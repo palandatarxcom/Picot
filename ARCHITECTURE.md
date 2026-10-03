@@ -302,6 +302,8 @@ Picot 设置页 UI 目前暴露 `model`/`thinking`/`advertise`/`disabled` 四字
 - **scope 页签（Global / Current project）= 文件归属与写入目标**，不是运行范围：全局写 `~/.pi/agent/settings.json`、项目写 `<cwd>/.pi/settings.json`；`/run` 始终按 `both` 合并发现，页签归属不改变生效范围。项目层可覆盖全局定义（user→project 叠加）。
 - **子页签（自定义 / 扩展包）= 纯前端浏览分类**：自定义 = 该 scope 的 agents 目录候选（全局含 builtin 只读组于扩展包子页）；扩展包 = 该 scope 的包来源候选按包身份分组。子页签切换不重新请求（同一盘点快照投影）；host 请求只带 global/project。
 
+页面顺序为 scope 页签 → 描述 → 子页签 → 计数 → master/detail。子页签复用技能页 `.skills-scope-tabs` / `.skills-scope-tab`，描述与计数复用 `.settings-help`。自定义计数为该视图候选数；扩展包计数包含 builtin 候选，但包数仅按 package 来源的 `packageIdentity` 去重。启用开关位于 detail 名字行右端，即时写入/清除本层 `disabled`，保留其他字段草稿。模型选择器复用 rpiv-advisor 的 `loadModelChoices` / `appendModelOptions` 原生 select；经 `ConfigGateway` 加载真实 catalog 与 scoped 模型，landing 同样可按需派生全局配置会话。常驻盘点横幅和页底范围外诊断不再渲染；逐候选状态与禁写原因仍展示。归档 spec 见 [`2026-09-30-subagent-settings-design.md`](docs/superpowers/specs/implemented/2026-09-30-subagent-settings-design.md)。
+
 当前生产用法（2026-10-03）：Dr. Lin 的 24 agent 团队定义全部在 git 源包 `datarx-agents-team`（`agents/{research,software,writing}/` 递归子目录），`.md` 不含 model/thinking；每角色分工经 `~/.pi/agent/settings.json` 的 agentOverrides 配置（23 条，与 Paseo agentProfiles 字节一致），小工按设计不配（继承调用方模型）。
 
 ### Settings → Skills（自定义 / 扩展包两页签）

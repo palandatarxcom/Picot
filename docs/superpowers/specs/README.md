@@ -10,13 +10,15 @@
 
 | 子目录 | 含义 | 文件数 |
 | --- | --- | --- |
-| [`implemented/`](implemented/) | 设计已批准 + 代码已落地 + 测试已通过 | 56 |
+| [`implemented/`](implemented/) | 实现已归档；交付范围、偏差与验证限制见各 spec | 56 |
 | [`in-progress/`](in-progress/) | 设计已批准实施未完（部分代码已合入或 working tree 有进展） | 2 |
 | [`not-started/`](not-started/) | 设计草案或待评审，未实施 | 6 |
 | [`audits/`](../../audits/) | 审计记录（非设计 spec，不引入实现） | 1 |
 | [`superseded/`](superseded/) | 已被更新的 spec 取代，保留作历史参考 | 5 |
 | [`process-evidence/`](process-evidence/) | Native Runtime 迁移过程的证据 / CP 评审 / 闭环记录（不是设计规格） | 24 |
 | [`prototypes/`](prototypes/) | 视觉原型（HTML），仅评审用，不进生产 | 3 |
+
+文件数和其他条目的状态来自上轮汇总，尚未同步当前并行归档；本轮只登记 Subagents settings 的完成状态，不将这些计数作为当前目录实况。
 
 ## 分类原则
 
@@ -85,6 +87,7 @@
 | ✅ implemented | [2026-09-23-embedded-pi-path-toggle](implemented/2026-09-23-embedded-pi-path-toggle-design.md) | Settings → 通用 PATH 开关 |
 | ✅ implemented | [2026-09-23-files-tree-and-paseo-icons](implemented/2026-09-23-files-tree-and-paseo-icons-design.md) | file-browser.js 1174 行 + file-tree.js + file-context-menu.js + file-type-icons.js + material-file-theme/，commit `3ab827e` |
 | ✅ implemented | [2026-09-26-local-follow-up-queue](implemented/2026-09-26-local-follow-up-queue-design.md) | public/ui/follow-up-queue.js（125 行），commit `039bd49` |
+| ✅ implemented | [2026-09-30-subagent-settings](implemented/2026-09-30-subagent-settings-design.md) | 候选盘点、只读定义、四字段名字级覆盖与 Skills 同款 UI 已落地；新建仍禁写，live parity 未证实；最终范围与限制见 §0 |
 | 🚧 in-progress | [2026-09-18-subagent-display](in-progress/2026-09-18-subagent-display-design.md) | 设计定案；widget + tool card 未实现 |
 | 🚧 in-progress | [2026-09-27-clinical-research-agent-team](in-progress/2026-09-27-clinical-research-agent-team-design.md) | 试用版；六份岗位指令 + Paseo profile 已建，真实团队未验证 |
 | 📋 not-started | [2026-09-18-acp-external-agent-delegation](not-started/2026-09-18-acp-external-agent-delegation-design.md) | 设计草案，Dr. Lin 2026-09：暂时不做 |

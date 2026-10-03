@@ -1,9 +1,55 @@
 # Subagents 设置页设计
 
-**状态：** Draft，待评审；仅设计，尚未实施。
+**状态：** 已实现，2026-10-03 按 Dr. Lin 确认归档。当前交付范围与限制见 §0；后文保留设计和实施阶段记录，不表示其中每个预期场景均已验收。
 
 **日期：** 2026-09-30
 **原型：** [`../prototypes/2026-09-30-subagent-settings-prototype.html`](../prototypes/2026-09-30-subagent-settings-prototype.html)，离线模拟，非运行证据。
+
+**本地实施计划：** `docs/superpowers/plans/2026-09-30-subagent-settings.md`，保留原任务清单与验证缺口；该目录由本地 Git exclude 忽略，不属于仓库交付。最终记录已写入本 spec。
+**架构契约：** [`ARCHITECTURE.md — Settings → Subagents`](../../../../ARCHITECTURE.md#settings--subagents候选盘点与受限名字级覆盖)。
+
+## 0. 最终实现与归档说明
+
+本节记录 2026-10-03 的实际交付；与后文初始设计冲突时，以本节和架构契约为准。
+
+### 页面与交互
+
+- 一级页签为「全局 / 当前项目」，默认全局；landing 只显示全局。页签表示文件归属和覆盖写入目标，不改变 `/run` 的 `both` 发现范围。
+- 每个作用域先显示描述文字，再显示「自定义 / 扩展包」分段按钮，之后是计数行与 master/detail。「自定义」显示 `{n} 个子代理`；「扩展包」显示 `{n} 个子代理 · {m} 个扩展包`。`n` 为当前浏览分类的候选数；扩展包视图含 builtin，`m` 只按 package 来源的 `packageIdentity` 去重，不将 builtin 组另算一个包。
+- 分段按钮复用技能页的 `.skills-scope-tabs` / `.skills-scope-tab`；描述与计数复用 `.settings-help`，不用单独的字体、颜色或间距规则。扩展包按包身份分组，builtin 单列只读定义组。
+- 子页签切换只投影当前 inventory，不重发 host 请求；作用域切换重置到「自定义」。选中列表条目后保持 master 滚动位置。
+- 启用开关放在 detail 的代理名称行右端，点击即写 `disabled`，不保存或丢弃 model/thinking/advertise 草稿。没有本层 `disabled: true` 时开关显示启用；此状态不是 live runner 状态。
+- 模型控件复用 rpiv-advisor 的 `loadModelChoices` / `appendModelOptions`，使用原生 `select`，首项为「不设置（继承父代理）」，随后为范围模型与全部已启用模型。目录加载经 `ConfigGateway`，landing 可按需派生全局配置会话；目录不可用时退为经校验的模型 ID 输入，不提供模拟选项。已有 `inherit` 或目录外 ID 保留为当前值。
+- thinking 支持未设置、JSON `false` 与 `off/minimal/low/medium/high/xhigh/max`；catalog 不提供逐模型档位能力，页面不承诺所选档位必定生效。advertise 提供未设置、true、false。
+- 原始定义限量只读展示，不拼接 YAML；被遮蔽条目不跳转。移除了常驻「仅显示磁盘候选」横幅和页底范围外来源列表；候选状态、逐条禁写原因、错误及保存反馈仍保留。范围外来源诊断留在 host 响应中，不读取其 prompt。
+
+### 写入与安全边界
+
+- 自定义、package、builtin 的覆盖统一写 `subagents.agentOverrides.<runtimeName>`，当前 UI 暴露 model、thinking、advertise、disabled 四字段；不修改 `.md`。写入层跟随一级页签，回显本层 `savedOverride`，不冒充合并后的生效值。
+- 每字段使用 set/clear/keep；清空只删除本层字段，保留未知字段与其他代理设置。启用开关禁用时 set `disabled: true`，启用时 clear。revision 取目标层 `settingsRevisions[scope]`。
+- 2026-10-02 已批准放宽覆盖资格：native 候选在本作用域快照内没有已知名字/alias 冲突、且范围内扫描完整时允许名字级保存。`writeQualified` 不证明 live winner；范围外未知占用不再阻断此类覆盖。external/未知 runner、被遮蔽或同层重名候选仍拒写，project root 分歧禁止项目写入。
+- 四个专用 host op 为 `subagents_inventory`、`subagents_get_detail`、`subagents_set_override`、`subagents_create`。仅认证 desktop owner 可用；项目 op 校验 Registered owner、`workspaceId`、`workspaceGeneration`、canonical root 与项目信任。详情通过 host candidate ID 重扫读取，前端没有任意路径权限。
+- 覆盖通过单锁 read–compare–modify–write、私有备份和原子替换落盘。保存只表示写盘成功，现有会话须 `/reload` 或新建会话，再用 `/subagents-models` / `/run` 核实。
+- `.md` 创建表单与排他发布事务已实现，但生产模式仍是 `disk-candidates-only`，创建按钮及 host 创建门均拒写。归档不表示新建功能已开放。
+
+### 证据与保留限制
+
+实现位置：`src-tauri/src/subagents_inventory.rs`、`src-tauri/src/subagents_settings.rs`、`src-tauri/src/host_config.rs`、`public/settings/subagents-tab.js`；接线位于 `host_server.rs`、`public/app/transport.js`、`app.js`、`landing.js`。前端回归在 `subagents-tab.test.js`，host 回归与实现同模块。四语言文案覆盖 en/zh/ja/es。
+
+收尾提交：`b22bd87`（分段按钮）、`a0f09bf`（描述与计数）、`d45af48`（计数样式）、`036377d`（描述样式漏改修复）。后两次样式修复须合看；`036377d` 的主标题属于 MCP，子代理的一行修复被并入该提交。`a0f09bf` 还携带 Skills CSS 改动，归档未拆分或重写提交历史。
+
+本会话已有验证记录：前端聚焦测试 61/61；host 覆盖开放时 Subagents 聚焦 31/31、Rust 全量串行 576/576。后两项是实施时记录，不是此次文档整理重跑结果。WebView landing 走查确认分段类名、原生模型选择器、detail 开关、真实包列表与空态；该轮发生在描述文字加入之前，不证明最终描述样式或全套视觉验收。
+
+保留限制：
+
+1. parity spike 未证明 live `/run` 一致性；动态注册、额外扫描目录与包过滤仍不能当作已覆盖的 live inventory。全局请求不带项目身份，不掌握当前工作区的完整遮蔽关系；不显示推算生效值。
+2. 新建仍关闭；provider 定向覆盖、per-run 参数和逐模型 thinking 能力不在此 UI 的验证范围。测试清单不等于每条设计矩阵已执行。
+3. 未完成 Windows/Linux 路径与 hard-link 平台实测、全主题/窄窗/完整键盘及 locale WebView 走查。测试 harness 缺少新增文案键会产生 i18n 警告；真实四语言文件有键，但新增文案本身未由断言完整覆盖。
+4. 不遵循 settings 锁的外部写者仍有最终比对到 rename 之间的竞态；父目录 symlink 竞态也保留为已知限制。host 包源还接受裸 `ssh://`，与此前核对的 pi-subagents 0.74 resolver 有差异。
+
+此次文档整理重新运行 `bun run vitest run public/settings/subagents-tab.test.js`：61/61 通过，退出码 0；stderr 有 8 条 i18n 缺键警告，包含测试 stub 中缺少的 scope 描述、计数和模型分组键。未重跑 Rust 全量、`bun run check` 或 WebView。文档路径检查未发现新增断链，`git diff --check` 通过。
+
+以下 §1–§7 为原设计、验证矩阵及阶段记录。原型保留供历史参考，不再要求它与生产 UI 同步，也不将其模拟行为作为验收证据。
 
 ## 1. 目标与边界
 
@@ -67,7 +113,7 @@ Pi 的资源过滤由 Pi 管，扩展另有其扫描规则：`node_modules/@eare
 
 验收门槛：以上盘点与同一 cwd 的 `/run` 输出一致，或者明确降级为候选且不显示未经证实的生效；所有写入限定批准路径、失败不损坏旧文件；项目/全局在 landing 与跨工作区场景不串权；原型中的示意模型、模拟来源与静态路径不能混入真实 UI，用户输入的 prompt 须实际写入并校验。实施后按 `AGENTS.md` 运行聚焦检查及所涉 frontend/host 的相应测试；本轮仅文档，不执行构建或测试。
 
-## 7. 待验证与评审项
+## 7. 历史待验证与评审项（当前限制见 §0）
 
 1. 当前 Picot 内嵌 Pi 版本见 `scripts/pi-version.json:2`；0.73.1 子代理扩展内部发现接口是否可在该进程合法调用并拿到动态注册代理/实时快照？若否，盘点适配层与 `/run` parity 的可接受降级范围需先实测。
 2. 扩展实际 resolved projectRoot 与 `<cwd>/.pi/` 写入目标冲突时，项目级创建与覆盖禁写并提示；仍须验证两种根的判定与错误展示，不改已定写入目标。
