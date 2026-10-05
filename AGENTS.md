@@ -74,8 +74,20 @@ bun run build:extensions
 Useful focused test form:
 
 ```bash
-bun run vitest run public/settings-save-status.test.js
+bun run test:focused public/settings-save-status.test.js
 ```
+
+## Test filesystem safety
+
+- Run Vitest through the sandboxed `test`, `test:focused`, `test:coverage`, or
+  `test:watch` scripts. Direct Vitest is rejected before test modules load.
+- The current write sandbox supports macOS only. If it cannot start, stop;
+  do not fall back to bare tests. Other platforms need a verified sandbox.
+- Before changing a shared root resolver, enumerate its read/write consumers
+  and isolate every directory override before loading production modules.
+- If tests touch real user files, stop and report affected paths immediately.
+  Preserve evidence; restoration requires Dr. Lin's approval and a verified
+  baseline, including symlink targets. See `ARCHITECTURE.md#测试文件系统边界`.
 
 ## Frontend and extension checks
 

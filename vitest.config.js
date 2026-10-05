@@ -1,6 +1,20 @@
 // ABOUTME: Configures Picot's browser and build-script Vitest regression suites.
 // ABOUTME: Keeps distribution-asset checks alongside frontend behavior tests.
+
+import { closeSync, openSync } from "node:fs";
 import { defineConfig } from "vitest/config";
+
+if (!process.env.PICOT_TEST_SANDBOX_ROOT || !process.env.PICOT_TEST_WRITE_GUARD) {
+  throw new Error(
+    "Run tests through bun run test or bun run test:focused; direct Vitest is unsafe.",
+  );
+}
+try {
+  closeSync(openSync(process.env.PICOT_TEST_WRITE_GUARD, "a"));
+  throw new Error("Test write guard is writable: refusing to run without kernel isolation.");
+} catch (error) {
+  if (error.code !== "EPERM" && error.code !== "EACCES") throw error;
+}
 
 export default defineConfig({
   test: {
