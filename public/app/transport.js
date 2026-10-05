@@ -303,8 +303,11 @@ export class WsTransport {
 
   // `pi mcp list --json` really connects to each server; the host caches the
   // result for 60s, so this is a page-activation cost, not a poll.
-  mcpServerStatus() {
-    return this._control("mcp_server_status", {}, { timeoutMs: SPAWN_TIMEOUT_MS });
+  // `{refresh:true}` asks the host to drop that cache after a configuration
+  // write; the default read keeps the TTL.
+  mcpServerStatus(options = {}) {
+    const args = options?.refresh === true ? { refresh: true } : {};
+    return this._control("mcp_server_status", args, { timeoutMs: SPAWN_TIMEOUT_MS });
   }
 
   /**

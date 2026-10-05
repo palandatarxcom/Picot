@@ -255,7 +255,23 @@ pub(crate) fn native_launch_spec(
     // project as trusted and loads its project-local resources. Ephemeral
     // runtimes call native_launch_spec_for directly and stay untrusted.
     crate::project_trust::trust_registered_workspace(cwd);
+    // Registry-verified launch only: the config bridge treats this canonical
+    // root as Picot's explicit permission for project MCP reads and writes.
+    let mut spec = spec;
+    spec.mcp_project_root = Some(canonical_project_root(Path::new(cwd)));
     Ok(spec)
+}
+
+/// Canonical project root for the host marker. `canonicalize` resolves
+/// symlinks so the bridge can compare real paths; if the directory vanished
+/// between admission and launch the already-resolved absolute cwd is used and
+/// the bridge's own realpath comparison still decides.
+fn canonical_project_root(cwd: &Path) -> PathBuf {
+    let resolved = cwd
+        .canonicalize()
+        .map(|path| PathBuf::from(strip_verbatim_prefix(&path.to_string_lossy())))
+        .unwrap_or_else(|_| PathBuf::from(strip_verbatim_prefix(&cwd.to_string_lossy())));
+    resolved
 }
 /// Build native launch inputs for a specific runtime type.
 ///
@@ -307,6 +323,9 @@ pub(crate) fn native_launch_spec_for(
         ),
         readiness: ReadinessPolicy::default(),
         cleanup: crate::native_pi_manager::NativeCleanupResources::default(),
+        // Ephemeral runtimes (Config/Quick/Side/Standby) never admit project
+        // MCP operations; only the primary wrapper sets the marker.
+        mcp_project_root: None,
     };
     Ok(spec)
 }
@@ -501,6 +520,48 @@ mod launch_spec_tests {
         spec.no_tools = true;
         let description = spec.command_description();
         assert!(description.args.contains(&"--no-tools".to_string()));
+    }
+
+    #[test]
+    fn ephemeral_runtimes_carry_no_project_root_marker() {
+        for runtime_type in [
+            NativeRuntimeType::Primary,
+            NativeRuntimeType::Config,
+            NativeRuntimeType::QuickChat,
+            NativeRuntimeType::SideChat,
+            NativeRuntimeType::Standby,
+        ] {
+            let spec = spec_for(runtime_type, None);
+            assert!(
+                spec.mcp_project_root.is_none(),
+                "{runtime_type:?} must not claim a host-verified project root"
+            );
+            let description = spec.command_description();
+            assert!(!description
+                .environment
+                .contains_key(crate::native_pi_manager::MCP_PROJECT_ROOT_ENV));
+        }
+    }
+
+    #[test]
+    fn only_a_set_project_root_is_exported_to_the_child() {
+        let mut spec = spec_for(NativeRuntimeType::Primary, None);
+        spec.mcp_project_root = Some(PathBuf::from("/workspace/with space"));
+        let description = spec.command_description();
+        assert_eq!(
+            description
+                .environment
+                .get(crate::native_pi_manager::MCP_PROJECT_ROOT_ENV),
+            Some(&"/workspace/with space".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_project_root_is_absolute_and_resolved() {
+        let dir = std::env::temp_dir();
+        let resolved = canonical_project_root(&dir);
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, dir.canonicalize().expect("temp dir must resolve"));
     }
 
     #[test]

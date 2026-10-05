@@ -75,6 +75,206 @@ impl UrlParser {
     }
 }
 
+const SAFE_CONFIG_ERROR: &str = "MCP configuration error; see Pi logs";
+const SAFE_SERVER_ERROR: &str = "MCP server connection failed; see Pi logs";
+const SAFE_TRUST_NOTE: &str =
+    "The project .pi/mcp.json is ignored because the project is not trusted; open the project in Picot to trust it.";
+const MCP_EXPOSURES: [&str; 4] = ["codemode", "direct", "deferred", "hidden"];
+
+/// `pi mcp list --json` reports the transport as the raw URL or command line.
+/// The page only ever needs the transport kind, so nothing that could carry a
+/// credential, host, path or argument reaches the WebView.
+fn safe_transport(raw: &str) -> &'static str {
+    // A real URL parse, not a prefix heuristic: only a complete http/https URL
+    // with a host is an HTTP transport. Anything else (a command line, a
+    // fragment, a scheme-less string) stays stdio.
+    match reqwest::Url::parse(raw.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => "http",
+        _ => "stdio",
+    }
+}
+
+fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("MCP server report field {key} must be a string"))
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("MCP server report field {key} must be a string")),
+    }
+}
+
+fn optional_count(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("MCP server report field {key} must be a non-negative integer")),
+        Some(_) => Err(format!(
+            "MCP server report field {key} must be a non-negative integer"
+        )),
+    }
+}
+
+/// One report row, validated and projected. Unknown additive CLI fields are
+/// accepted but never forwarded; the raw transport and error text are replaced.
+fn project_server_row(row: &Value) -> Result<Value, String> {
+    let object = row
+        .as_object()
+        .ok_or_else(|| "MCP server report row must be an object".to_string())?;
+    let name = string_field(object, "name")?;
+    let scope = string_field(object, "scope")?;
+    let source = string_field(object, "source")?;
+    let state = string_field(object, "state")?;
+    let transport = string_field(object, "transport")?;
+    let enabled = object
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "MCP server report field enabled must be a boolean".to_string())?;
+    let exposure = string_field(object, "exposure")?;
+    if !MCP_EXPOSURES.contains(&exposure.as_str()) {
+        // Fixed text: a bad schema must not echo whatever the CLI printed.
+        return Err("MCP server report exposure is not canonical".to_string());
+    }
+    let tools = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MCP server report field tools must be an array".to_string())?
+        .iter()
+        .map(|tool| {
+            tool.as_str()
+                .map(|name| Value::String(name.to_owned()))
+                .ok_or_else(|| "MCP server report tool names must be strings".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let override_path = optional_string_field(object, "override")?;
+    let tool_exposure = match object.get("toolExposure") {
+        None => None,
+        Some(Value::Object(map)) => {
+            let mut safe = serde_json::Map::new();
+            for (tool, value) in map {
+                let exposure = value.as_str().ok_or_else(|| {
+                    "MCP server report toolExposure values must be strings".to_string()
+                })?;
+                if !MCP_EXPOSURES.contains(&exposure) {
+                    return Err("MCP server report toolExposure value is not canonical".to_string());
+                }
+                safe.insert(tool.clone(), Value::String(exposure.to_owned()));
+            }
+            Some(Value::Object(safe))
+        }
+        Some(_) => return Err("MCP server report field toolExposure must be an object".to_string()),
+    };
+    let resources = optional_count(object, "resources")?;
+    let resource_templates = optional_count(object, "resourceTemplates")?;
+    let failed = match object.get("error") {
+        None => false,
+        Some(Value::String(_)) => true,
+        Some(_) => return Err("MCP server report field error must be a string".to_string()),
+    };
+
+    let mut projected = serde_json::Map::new();
+    projected.insert("name".into(), Value::String(name));
+    projected.insert("scope".into(), Value::String(scope));
+    projected.insert("source".into(), Value::String(source));
+    projected.insert("enabled".into(), Value::Bool(enabled));
+    projected.insert("exposure".into(), Value::String(exposure));
+    projected.insert(
+        "transport".into(),
+        Value::String(safe_transport(&transport).into()),
+    );
+    projected.insert("state".into(), Value::String(state));
+    projected.insert("tools".into(), Value::Array(tools));
+    if let Some(override_path) = override_path {
+        projected.insert("override".into(), Value::String(override_path));
+    }
+    if let Some(tool_exposure) = tool_exposure {
+        projected.insert("toolExposure".into(), tool_exposure);
+    }
+    if let Some(resources) = resources {
+        projected.insert("resources".into(), Value::Number(resources.into()));
+    }
+    if let Some(resource_templates) = resource_templates {
+        projected.insert(
+            "resourceTemplates".into(),
+            Value::Number(resource_templates.into()),
+        );
+    }
+    if failed {
+        projected.insert("error".into(), Value::String(SAFE_SERVER_ERROR.into()));
+    }
+    Ok(Value::Object(projected))
+}
+
+/// Validate one `pi mcp list --json` run and project it into the safe envelope
+/// the host returns. Exit 0 and exit 1 both carry a usable report (exit 1 means
+/// "some server failed or the config has errors"); any other exit, a signal, or
+/// a malformed document is a query failure, never an empty report.
+fn parse_list_report(stdout: &[u8], status: &std::process::ExitStatus) -> Result<Value, String> {
+    let code = status
+        .code()
+        .ok_or_else(|| "MCP list terminated by a signal".to_string())?;
+    if code != 0 && code != 1 {
+        return Err(format!("MCP list exited with code {code}"));
+    }
+    let report: Value =
+        serde_json::from_slice(stdout).map_err(|_| "MCP list returned invalid JSON".to_string())?;
+    let object = report
+        .as_object()
+        .ok_or_else(|| "MCP list report is not an object".to_string())?;
+    let rows = object
+        .get("servers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MCP list report needs a servers array".to_string())?;
+    let errors = object
+        .get("errors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MCP list report needs an errors array".to_string())?;
+    if !errors.iter().all(Value::is_string) {
+        return Err("MCP list report errors must be strings".to_string());
+    }
+    let note = match object.get("note") {
+        None => None,
+        Some(Value::String(_)) => Some(SAFE_TRUST_NOTE.to_string()),
+        Some(_) => return Err("MCP list report note must be a string".to_string()),
+    };
+    let servers = rows
+        .iter()
+        .map(project_server_row)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut projected = serde_json::Map::new();
+    projected.insert("servers".into(), Value::Array(servers));
+    // Diagnostics keep their count but never their text: CLI config errors can
+    // quote URLs, commands and credentials.
+    projected.insert(
+        "errors".into(),
+        Value::Array(
+            errors
+                .iter()
+                .map(|_| Value::String(SAFE_CONFIG_ERROR.into()))
+                .collect(),
+        ),
+    );
+    if let Some(note) = note {
+        projected.insert("note".into(), Value::String(note));
+    }
+    Ok(Value::Object(projected))
+}
+
 fn status_name(status: &OAuthStatus) -> &'static str {
     match status {
         OAuthStatus::Pending => "pending",
@@ -370,20 +570,16 @@ impl McpLoginRunner {
         let epoch = self.cache_epoch.load(Ordering::SeqCst);
         let output = command(binary, cwd, "list", None)
             .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err("MCP list failed; see Pi logs".into());
-        }
-        let servers: Value = serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
-        if !servers.is_array() {
-            return Err("MCP server list is not an array".into());
-        }
+            .map_err(|_| "MCP list could not be started".to_string())?;
+        let report = parse_list_report(&output.stdout, &output.status)?;
         if let Ok(mut cache) = self.cache.lock() {
+            // Epoch guard: a report that started before an invalidation must not
+            // reinsert itself into the fresh cache.
             if epoch == self.cache_epoch.load(Ordering::SeqCst) {
-                cache.insert(cwd.to_owned(), (Instant::now(), servers.clone()));
+                cache.insert(cwd.to_owned(), (Instant::now(), report.clone()));
             }
         }
-        Ok(servers)
+        Ok(report)
     }
 }
 
@@ -446,13 +642,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mcp_login_cancel_and_list_cache_invalidation() {
-        let (dir, binary) = fixture("if [ \"$2\" = login ]; then sleep 30; elif [ \"$2\" = logout ]; then echo logout >> calls; else echo list >> calls; echo '[{\"name\":\"test\",\"state\":\"needs-auth\"}]'; fi");
+        let (dir, binary) = fixture("if [ \"$2\" = login ]; then sleep 30; elif [ \"$2\" = logout ]; then echo logout >> calls; else echo list >> calls; echo '{\"servers\":[{\"name\":\"test\",\"scope\":\"global\",\"source\":\"/agent/mcp.json\",\"enabled\":true,\"exposure\":\"codemode\",\"transport\":\"npx -y test\",\"state\":\"needs-auth\",\"tools\":[]}],\"errors\":[]}'; fi");
         let (runner, owner) = runner();
         let id = runner.start(&binary, dir.path(), "test", &owner).unwrap();
         runner.cancel(&owner, &id).unwrap();
         assert_eq!(runner.status(&owner, &id).unwrap()["status"], "cancelled");
         let first = runner.list(&binary, dir.path()).unwrap();
-        assert_eq!(first[0]["name"], "test");
+        assert_eq!(first["servers"][0]["name"], "test");
         runner.list(&binary, dir.path()).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("calls"))
@@ -481,11 +677,139 @@ mod tests {
             4
         );
     }
+
+    #[cfg(unix)]
+    fn list_fixture(json: &str, code: i32) -> (tempfile::TempDir, PathBuf) {
+        let escaped = json.replace('\'', "'\\''");
+        fixture(&format!("echo '{escaped}'; exit {code}"))
+    }
+
+    #[cfg(unix)]
+    const ROW_NEEDS_AUTH: &str = r#"{"name":"sentry","scope":"global","source":"/agent/mcp.json","enabled":true,"exposure":"codemode","transport":"https://mcp.sentry.dev/mcp","state":"needs-auth","tools":[]}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_list_accepts_exit_zero_and_one_reports() {
+        let (dir, binary) = list_fixture(r#"{"servers":[],"errors":[]}"#, 0);
+        let (runner, _owner) = runner();
+        let report = runner.list(&binary, dir.path()).unwrap();
+        assert_eq!(report["servers"].as_array().unwrap().len(), 0);
+        assert_eq!(report["errors"].as_array().unwrap().len(), 0);
+
+        // Exit 1 with a usable report is a normal partial failure, not a host
+        // query failure: needs-auth rows and config errors must survive.
+        let (dir, binary) = list_fixture(
+            &format!(
+                r#"{{"servers":[{ROW_NEEDS_AUTH}],"errors":["/agent/mcp.json: server \"broken\" must be an object"]}}"#
+            ),
+            1,
+        );
+        let report = runner.list(&binary, dir.path()).unwrap();
+        assert_eq!(report["servers"][0]["state"], "needs-auth");
+        assert_eq!(report["servers"][0]["name"], "sentry");
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_list_rejects_malformed_reports_and_foreign_exit_codes() {
+        let cases = [
+            (r#"[]"#, 0),                                   // top-level array
+            (r#"{"servers":[]}"#, 0),                       // missing errors
+            (r#"{"servers":"nope","errors":[]}"#, 0),       // wrong servers type
+            (r#"{"servers":[],"errors":"nope"}"#, 0),       // wrong errors type
+            (r#"{"servers":[{"name":1}],"errors":[]}"#, 0), // malformed row
+            (r#"{"servers":[],"errors":[],"note":5}"#, 0),  // wrong note type
+            (r#"{"servers":[],"errors":[]"#, 0),            // truncated
+            (r#"{"servers":[],"errors":[]} trailing"#, 0),  // trailing junk
+            (r#"{"servers":[],"errors":[]}"#, 2),           // foreign exit code
+        ];
+        for (json, code) in cases {
+            let (dir, binary) = list_fixture(json, code);
+            let (runner, _owner) = runner();
+            assert!(
+                runner.list(&binary, dir.path()).is_err(),
+                "report {json} with exit {code} must be rejected"
+            );
+        }
+
+        let (dir, binary) = fixture("kill -TERM $$");
+        let (runner, _owner) = runner();
+        assert!(runner.list(&binary, dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_list_projects_safe_transport_and_diagnostics() {
+        let secret_row = r#"{"name":"docs","scope":"global","source":"/agent/mcp.json","override":"/work/.pi/mcp.json","enabled":true,"exposure":"direct","transport":"https://user:tok3n@example.test/mcp?key=SECRET","state":"error","tools":["read"],"toolExposure":{"delete_*":"hidden"},"resources":2,"error":"failed with SECRET and /usr/local/bin/secret-command --token"}"#;
+        let (dir, binary) = list_fixture(
+            &format!(
+                r#"{{"servers":[{secret_row}],"errors":["/agent/mcp.json: bad SECRET token"],"note":"/work/.pi/mcp.json is ignored because the project is not trusted. Start pi in the project to trust it."}}"#
+            ),
+            1,
+        );
+        let (runner, _owner) = runner();
+        let report = runner.list(&binary, dir.path()).unwrap();
+        let serialized = report.to_string();
+        for needle in [
+            "SECRET",
+            "tok3n",
+            "user:",
+            "example.test",
+            "/usr/local/bin",
+            "--token",
+            "key=",
+        ] {
+            assert!(
+                !serialized.contains(needle),
+                "projected report must not carry {needle}: {serialized}"
+            );
+        }
+        assert_eq!(report["servers"][0]["transport"], "http");
+        assert_eq!(report["servers"][0]["source"], "/agent/mcp.json");
+        assert_eq!(report["servers"][0]["override"], "/work/.pi/mcp.json");
+        assert_eq!(report["servers"][0]["exposure"], "direct");
+        assert_eq!(report["servers"][0]["toolExposure"]["delete_*"], "hidden");
+        assert_eq!(report["servers"][0]["resources"], 2);
+        assert!(report["servers"][0]["error"].is_string());
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+        assert!(report["note"].is_string());
+
+        let stdio_row = r#"{"name":"local","scope":"project","source":"/work/.pi/mcp.json","enabled":false,"exposure":"hidden","transport":"/opt/bin/mcp --flag","state":"disabled","tools":[]}"#;
+        let (dir, binary) = list_fixture(&format!(r#"{{"servers":[{stdio_row}],"errors":[]}}"#), 0);
+        let report = runner.list(&binary, dir.path()).unwrap();
+        assert_eq!(report["servers"][0]["transport"], "stdio");
+        assert!(report.get("note").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_list_inflight_result_cannot_reinsert_after_invalidation() {
+        let (dir, binary) = fixture(
+            "if [ \"$2\" = list ]; then echo list >> calls; sleep 0.4; echo '{\"servers\":[],\"errors\":[]}'; fi",
+        );
+        let (runner, _owner) = runner();
+        let (runner_a, binary_a, cwd_a) = (runner.clone(), binary.clone(), dir.path().to_owned());
+        let handle = std::thread::spawn(move || runner_a.list(&binary_a, &cwd_a));
+        std::thread::sleep(Duration::from_millis(80));
+        runner.invalidate();
+        assert!(handle.join().unwrap().is_ok());
+        // The stale in-flight result must not have been cached: a fresh list
+        // spawns the binary again.
+        runner.list(&binary, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn mcp_login_success_invalidates_cached_server_reports() {
         let (dir, binary) =
-            fixture("if [ \"$2\" = list ]; then echo list >> calls; echo '[]'; else exit 0; fi");
+            fixture("if [ \"$2\" = list ]; then echo list >> calls; echo '{\"servers\":[],\"errors\":[]}'; else exit 0; fi");
         let (runner, owner) = runner();
         runner.list(&binary, dir.path()).unwrap();
         let id = runner.start(&binary, dir.path(), "test", &owner).unwrap();

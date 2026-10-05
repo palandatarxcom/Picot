@@ -941,6 +941,9 @@ const mcpPage = setupMcpPage({
   mcpLogin: createMcpHostOps(transport),
   openExternal: (url) => transport.openExternal(url),
   captionEl: document.getElementById("mcp-tab-caption"),
+  // Landing has no workspace: constant context and no routing target, so every
+  // project-scoped MCP action rejects instead of guessing a workspace.
+  getContextKey: () => "landing",
 });
 
 // Configuration page: three global file editors + the agent controls. The

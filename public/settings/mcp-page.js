@@ -4,12 +4,15 @@
 
 import { onLocaleChange, t } from "../i18n.js";
 import { createMcpLoginDialog } from "./mcp-login-dialog.js";
+import { renderMcpOverrideDetail } from "./mcp-override-detail.js";
 
 /**
- * @typedef {{name:string, entry:Object, sourceFile:string, editable:true, enabled:boolean}} McpListEntry
+ * @typedef {{name:string, entry:Object, sourceFile:string, editable:true, enabled:boolean, kind?:string, effective?:Object, identity?:Object, validationError?:string, revision?:string}} McpListEntry
  * @typedef {{id:string, sourceFile:string, missing:string[]}} McpMigrationTarget
  * @typedef {{name:string, scope?:string, state:string, transport?:string, tools?:unknown[], error?:string}} McpServerStatus
- * @typedef {{groups: Record<string, McpListEntry[]>, groupErrors: Record<string, string|undefined>, migrations: McpMigrationTarget[], projectAvailable?: boolean}} McpListData
+ * @typedef {{groups: Record<string, McpListEntry[]>, groupErrors: Record<string, string|undefined>, migrations: McpMigrationTarget[], projectAvailable?: boolean, projectTrusted?: boolean, revisions?: {piGlobal:string, project:string|null}}} McpListData
+ * @typedef {{workspaceId:string, sessionId:string, instanceId?:string}} RuntimeTarget
+ * @typedef {{context:string, target:RuntimeTarget|null}} McpBinding
  */
 
 // Long master-row error text is summarized; the full message stays on `title`.
@@ -26,7 +29,7 @@ export function createMcpHostOps(transport) {
     cancel: (operationId) => transport.mcpLoginCancel(operationId),
     status: (operationId) => transport.mcpLoginStatus(operationId),
     logout: (name) => transport.mcpLogout(name),
-    serverStatus: () => transport.mcpServerStatus(),
+    serverStatus: (options) => transport.mcpServerStatus(options),
     subscribe: (listener) => transport.onMcpLoginUpdate(listener),
   };
 }
@@ -44,19 +47,41 @@ export function setupMcpPage({
   openExternal = null,
   captionEl = null,
   migrationsEl = null,
+  // Workspace identity (workspace + generation) and the live routing triple.
+  // Landing passes neither: global-only mode, where project mutations reject.
+  getContextKey = () => "mcp-page",
+  getRuntimeTarget = null,
 }) {
   /** @type {McpListData | null} */
   let data = null;
+  /**
+   * The immutable context + routing triple `data` was read for. Rendered
+   * controls act on this binding, never on whatever target is current now.
+   * @type {McpBinding | null}
+   */
+  let dataBinding = null;
+  /** True while the page has no inventory because a stale one was dropped. */
+  let refreshRequired = false;
   let activeTab = "piGlobal";
   /** @type {Map<string, {name: string}>} per-tab selection */
   const selections = new Map();
   let mode = "view"; // view | add
   let loadSeq = 0;
   let statusText = "";
-  /** @type {{byScope: Map<string, McpServerStatus>, byName: Map<string, McpServerStatus>} | null} */
+  /** @type {{all: McpServerStatus[]} | null} */
   let statuses = null;
   let statusError = "";
   let loginDialog = null;
+  let disposed = false;
+  /** Unsaved override drafts, keyed by source file + name + revision. */
+  const drafts = new Map();
+  /** Override name whose enabled switch is waiting for an acknowledgement. */
+  let pendingToggle = null;
+  let batchPending = false;
+  let statusSeq = 0;
+  let statusGeneration = 0;
+  let statusDiagnostics = { errors: [], note: undefined };
+  let lastContextKey = null;
 
   const unsubscribeLocale = onLocaleChange(() => render());
 
@@ -74,10 +99,15 @@ export function setupMcpPage({
 
   async function load() {
     const seq = ++loadSeq;
-    const result = await call("mcp_list_servers");
+    const binding = captureMcpBindingSafe();
+    const result = await call("mcp_list_servers", {}, binding);
     if (seq !== loadSeq) return;
+    // A reload started in another workspace must not repaint this one.
+    if (binding && !isMcpBindingCurrent(binding)) return;
     data = result.ok ? result.data : null;
-    statusText = result.ok ? "" : String(result.error ?? "load failed");
+    dataBinding = data ? binding : null;
+    refreshRequired = false;
+    statusText = result.ok ? "" : String(result.error ?? t("settings.mcp.status.unavailable"));
     if (selected()) {
       const name = selected().name;
       if (!groupEntries().some((e) => e.name === name)) selections.delete(activeTab);
@@ -87,40 +117,84 @@ export function setupMcpPage({
   }
 
   async function activate() {
+    syncContext();
     await load();
     await loadStatus();
+  }
+
+  /**
+   * Workspace change (or first activation) drops every piece of per-workspace
+   * UI state: rows, drafts, diagnostics and in-flight status results.
+   */
+  function syncContext() {
+    const key = getContextKey();
+    if (key === lastContextKey) return;
+    lastContextKey = key;
+    data = null;
+    dataBinding = null;
+    refreshRequired = false;
+    selections.clear();
+    drafts.clear();
+    mode = "view";
+    pendingToggle = null;
+    statusText = "";
+    invalidateStatus();
   }
 
   /**
    * Live per-server state from the host (`pi mcp list --json`, 60s host-side
    * TTL). Queried on page activation and after every sign-in/sign-out — never
    * polled: an in-flight login polls through `mcp_login_status` instead.
+   *
+   * A `refresh: true` query must be *issued* before any await the page teardown
+   * can interrupt (the inventory reload): it invalidates the host-side cache,
+   * so it has to leave the page even when the reply never repaints anything.
    */
-  async function loadStatus() {
-    if (!mcpLogin) return;
+  async function loadStatus(options) {
+    if (!mcpLogin || disposed) return;
+    const context = getContextKey();
+    const generation = statusGeneration;
+    const seq = ++statusSeq;
     const result = await Promise.resolve()
-      .then(() => mcpLogin.serverStatus())
+      .then(() => mcpLogin.serverStatus(options))
       .catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+    // Only the newest query of the current context may publish: a slow reply
+    // from before a save must not restore the state that save invalidated.
+    if (
+      disposed ||
+      context !== getContextKey() ||
+      generation !== statusGeneration ||
+      seq !== statusSeq
+    ) {
+      return;
+    }
     if (result?.ok) {
       statuses = indexStatus(result.servers);
       statusError = "";
+      statusDiagnostics = { errors: result.errors ?? [], note: result.note };
     } else {
       statuses = null;
-      statusError = String(result?.error ?? "mcp_server_status failed");
+      statusError = String(result?.error ?? t("settings.mcp.status.unavailable"));
+      statusDiagnostics = { errors: [], note: undefined };
     }
     render();
   }
 
+  /** Any accepted configuration write invalidates the CLI disk view. */
+  function invalidateStatus() {
+    statusGeneration += 1;
+    statusSeq += 1;
+    statuses = null;
+    statusError = "";
+    statusDiagnostics = { errors: [], note: undefined };
+  }
+
   function indexStatus(servers) {
-    const byScope = new Map();
-    const byName = new Map();
-    for (const server of Array.isArray(servers) ? servers : []) {
-      if (!server || typeof server.name !== "string") continue;
-      const scope = server.scope ? scopeOf(server.scope) : "";
-      if (scope) byScope.set(`${scope}:${server.name}`, server);
-      if (!byName.has(server.name)) byName.set(server.name, server);
-    }
-    return { byScope, byName };
+    return {
+      all: (Array.isArray(servers) ? servers : []).filter(
+        (server) => server && typeof server.name === "string",
+      ),
+    };
   }
 
   function scopeOf(scope) {
@@ -128,17 +202,37 @@ export function setupMcpPage({
   }
 
   /**
-   * pi's report scopes are not guaranteed to be present or uniformly spelled,
-   * so a tab-scoped match wins and the bare name match is a fallback for
-   * reports without scope. A scoped report never lends a same-named server
-   * from the other scope a status — that is what gates untrusted projects.
+   * Status identity, not name matching. Pi reports a project override as the
+   * effective *global* server (global scope + global source) plus the project
+   * override path, so an override row only accepts a report that names that
+   * exact triple. A full definition accepts a report from its own file in its
+   * own scope. Invalid rows, lost bases and other workspaces stay unknown
+   * instead of borrowing a same-named report.
    */
-  function statusFor(name, scope) {
-    const scoped = statuses?.byScope.get(`${scope}:${name}`);
-    if (scoped) return scoped;
-    const named = statuses?.byName.get(name);
-    if (!named || named.scope) return null;
-    return named;
+  function statusForItem(item) {
+    const reports = statuses?.all ?? [];
+    if (item.kind === "override") {
+      const identity = item.identity;
+      if (!identity?.source || !identity?.override) return null;
+      return (
+        reports.find(
+          (report) =>
+            report.name === item.name &&
+            scopeOf(report.scope) === "piGlobal" &&
+            report.source === identity.source &&
+            report.override === identity.override,
+        ) ?? null
+      );
+    }
+    if (item.kind === "invalid") return null;
+    return (
+      reports.find(
+        (report) =>
+          report.name === item.name &&
+          report.source === item.sourceFile &&
+          scopeOf(report.scope) === activeTab,
+      ) ?? null
+    );
   }
 
   function transportOf(item, status) {
@@ -150,8 +244,17 @@ export function setupMcpPage({
 
   /** The adapter/shared copy runs only after the user clicks a migration
    * banner's action; the list op detects but never writes. */
-  async function migrate(target) {
-    const result = await call("mcp_migrate_adapter_config", { target });
+  async function migrate(target, renderScope) {
+    let binding;
+    try {
+      binding = actionBinding(renderScope);
+    } catch (error) {
+      setStatus(error?.message ?? String(error));
+      render();
+      return;
+    }
+    const result = await call("mcp_migrate_adapter_config", { target }, binding);
+    if (!isMcpBindingCurrent(binding)) return;
     const migrated = result.ok ? (result.data?.migrated ?? []) : [];
     setStatus(
       result.ok && migrated.length > 0
@@ -167,15 +270,107 @@ export function setupMcpPage({
     return true;
   }
 
-  /** Gateway rejects (timeout / no target / transport failure) normalize to
-   * the same {ok:false} shape the handlers already render — models-page.js
+  /**
+   * A rendered control belongs to the context + routing triple it was drawn
+   * for. Acting on a stale control must reject instead of sending the click to
+   * whatever workspace is current now; the action binding is captured only
+   * after that check.
+   */
+  function actionBinding(renderScope) {
+    if (renderScope && !isMcpBindingCurrent(renderScope)) {
+      throw new Error(t("settings.mcp.targetChanged"));
+    }
+    return captureMcpBinding();
+  }
+
+  function sameMcpTarget(a, b) {
+    return Boolean(
+      a &&
+        b &&
+        a.workspaceId === b.workspaceId &&
+        a.sessionId === b.sessionId &&
+        (a.instanceId ?? "") === (b.instanceId ?? ""),
+    );
+  }
+
+  /**
+   * Freeze the routing triple the user acted on. Captured synchronously at the
+   * user action: readiness can resolve much later, and a switch in between must
+   * not re-target the request at the new workspace.
+   */
+  function captureMcpBinding() {
+    if (disposed) throw new Error(t("settings.mcp.status.unavailable"));
+    if (!getRuntimeTarget) return { context: getContextKey(), target: null }; // landing: global-only
+    const target = getRuntimeTarget();
+    if (
+      typeof target?.workspaceId !== "string" ||
+      !target.workspaceId ||
+      typeof target?.sessionId !== "string" ||
+      !target.sessionId ||
+      (target.instanceId !== undefined && typeof target.instanceId !== "string")
+    ) {
+      throw new Error(t("settings.mcp.noSession"));
+    }
+    return {
+      context: getContextKey(),
+      target: Object.freeze({
+        workspaceId: target.workspaceId,
+        sessionId: target.sessionId,
+        ...(target.instanceId !== undefined ? { instanceId: target.instanceId } : {}),
+      }),
+    };
+  }
+
+  /** Inventory/status reads tolerate a missing target; mutations never do. */
+  function captureMcpBindingSafe() {
+    try {
+      return captureMcpBinding();
+    } catch {
+      return null;
+    }
+  }
+
+  function isMcpBindingCurrent(binding) {
+    if (disposed) return false;
+    if (!binding) return true;
+    if (binding.context !== getContextKey()) return false;
+    if (!binding.target) return true;
+    return sameMcpTarget(binding.target, getRuntimeTarget?.());
+  }
+
+  function assertMcpBindingCurrent(binding) {
+    if (!isMcpBindingCurrent(binding)) {
+      throw new Error(t("settings.mcp.targetChanged"));
+    }
+  }
+
+  /**
+   * Gateway rejects (timeout / no target / transport failure) normalize to the
+   * same {ok:false} shape the handlers already render — models-page.js
    * precedent. Without this, a rejected call strands the click handler as an
-   * unhandled rejection with no user feedback for the full 30s timeout. */
-  function call(op, params) {
-    return configGateway.call(op, params).catch((error) => ({
-      ok: false,
-      error: error?.message ?? String(error),
-    }));
+   * unhandled rejection with no user feedback for the full 30s timeout.
+   *
+   * Every MCP request carries its initiating binding: `options.target` pins the
+   * routing triple and the gateway's synchronous `beforeSend` re-checks it after
+   * readiness, immediately before dispatch. A stale binding rejects instead of
+   * falling back to the current target.
+   */
+  function call(op, params, binding) {
+    try {
+      const active = binding === undefined ? captureMcpBinding() : binding;
+      if (getRuntimeTarget && !active?.target) throw new Error(t("settings.mcp.noSession"));
+      assertMcpBindingCurrent(active);
+      const options = {
+        ...(active?.target ? { target: active.target } : {}),
+        beforeSend: () => assertMcpBindingCurrent(active),
+      };
+      return configGateway.call(op, params, options).catch((error) => ({
+        ok: false,
+        error: error?.message ?? String(error),
+      }));
+    } catch (error) {
+      return Promise.resolve({ ok: false, error: error?.message ?? String(error) });
+    }
   }
 
   function selected() {
@@ -201,10 +396,30 @@ export function setupMcpPage({
   }
 
   function render() {
+    dropStaleInventory();
     renderTabs();
     renderCaption();
     renderMaster();
     renderDetail();
+  }
+
+  /**
+   * The inventory belongs to the binding it was read for. A repaint after the
+   * target moved on (workspace switch, session/instance adoption) must not
+   * restyle those rows as the new target's: acting on them would write into a
+   * workspace the user never looked at. Drop the rows and every control that
+   * carries their revision, and require an explicit refresh instead.
+   */
+  function dropStaleInventory() {
+    if (!data || !dataBinding) return;
+    if (isMcpBindingCurrent(dataBinding)) return;
+    data = null;
+    dataBinding = null;
+    refreshRequired = true;
+    selections.clear();
+    mode = "view";
+    pendingToggle = null;
+    if (!statusText) statusText = t("settings.mcp.targetChanged");
   }
 
   /** Tab-level caption outside the master list: scope label + entry count. */
@@ -231,7 +446,24 @@ export function setupMcpPage({
   function renderMaster() {
     masterEl.replaceChildren();
     (migrationsEl ?? document.getElementById("mcp-migrations"))?.replaceChildren();
-    if (!data) return;
+    if (!data) {
+      // No usable inventory: either the read failed or the rows belonged to a
+      // target that moved on. The only safe action is an explicit refresh.
+      if (!refreshRequired) return;
+      const refresh = document.createElement("button");
+      refresh.type = "button";
+      refresh.className = "models-provider-add";
+      refresh.dataset.action = "mcp-refresh";
+      refresh.textContent = t("settings.mcp.refresh");
+      refresh.addEventListener("click", () => {
+        if (refresh.disabled) return;
+        refresh.disabled = true;
+        void activate();
+      });
+      masterEl.appendChild(refresh);
+      return;
+    }
+    const renderScope = dataBinding;
     const entries = groupEntries();
 
     if (statusError) {
@@ -239,6 +471,18 @@ export function setupMcpPage({
       note.className = "mcp-group-error mcp-status-error";
       note.textContent = t("settings.mcp.status.unavailable");
       note.title = statusError;
+      masterEl.appendChild(note);
+    } else if (statusDiagnostics.errors.length > 0 || statusDiagnostics.note) {
+      // CLI diagnostics are page-level status, separate from the save/import
+      // summary. The host only ever sends fixed safe text here.
+      const note = document.createElement("div");
+      note.className = "mcp-group-error mcp-status-diagnostics";
+      const parts = [];
+      if (statusDiagnostics.errors.length > 0) {
+        parts.push(t("settings.mcp.status.errors", { count: statusDiagnostics.errors.length }));
+      }
+      if (statusDiagnostics.note) parts.push(statusDiagnostics.note);
+      note.textContent = parts.join(" ");
       masterEl.appendChild(note);
     }
 
@@ -266,7 +510,7 @@ export function setupMcpPage({
       row.appendChild(name);
       const meta = document.createElement("div");
       meta.className = "pkg-manager-sidebar-meta";
-      const live = statusFor(item.name, activeTab);
+      const live = statusForItem(item);
       const dot = document.createElement("span");
       dot.className = `pkg-manager-status-dot ${dotClassFor(item, live)}`;
       meta.appendChild(dot);
@@ -274,15 +518,12 @@ export function setupMcpPage({
       src.textContent = basename(item.sourceFile);
       src.title = item.sourceFile;
       meta.appendChild(src);
-      const statusBadge = renderStatusBadge(live);
+      // A disabled entry shows the config chip, never a live report: the host
+      // caches `pi mcp list` for 60s, so the cached state can predate the
+      // switch and would otherwise contradict the row it belongs to.
+      const statusBadge = item.enabled ? renderStatusBadge(live) : null;
       if (statusBadge) meta.appendChild(statusBadge);
-      // With live state known the badge is authoritative; the config-level
-      // "disabled" chip would only repeat it (or contradict it).
-      if (!item.enabled && !statusBadge) {
-        const badge = document.createElement("span");
-        badge.textContent = t("settings.mcp.disabledBadge");
-        meta.appendChild(badge);
-      }
+      if (!item.enabled) meta.appendChild(renderDisabledBadge());
       row.appendChild(meta);
       row.addEventListener("click", () => {
         selections.set(activeTab, { name: item.name });
@@ -304,6 +545,24 @@ export function setupMcpPage({
     });
     masterEl.appendChild(add);
 
+    // Batch snapshot of every global server into this project. Only offered
+    // where a trusted project exists: there is nothing to import into
+    // otherwise, and the backend would reject it anyway.
+    if (activeTab === "project" && data.projectTrusted) {
+      const importBtn = document.createElement("button");
+      importBtn.type = "button";
+      importBtn.className = "models-provider-add";
+      importBtn.dataset.action = "mcp-import-global";
+      importBtn.textContent = t("settings.mcp.importGlobal");
+      importBtn.disabled = batchPending;
+      importBtn.addEventListener("click", () => {
+        if (importBtn.disabled) return;
+        importBtn.disabled = true;
+        void importGlobalOverrides(renderScope);
+      });
+      masterEl.appendChild(importBtn);
+    }
+
     // Migration notices live OUTSIDE the master/detail layout entirely:
     // migrating is the user's call and must not compete with the live view.
     for (const target of data.migrations ?? []) {
@@ -323,7 +582,7 @@ export function setupMcpPage({
       // twice; the re-render after load() replaces this button anyway.
       action.addEventListener("click", () => {
         action.disabled = true;
-        void migrate(target.id);
+        void migrate(target.id, renderScope);
       });
       notice.append(text, action);
       (migrationsEl ?? document.getElementById("mcp-migrations") ?? masterEl).appendChild(notice);
@@ -335,8 +594,12 @@ export function setupMcpPage({
     return idx === -1 ? filePath : filePath.slice(idx + 1);
   }
 
-  /** Master-row dot: live state wins over the config `enabled` flag. */
+  /**
+   * Master-row dot: a disabled entry is disabled whatever the cached live
+   * report says; only an enabled entry lets the live state win over `enabled`.
+   */
   function dotClassFor(item, live) {
+    if (!item.enabled) return "is-disabled";
     switch (live?.state) {
       case "connected":
         return "is-loaded";
@@ -347,7 +610,7 @@ export function setupMcpPage({
       case "error":
         return "is-disabled";
       default:
-        return item.enabled ? "is-loaded" : "is-disabled";
+        return "is-loaded";
     }
   }
 
@@ -382,6 +645,14 @@ export function setupMcpPage({
     return badge;
   }
 
+  function renderDisabledBadge() {
+    const badge = document.createElement("span");
+    badge.className = "mcp-badge";
+    badge.dataset.disabledBadge = "";
+    badge.textContent = t("settings.mcp.disabledBadge");
+    return badge;
+  }
+
   function summarize(text) {
     const collapsed = text.replace(/\s+/g, " ").trim();
     return collapsed.length > ERROR_SUMMARY_CHARS
@@ -391,45 +662,32 @@ export function setupMcpPage({
 
   /**
    * Sign-in / sign-out affordances for the selected row. Sign-out needs a live
-   * connected HTTP server; sign-in is offered to every other authorization-
-   * capable HTTP server. A project row pi does not report at all means the
-   * project is not trusted (pi omits it), so the button is disabled with an
-   * explicit reason instead of surfacing pi's raw trust error.
+   * connected HTTP server; sign-in needs Pi to report `needs-auth`. A missing
+   * report is unknown state — never an inference that the project is untrusted
+   * (the config plane already reports trust explicitly) and never a reason to
+   * offer an action `/mcp login` cannot complete.
    */
   function renderOAuthRow(item) {
     if (!mcpLogin) return null;
-    const live = statusFor(item.name, activeTab);
+    const live = statusForItem(item);
     const isHttp = /http/i.test(transportOf(item, live));
     const state = live?.state ?? null;
-    const untrustedProject = activeTab === "project" && !live;
     const canSignOut = isHttp && state === "connected";
-    // Sign-in targets MCP OAuth only: pi must explicitly report
-    // `needs-auth`. An `error` or missing report (status query failed,
-    // headers-based auth) is not something `/mcp login` can fix, so no
-    // button — the error badge carries the detail instead. The one
-    // exception is an unreported project row: pi omits untrusted projects,
-    // so the disabled button explains why.
-    const canSignIn = isHttp && item.enabled && (state === "needs-auth" || untrustedProject);
+    const canSignIn = isHttp && item.enabled && state === "needs-auth";
     if (!canSignIn && !canSignOut) return null;
 
     const row = document.createElement("div");
     row.className = "mcp-toggle-row";
-    const badge = renderStatusBadge(live);
-    if (badge) row.appendChild(badge);
+    // Same rule as the master row: a disabled config hides the cached live
+    // badge. Sign-out above survives it — clearing stored credentials does
+    // not depend on the entry being enabled.
+    const badge = item.enabled ? renderStatusBadge(live) : renderDisabledBadge();
+    row.appendChild(badge);
 
     if (canSignIn) {
       const signIn = actionButton("mcp-login", t("settings.mcp.signIn"), "mcp-btn mcp-btn-primary");
-      if (untrustedProject) {
-        signIn.disabled = true;
-        signIn.title = t("settings.mcp.projectUntrusted");
-        const hint = document.createElement("span");
-        hint.className = "mcp-toggle-label";
-        hint.textContent = t("settings.mcp.projectUntrusted");
-        row.append(signIn, hint);
-      } else {
-        signIn.addEventListener("click", () => startLogin(item.name));
-        row.appendChild(signIn);
-      }
+      signIn.addEventListener("click", () => startLogin(item.name));
+      row.appendChild(signIn);
     }
     if (canSignOut) {
       const signOut = actionButton(
@@ -503,6 +761,7 @@ export function setupMcpPage({
 
   function renderDetail() {
     detailEl.replaceChildren();
+    const renderScope = dataBinding;
     const body = document.createElement("div");
     body.className = "mcp-detail-body";
     const status = document.createElement("div");
@@ -510,8 +769,12 @@ export function setupMcpPage({
     status.textContent = statusText;
     body.appendChild(status);
 
+    if (!data) {
+      detailEl.replaceChildren(body);
+      return;
+    }
     if (mode === "add") {
-      body.appendChild(renderForm(null, null));
+      body.appendChild(renderForm(activeTab, null, renderScope));
       detailEl.replaceChildren(body);
       return;
     }
@@ -525,15 +788,274 @@ export function setupMcpPage({
       detailEl.replaceChildren(body);
       return;
     }
-    body.appendChild(renderEntry(item));
+    // Override and invalid rows get the three-field detail; full definitions
+    // keep the existing connection editor unchanged.
+    const overrideLike = item.kind === "override" || item.kind === "invalid";
+    body.appendChild(
+      overrideLike ? renderOverride(item, renderScope) : renderEntry(item, renderScope),
+    );
     detailEl.replaceChildren(body);
   }
 
-  function renderEntry(item) {
+  function draftKey(item) {
+    return [item.sourceFile, item.name, item.revision ?? ""].join("\u0000");
+  }
+
+  /**
+   * Adopt the acknowledged toggle result in the in-memory row so every repaint
+   * between the acknowledgement and the inventory reload renders one revision.
+   * `load()` replaces the row with the file's truth; until then the row must not
+   * keep the revision the toggle just invalidated.
+   */
+  function applyToggleAcknowledgement(item, result) {
+    const revision = result?.revision ?? item.revision;
+    item.revision = revision;
+    if (typeof result?.enabled === "boolean") {
+      item.enabled = result.enabled;
+      if (item.effective) item.effective = { ...item.effective, enabled: result.enabled };
+    }
+    return revision;
+  }
+
+  function overrideDraft(item) {
+    const key = draftKey(item);
+    const existing = drafts.get(key);
+    if (existing) return { key, draft: existing };
+    const draft = {
+      exposure: item.effective?.exposure ?? "codemode",
+      toolExposureText: JSON.stringify(item.effective?.toolExposure ?? {}, null, 2),
+    };
+    drafts.set(key, draft);
+    return { key, draft };
+  }
+
+  function renderOverride(item, renderScope) {
+    const { key, draft } = overrideDraft(item);
+    return renderMcpOverrideDetail({
+      item,
+      draft,
+      status: statusForItem(item),
+      pending: pendingToggle === item.name,
+      onDraftChange: (next) => {
+        drafts.set(key, next); // unsaved text survives re-renders and locale repaints
+      },
+      onToggle: (intent) => {
+        if (batchPending) return;
+        void toggleOverride(item, intent, renderScope);
+      },
+      onSave: (values) => {
+        if (batchPending) return;
+        void saveOverride(item, values, renderScope);
+      },
+      onRemove: () => {
+        if (batchPending) return;
+        void removeOverride(item, renderScope);
+      },
+    });
+  }
+
+  /** enabled is one field, saved on its own; other unsaved fields stay drafted. */
+  async function toggleOverride(item, intent, renderScope) {
+    let binding;
+    try {
+      binding = actionBinding(renderScope);
+    } catch (error) {
+      setStatus(error?.message ?? String(error));
+      render();
+      return;
+    }
+    const key = draftKey(item);
+    pendingToggle = item.name;
+    render();
+    const result = await call(
+      "mcp_toggle_server",
+      {
+        scope: "project",
+        name: item.name,
+        disable: intent.disable,
+        expectedRevision: item.revision,
+        expectedGlobalRevision: data?.revisions?.piGlobal,
+      },
+      binding,
+    );
+    pendingToggle = null;
+    if (!isMcpBindingCurrent(binding)) return;
+    if (!result.ok) {
+      setStatus(String(result.error ?? t("settings.mcp.status.unavailable")));
+      render();
+      return;
+    }
+    // The acknowledgement carries a new revision: move the unsaved draft to it
+    // so a switch click never discards exposure/map text the user typed.
+    // Adopt the acknowledged revision and enabled state in the in-memory row
+    // *before* repainting: the inventory reload below may take a while or fail,
+    // and repainting the invalidated revision would rebuild a default draft on
+    // the old key — losing whatever the user types while the reload is in
+    // flight. With the row advanced, the pane keeps one revision and one draft
+    // identity for the whole ack→reload window.
+    applyToggleAcknowledgement(item, result.data);
+    // Read the draft now, not before the request: the map field stayed editable
+    // while the toggle was pending and `onDraftChange` replaces the stored
+    // object. When the acknowledgement repeats the revision (a no-op) the key
+    // is unchanged, so the draft must stay where it is instead of being moved
+    // and deleted under itself.
+    const nextKey = draftKey(item);
+    const draft = drafts.get(key);
+    if (draft && nextKey !== key) {
+      drafts.set(nextKey, draft);
+      drafts.delete(key);
+    }
+    invalidateStatus();
+    render();
+    // Issue the host refresh before the reload it may not survive.
+    void loadStatus({ refresh: true });
+    await load();
+    if (!isMcpBindingCurrent(binding)) return;
+    // load() clears the status line, so the operation result is set after it.
+    setStatus(t("settings.mcp.reloadRequired"));
+  }
+
+  async function saveOverride(item, values, renderScope) {
+    let binding;
+    try {
+      binding = actionBinding(renderScope);
+    } catch (error) {
+      setStatus(error?.message ?? String(error));
+      render();
+      return;
+    }
+    const result = await call(
+      "mcp_save_server",
+      {
+        scope: "project",
+        name: item.name,
+        kind: "override",
+        intent: "edit",
+        entry: {
+          enabled: values.enabled,
+          exposure: values.exposure,
+          toolExposure: values.toolExposure,
+        },
+        expectedRevision: item.revision,
+        expectedGlobalRevision: data?.revisions?.piGlobal,
+      },
+      binding,
+    );
+    if (!isMcpBindingCurrent(binding)) return;
+    if (!result.ok) {
+      // Stale/conflicting revision: the draft stays, the user reloads.
+      setStatus(String(result.error ?? t("settings.mcp.status.unavailable")));
+      render();
+      return;
+    }
+    drafts.delete(draftKey(item));
+    invalidateStatus();
+    render();
+    // Issue the host refresh before the reload it may not survive.
+    void loadStatus({ refresh: true });
+    await load();
+    if (!isMcpBindingCurrent(binding)) return;
+    setStatus(t("settings.mcp.reloadRequired"));
+  }
+
+  async function removeOverride(item, renderScope) {
+    let binding;
+    try {
+      binding = actionBinding(renderScope);
+    } catch (error) {
+      setStatus(error?.message ?? String(error));
+      render();
+      return;
+    }
+    const result = await call(
+      "mcp_delete_server",
+      { scope: "project", name: item.name, expectedRevision: item.revision },
+      binding,
+    );
+    if (!isMcpBindingCurrent(binding)) return;
+    if (!result.ok) {
+      setStatus(String(result.error ?? t("settings.mcp.status.unavailable")));
+      render();
+      return;
+    }
+    drafts.delete(draftKey(item));
+    invalidateStatus();
+    render();
+    // Issue the host refresh before the reload it may not survive.
+    void loadStatus({ refresh: true });
+    await load();
+    if (!isMcpBindingCurrent(binding)) return;
+    setStatus(t("settings.mcp.override.removeWarning"));
+  }
+
+  /**
+   * One batch write of every valid global server as an explicit three-field
+   * snapshot. The initiating binding is frozen before the request, so a
+   * workspace switch while readiness opens rejects instead of importing into
+   * the new workspace.
+   */
+  async function importGlobalOverrides(renderScope) {
+    let binding;
+    try {
+      binding = actionBinding(renderScope);
+    } catch (error) {
+      batchPending = false;
+      setStatus(error?.message ?? String(error));
+      render();
+      return;
+    }
+    batchPending = true;
+    render();
+    const result = await call("mcp_import_global_overrides", {}, binding);
+    batchPending = false;
+    if (!isMcpBindingCurrent(binding)) return;
+    if (!result.ok) {
+      setStatus(t("settings.mcp.importFailed", { error: String(result.error ?? "") }));
+      render();
+      return;
+    }
+    const summary = importSummary(result.data);
+    invalidateStatus();
+    render();
+    // Issue the host refresh before the reload it may not survive.
+    void loadStatus({ refresh: true });
+    await load();
+    if (!isMcpBindingCurrent(binding)) return;
+    // load() clears the status line; the operation result is sticky.
+    setStatus(summary);
+  }
+
+  function importSummary(result) {
+    const imported = Array.isArray(result?.imported) ? result.imported : [];
+    const skipped = Array.isArray(result?.skipped) ? result.skipped : [];
+    const existing = skipped.filter((s) => s.reason === "existing").length;
+    const conflicts = skipped.filter((s) => s.reason !== "existing").length;
+    const counts = t("settings.mcp.importSummary", {
+      added: imported.length,
+      existing,
+      skipped: conflicts,
+    });
+    const details = skipped.map((skip) =>
+      skip.reason === "namespace-conflict"
+        ? t("settings.mcp.importSkip.namespaceConflict", {
+            name: skip.name,
+            conflict: skip.conflictWith ?? "",
+          })
+        : skip.reason === "invalid-global"
+          ? t("settings.mcp.importSkip.invalidGlobal", {
+              name: skip.name,
+              detail: skip.detail ?? "",
+            })
+          : t("settings.mcp.importSkip.existing", { name: skip.name }),
+    );
+    return details.length > 0 ? `${counts} ${details.join("; ")}` : counts;
+  }
+
+  function renderEntry(item, renderScope) {
     const wrap = document.createElement("div");
     wrap.className = "mcp-entry";
 
-    wrap.appendChild(renderToggle(item));
+    wrap.appendChild(renderToggle(item, renderScope));
 
     const head = document.createElement("div");
     head.className = "mcp-entry-head";
@@ -553,11 +1075,23 @@ export function setupMcpPage({
     source.textContent = `${t("settings.mcp.sourceLabel")}: ${item.sourceFile}`;
     wrap.appendChild(source);
 
+    // Native eligibility diagnostic: pi rejects this definition, so it is
+    // neither an import candidate nor an override base. The legacy editor
+    // below keeps its contract (JSONC, `mcp-servers`, array commands); this
+    // line only explains why native Pi does not read the entry.
+    if (typeof item.validationError === "string" && item.validationError.length > 0) {
+      const diagnostic = document.createElement("div");
+      diagnostic.className = "mcp-group-error";
+      diagnostic.dataset.diagnostic = "native-ineligible";
+      diagnostic.textContent = item.validationError;
+      wrap.appendChild(diagnostic);
+    }
+
     const oauthRow = renderOAuthRow(item);
     if (oauthRow) wrap.appendChild(oauthRow);
 
     if (item.editable) {
-      const form = renderForm(activeTab, item.name);
+      const form = renderForm(activeTab, item.name, renderScope);
       wrap.appendChild(form);
     } else {
       const pre = document.createElement("pre");
@@ -569,7 +1103,7 @@ export function setupMcpPage({
     return wrap;
   }
 
-  function renderToggle(item) {
+  function renderToggle(item, renderScope) {
     // Extensions-page switch pattern: role=switch + pkg-manager-toggle.
     const row = document.createElement("div");
     row.className = "mcp-toggle-row";
@@ -584,15 +1118,34 @@ export function setupMcpPage({
     toggle.setAttribute("aria-label", t("settings.mcp.enable"));
     toggle.appendChild(document.createElement("span"));
     toggle.addEventListener("click", async () => {
-      const result = await call("mcp_toggle_server", {
-        scope: activeTab,
-        name: item.name,
-        disable: item.enabled,
-      });
+      if (batchPending) return;
+      let binding;
+      try {
+        binding = actionBinding(renderScope);
+      } catch (error) {
+        setStatus(error?.message ?? String(error));
+        render();
+        return;
+      }
+      const result = await call(
+        "mcp_toggle_server",
+        {
+          scope: activeTab,
+          name: item.name,
+          disable: item.enabled,
+          expectedRevision: item.revision,
+        },
+        binding,
+      );
+      if (!isMcpBindingCurrent(binding)) return;
       if (result.ok) {
+        invalidateStatus();
         setStatus(t("settings.mcp.saved"));
+        render();
+        // Issue the host refresh before the reload it may not survive.
+        void loadStatus({ refresh: true });
         await load();
-      } else setStatus(String(result.error ?? "toggle failed"));
+      } else setStatus(String(result.error ?? t("settings.mcp.status.unavailable")));
     });
     row.append(label, toggle);
     return row;
@@ -603,9 +1156,13 @@ export function setupMcpPage({
    * Array-form `command` displays joined with spaces and round-trips the
    * original array untouched unless the user edits the field.
    */
-  function renderForm(scope, name) {
-    const existing = name ? findEntry(name)?.entry : null;
-    const isEdit = existing !== null;
+  function renderForm(scope, name, renderScope) {
+    // The rendered row (not whatever the list holds at click time) owns the
+    // revision and the target this form may act on.
+    const renderedItem = name ? findEntry(name) : null;
+    const existing = renderedItem?.entry ?? null;
+    const isEdit = renderedItem !== null;
+    const renderedRevision = isEdit ? renderedItem?.revision : data?.revisions?.[scope];
     const form = document.createElement("form");
     form.className = "mcp-form";
     form.addEventListener("submit", (e) => e.preventDefault());
@@ -724,13 +1281,31 @@ export function setupMcpPage({
       del.className = "mcp-btn mcp-btn-danger";
       del.textContent = t("settings.mcp.delete");
       del.addEventListener("click", async () => {
-        const result = await call("mcp_delete_server", { scope, name });
+        if (batchPending) return;
+        let binding;
+        try {
+          binding = actionBinding(renderScope);
+        } catch (error) {
+          setStatus(error?.message ?? String(error));
+          render();
+          return;
+        }
+        const result = await call(
+          "mcp_delete_server",
+          { scope, name, expectedRevision: renderedRevision },
+          binding,
+        );
+        if (!isMcpBindingCurrent(binding)) return;
         if (result.ok) {
           selections.delete(activeTab);
           mode = "view";
+          invalidateStatus();
           setStatus(t("settings.mcp.saved"));
+          render();
+          // Issue the host refresh before the reload it may not survive.
+          void loadStatus({ refresh: true });
           await load();
-        } else setStatus(String(result.error ?? "delete failed"));
+        } else setStatus(String(result.error ?? t("settings.mcp.status.unavailable")));
       });
       actions.appendChild(del);
     }
@@ -766,18 +1341,39 @@ export function setupMcpPage({
       }
       if (exposureSelect.value === "codemode") delete entry.exposure;
       else entry.exposure = exposureSelect.value;
+      if (batchPending) return;
       const targetName = isEdit ? name : nameInput.value.trim();
-      const result = await call("mcp_save_server", {
-        scope,
-        name: targetName,
-        entry,
-      });
+      let binding;
+      try {
+        binding = actionBinding(renderScope);
+      } catch (error) {
+        setStatus(error?.message ?? String(error));
+        render();
+        return;
+      }
+      const result = await call(
+        "mcp_save_server",
+        {
+          scope,
+          name: targetName,
+          kind: "definition",
+          intent: isEdit ? "edit" : "create",
+          entry,
+          expectedRevision: renderedRevision,
+        },
+        binding,
+      );
+      if (!isMcpBindingCurrent(binding)) return;
       if (result.ok) {
         selections.set(activeTab, { name: targetName });
         mode = "view";
+        invalidateStatus();
         setStatus(t("settings.mcp.saved"));
+        render();
+        // Issue the host refresh before the reload it may not survive.
+        void loadStatus({ refresh: true });
         await load();
-      } else setStatus(String(result.error ?? "save failed"));
+      } else setStatus(String(result.error ?? t("settings.mcp.status.unavailable")));
     });
 
     form.append(
@@ -831,8 +1427,10 @@ export function setupMcpPage({
   }
 
   function destroy() {
+    disposed = true;
     loginDialog?.destroy();
     loginDialog = null;
+    drafts.clear();
     unsubscribeLocale();
   }
 

@@ -45,10 +45,13 @@ import {
 } from "./extension-settings";
 import {
   deleteMcpServer,
+  importGlobalMcpOverrides,
   listMcpServers,
+  type McpSettingsContext,
   migrateAdapterConfig,
   saveMcpServer,
   toggleMcpServer,
+  UNTRUSTED_PROJECT_ERROR,
 } from "./mcp-settings";
 import {
   createOAuthLoginOperationManager,
@@ -270,6 +273,11 @@ function resolveHomeDir(): string {
 }
 
 function resolvePiAgentRoot(): string {
+  // Pi's own agent directory is `PI_CODING_AGENT_DIR` when set (the Rust launch
+  // resolver honors it too). Reading MCP configs or the trust store from a
+  // different directory would make the page import the wrong globals.
+  const fromEnv = process.env.PI_CODING_AGENT_DIR;
+  if (typeof fromEnv === "string" && fromEnv.trim()) return path.resolve(fromEnv.trim());
   const candidates: string[] = [];
   const add = (value?: string) => {
     if (typeof value === "string" && value.trim()) candidates.push(path.resolve(value.trim()));
@@ -348,9 +356,87 @@ function parseSkillTarget(value: unknown): SkillTarget {
   return { kind: target.kind, id: target.id };
 }
 
-/** The MCP ops are project-layer aware: empty string means "no project cwd". */
-function mcpCwd(ctx: ConfigContext): string {
-  return typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : "";
+/** Host-issued launch marker naming the registry-verified project root. */
+const MCP_PROJECT_ROOT_ENV = "PI_STUDIO_MCP_PROJECT_ROOT";
+
+/**
+ * MCP settings context. The project root is taken from the host launch marker
+ * only: `ctx.cwd` is not authorization, because the landing/scratch runtime runs
+ * in Picot's own temp directory. Missing or mismatched marker means global-only.
+ */
+function mcpContext(ctx: ConfigContext): McpSettingsContext {
+  const projectRoot = resolveMcpProjectRoot(ctx);
+  if (!projectRoot) return { agentDir: PI_AGENT_ROOT, projectRoot: null, projectTrusted: false };
+  return {
+    agentDir: PI_AGENT_ROOT,
+    projectRoot,
+    projectTrusted: isMcpProjectTrusted(ctx, projectRoot),
+    // Re-read inside the write lock: a revocation that lands while the mutation
+    // waits for the lock must reject instead of writing.
+    verifyProject: () => {
+      if (!isMcpProjectTrusted(ctx, projectRoot)) throw new Error(UNTRUSTED_PROJECT_ERROR);
+    },
+  };
+}
+
+function resolveMcpProjectRoot(ctx: ConfigContext): string | null {
+  const marker = process.env[MCP_PROJECT_ROOT_ENV];
+  const cwd = typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : "";
+  if (!marker || !cwd || !path.isAbsolute(marker) || !path.isAbsolute(cwd)) return null;
+  try {
+    // The host issues the marker as the already-canonical project root at spawn
+    // (`pi_launch::canonical_project_root`), so the marker itself is the
+    // authorization identity. Requiring it to still resolve to itself means a
+    // directory that was renamed away, replaced by a symlink, or reached
+    // through a swapped ancestor is rejected instead of being promoted into a
+    // fresh permission for whatever the path points at now.
+    if (fs.realpathSync(marker) !== marker) return null;
+    // `ctx.cwd` may legitimately be a symlinked alias of the admitted root, so
+    // it is still compared by realpath — but against the issued root, never
+    // against a re-resolved marker.
+    if (fs.realpathSync(cwd) !== marker) return null;
+    return marker;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pi's saved decision is consulted again at request time and wins over a stale
+ * in-process answer: a nearer explicit `false` withdraws the write permission,
+ * while a parent `true` (or no entry at all, e.g. session-only trust) leaves the
+ * runtime's own answer standing. An unreadable store fails closed.
+ */
+function isMcpProjectTrusted(ctx: ConfigContext, projectRoot: string): boolean {
+  if (ctx.isProjectTrusted?.() !== true) return false;
+  return nearestSavedTrust(projectRoot) !== false;
+}
+
+function nearestSavedTrust(projectRoot: string): boolean | null {
+  const trustPath = path.join(PI_AGENT_ROOT, "trust.json");
+  let raw: string;
+  try {
+    raw = fs.readFileSync(trustPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return false;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const decisions = parsed as Record<string, unknown>;
+  let dir = projectRoot;
+  for (;;) {
+    const decision = decisions[dir];
+    if (decision === true || decision === false) return decision;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
 }
 
 function skillInventoryOptions(scope: SkillScope, ctx: ConfigContext) {
@@ -1629,23 +1715,28 @@ export async function handlePicotConfig(
         return { ok: true, data: getDefaultCodemode() };
 
       case "mcp_list_servers":
-        return { ok: true, data: listMcpServers(PI_AGENT_ROOT, mcpCwd(ctx)) };
+        return { ok: true, data: listMcpServers(mcpContext(ctx)) };
 
       case "mcp_save_server":
-        return { ok: true, data: saveMcpServer(params, PI_AGENT_ROOT, mcpCwd(ctx)) };
+        return { ok: true, data: await saveMcpServer(params, mcpContext(ctx)) };
 
       case "mcp_delete_server":
-        return { ok: true, data: deleteMcpServer(params, PI_AGENT_ROOT, mcpCwd(ctx)) };
+        return { ok: true, data: await deleteMcpServer(params, mcpContext(ctx)) };
 
       case "mcp_toggle_server":
-        return { ok: true, data: toggleMcpServer(params, PI_AGENT_ROOT, mcpCwd(ctx)) };
+        return { ok: true, data: await toggleMcpServer(params, mcpContext(ctx)) };
+
+      // One batch snapshot of the global file's effective enabled/exposure/
+      // toolExposure values. Connection fields and credentials never move.
+      case "mcp_import_global_overrides":
+        return { ok: true, data: await importGlobalMcpOverrides(mcpContext(ctx)) };
 
       // User-confirmed legacy mcp.json → mcp-adapter.json copy (the list op
       // only detects; it never writes).
       case "mcp_migrate_adapter_config":
         return {
           ok: true,
-          data: migrateAdapterConfig(params, PI_AGENT_ROOT, mcpCwd(ctx)),
+          data: await migrateAdapterConfig(params, mcpContext(ctx)),
         };
 
       case "advisor.config.get":

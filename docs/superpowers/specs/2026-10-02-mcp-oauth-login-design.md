@@ -4,6 +4,14 @@
 **状态：** 设计稿（待 Dr. Lin 拍板）
 **前置：** 内嵌 Pi ≥ 0.99.2（当前 pin 0.99.2，1.0.0 兼容已评估）
 
+## 2026-10-05 关联说明
+
+登录/登出/状态的宿主 CLI 链路已在当前源码实现；本文早期状态与 pin 是历史记录，不作当前版本证明。项目 override 的页面与保存契约以 [MCP 设置页 Spec](implemented/2026-09-13-mcp-settings-page-design.md) 为准，新增能力仍待实施。它不改变 token store、owner-bound 登录操作、取消或缓存失效契约。
+
+合法 override 的状态身份是有效全局 scope/source 加项目 override 路径，不是 project scope。项目 override detail 不放 OAuth 按钮；需要认证时回全局页操作。完整服务器既有 OAuth UI 保留。无 live report 不等于未信任，信任必须由工作区/配置准入判断。host `mcp_server_status` 可增加 `refresh:true`，在配置变更后复用 runner.invalidate() 再查询，默认仍维持 60 秒 TTL、页面不轮询。
+
+当前 host MCP ops 要求 Registered workspace，landing 的全局配置桥可用不代表 MCP CLI 登录/status 已对 landing 放行。本次不扩大此权限；状态不可用时页面降级。Pi ≥1.0.1 是项目 override 的前置，实施前核验实际内嵌 binary，不以 pin 单独证明。
+
 ## 目标
 
 MCP 设置页对齐 Models 页 codex OAuth 的体验：每台远程 MCP 服务器可**登录（浏览器授权码流）/登出/看连接状态**，令牌由 pi 写入 `~/.pi/agent/mcp-auth.json`，Picot 全程不接触密钥。

@@ -8104,6 +8104,14 @@ const mcpPage = setupMcpPage({
   mcpLogin: createMcpHostOps(transport),
   openExternal: (url) => transport.openExternal(url),
   captionEl: document.getElementById("mcp-tab-caption"),
+  // Project MCP actions are bound to the workspace identity (workspace +
+  // generation) and to the exact routing triple the user acted on: a switch
+  // while readiness opens rejects instead of writing into the new workspace.
+  getContextKey: () => {
+    const target = getSettingsRuntimeTarget();
+    return [target?.workspaceId ?? "no-workspace", gitClient.generation ?? 0].join("\u0000");
+  },
+  getRuntimeTarget: getSettingsRuntimeTarget,
 });
 packageManager = setupPackageManager({
   root: document,

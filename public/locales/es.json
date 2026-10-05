@@ -824,6 +824,7 @@
       "sourceLabel": "Origen",
       "sectionsAriaLabel": "Capas MCP",
       "addMcp": "+ Añadir MCP",
+      "refresh": "Actualizar",
       "migrateNotice": "La configuración antigua {file} contiene {count} servidor(es) que Pi nativo no lee.",
       "migrate": "Migrar",
       "migrationFailed": "La migración falló.",
@@ -838,7 +839,9 @@
         "disabled": "Deshabilitado",
         "error": "Error",
         "unknown": "Estado desconocido",
-        "unavailable": "El estado MCP en vivo no está disponible."
+        "unavailable": "El estado MCP en vivo no está disponible.",
+        "errors": "{count} servidor(es) informaron errores.",
+        "trustNote": "Los servidores MCP del proyecto no son de confianza en esta sesión."
       },
       "login": {
         "title": "Iniciar sesión en {name}",
@@ -849,7 +852,32 @@
         "retry": "Reintentar",
         "failed": "Error al iniciar sesión.",
         "cancelled": "Inicio de sesión cancelado."
-      }
+      },
+      "importGlobal": "Importar ajustes globales",
+      "importSummary": "Añadidos {added}, ya presentes {existing}, omitidos {skipped}.",
+      "importFailed": "Error al importar: {error}",
+      "importSkip": {
+        "existing": "{name}: ya está en este proyecto",
+        "namespaceConflict": "{name}: colisiona con {conflict}",
+        "invalidGlobal": "{name}: entrada global no válida ({detail})"
+      },
+      "reloadRequired": "Guardado. Recarga la sesión para aplicarlo.",
+      "trustRequired": "Confía en este proyecto para gestionar sus servidores MCP.",
+      "override": {
+        "sourceHint": "Anula el servidor global {name}. La conexión y el inicio de sesión siguen siendo globales.",
+        "toolExposure": "Mapa de exposición de herramientas (JSON)",
+        "mapHelp": "Reemplaza el mapa completo: las claves son nombres de herramientas o patrones *; el nombre exacto gana y, entre patrones, gana la primera coincidencia. {} elimina las reglas por herramienta.",
+        "mapInvalid": "Introduce un objeto JSON, por ejemplo {}.",
+        "mapValueInvalid": "La herramienta «{tool}» debe ser codemode, direct, deferred o hidden.",
+        "exposureInvalid": "Elige una exposición de herramientas.",
+        "remove": "Quitar anulación del proyecto",
+        "removeWarning": "Elimina esta entrada solo del mcp.json del proyecto. El servidor global sigue aplicándose; no equivale a desactivarlo.",
+        "baseLost": "El servidor global de esta anulación ya no existe. Quita la entrada o restaura el servidor global.",
+        "staleDraft": "El archivo cambió en el disco. Recarga antes de guardar.",
+        "needsAuthHint": "Este servidor requiere inicio de sesión. Usa la pestaña Global; esta entrada solo anula la exposición."
+      },
+      "noSession": "No hay sesión activa para la configuración MCP.",
+      "targetChanged": "El espacio de trabajo cambió antes de enviar la petición MCP."
     },
     "usage": "Uso",
     "quota": "Cuota",

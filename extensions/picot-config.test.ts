@@ -6,7 +6,9 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,6 +30,9 @@ async function loadConfigWithTempHome() {
   const home = mkdtempSync(join(tmpdir(), "picot-config-auth-"));
   tempHomes.push(home);
   vi.resetModules();
+  // Hermetic: the agent root honors PI_CODING_AGENT_DIR (like Pi and the Rust
+  // launcher), so the temp HOME must not lose to an inherited value.
+  vi.stubEnv("PI_CODING_AGENT_DIR", "");
   process.env.HOME = home;
   const module = await import("./picot-config.ts");
   return {
@@ -990,5 +995,344 @@ describe("picot config settings writes share the settings lock", () => {
         expect(settings.otherKey).toBe("keep");
       },
     );
+  });
+});
+
+describe("picot config MCP project admission", () => {
+  const MARKER = "PI_STUDIO_MCP_PROJECT_ROOT";
+
+  async function fixture() {
+    const { home, handlePicotConfig } = await loadConfigWithTempHome();
+    const agentDir = join(home, ".pi", "agent");
+    const project = join(home, "workspace");
+    mkdirSync(agentDir, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(
+      join(agentDir, "mcp.json"),
+      JSON.stringify({ mcpServers: { docs: { url: "https://example.test/mcp" } } }),
+      "utf8",
+    );
+    const projectFile = join(project, ".pi", "mcp.json");
+    return { home, agentDir, project, projectFile, handlePicotConfig };
+  }
+
+  function trustFile(home: string): string {
+    return join(home, ".pi", "agent", "trust.json");
+  }
+
+  it("keeps the global inventory usable and rejects project ops without a host marker", async () => {
+    const { project, projectFile, handlePicotConfig } = await fixture();
+    const listed = await handlePicotConfig(
+      "mcp_list_servers",
+      {},
+      { cwd: project, isProjectTrusted: () => true },
+    );
+    expect(listed).toMatchObject({
+      ok: true,
+      data: {
+        projectAvailable: false,
+        projectTrusted: false,
+        groups: { piGlobal: [{ name: "docs" }] },
+      },
+    });
+
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: project, isProjectTrusted: () => true },
+      ),
+    ).resolves.toMatchObject({ ok: false });
+    expect(existsSync(projectFile)).toBe(false);
+  });
+
+  it("rejects a marker that does not name the request cwd", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    vi.stubEnv(MARKER, home);
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: project, isProjectTrusted: () => true },
+      ),
+    ).resolves.toMatchObject({ ok: false });
+    expect(existsSync(projectFile)).toBe(false);
+  });
+
+  it("imports for a trusted project whose marker matches the canonical cwd", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    vi.stubEnv(MARKER, project);
+    writeFileSync(trustFile(home), JSON.stringify({ [realpathSync(project)]: true }), "utf8");
+
+    const result = await handlePicotConfig(
+      "mcp_import_global_overrides",
+      {},
+      { cwd: project, isProjectTrusted: () => true },
+    );
+    expect(result).toMatchObject({ ok: true, data: { imported: ["docs"], changed: true } });
+    expect(JSON.parse(readFileSync(projectFile, "utf8"))).toEqual({
+      mcpServers: { docs: { enabled: true, exposure: "codemode", toolExposure: {} } },
+    });
+  });
+
+  it("accepts a symlinked cwd alias when the marker resolves to the same directory", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    const alias = join(home, "workspace-alias");
+    symlinkSync(project, alias);
+    vi.stubEnv(MARKER, project);
+    writeFileSync(trustFile(home), JSON.stringify({ [realpathSync(project)]: true }), "utf8");
+
+    const result = await handlePicotConfig(
+      "mcp_import_global_overrides",
+      {},
+      { cwd: alias, isProjectTrusted: () => true },
+    );
+    expect(result).toMatchObject({ ok: true, data: { imported: ["docs"] } });
+    expect(existsSync(projectFile)).toBe(true);
+  });
+
+  it("rejects project ops when the runtime reports the project untrusted", async () => {
+    const { project, projectFile, handlePicotConfig } = await fixture();
+    vi.stubEnv(MARKER, project);
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: project, isProjectTrusted: () => false },
+      ),
+    ).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/trust/i) });
+    await expect(
+      handlePicotConfig("mcp_import_global_overrides", {}, { cwd: project }),
+    ).resolves.toMatchObject({ ok: false });
+    expect(existsSync(projectFile)).toBe(false);
+  });
+
+  it("fails closed when the trust store records a nearer false", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    vi.stubEnv(MARKER, project);
+    writeFileSync(
+      trustFile(home),
+      JSON.stringify({ [realpathSync(project)]: false, [home]: true }),
+      "utf8",
+    );
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: project, isProjectTrusted: () => true },
+      ),
+    ).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/trust/i) });
+    expect(existsSync(projectFile)).toBe(false);
+  });
+
+  it("inherits a saved trust decision from a parent directory", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    vi.stubEnv(MARKER, project);
+    writeFileSync(trustFile(home), JSON.stringify({ [home]: true }), "utf8");
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: project, isProjectTrusted: () => true },
+      ),
+    ).resolves.toMatchObject({ ok: true });
+    expect(existsSync(projectFile)).toBe(true);
+  });
+
+  /**
+   * Trust is re-read inside the settings lock. The wait is made controllable by
+   * pre-creating the lock directory, so the revocation lands exactly between
+   * admission and the critical section.
+   */
+  function holdProjectLock(projectFile: string): () => void {
+    const lockDir = `${projectFile}.lock`;
+    mkdirSync(lockDir, { recursive: true });
+    return () => rmSync(lockDir, { recursive: true, force: true });
+  }
+
+  const UNTRUSTED_MESSAGE =
+    "This project is not trusted; project MCP settings are unavailable until you trust it";
+
+  it("rejects an import with the untrusted error when trust is withdrawn while waiting", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    const projectReal = realpathSync(project);
+    vi.stubEnv(MARKER, project);
+    writeFileSync(trustFile(home), JSON.stringify({ [projectReal]: true }), "utf8");
+    mkdirSync(join(project, ".pi"), { recursive: true });
+    const release = holdProjectLock(projectFile);
+
+    const pending = handlePicotConfig(
+      "mcp_import_global_overrides",
+      {},
+      { cwd: project, isProjectTrusted: () => true },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    writeFileSync(trustFile(home), JSON.stringify({ [projectReal]: false }), "utf8");
+    release();
+
+    await expect(pending).resolves.toEqual({ ok: false, error: UNTRUSTED_MESSAGE });
+    expect(existsSync(projectFile)).toBe(false);
+  });
+
+  it("rejects a project save with the untrusted error when trust is withdrawn while waiting", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    const projectReal = realpathSync(project);
+    vi.stubEnv(MARKER, project);
+    writeFileSync(trustFile(home), JSON.stringify({ [projectReal]: true }), "utf8");
+    mkdirSync(join(project, ".pi"), { recursive: true });
+    const release = holdProjectLock(projectFile);
+
+    const pending = handlePicotConfig(
+      "mcp_save_server",
+      {
+        scope: "project",
+        name: "docs",
+        kind: "definition",
+        intent: "create",
+        entry: { command: "run" },
+        expectedRevision: "missing",
+      },
+      { cwd: project, isProjectTrusted: () => true },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    writeFileSync(trustFile(home), JSON.stringify({ [projectReal]: false }), "utf8");
+    release();
+
+    await expect(pending).resolves.toEqual({ ok: false, error: UNTRUSTED_MESSAGE });
+    expect(existsSync(projectFile)).toBe(false);
+  });
+
+  it("fails closed on a malformed trust store without breaking the global inventory", async () => {
+    const { home, project, projectFile, handlePicotConfig } = await fixture();
+    vi.stubEnv(MARKER, project);
+    writeFileSync(trustFile(home), "{ not json", "utf8");
+    const listed = await handlePicotConfig(
+      "mcp_list_servers",
+      {},
+      { cwd: project, isProjectTrusted: () => true },
+    );
+    expect(listed).toMatchObject({
+      ok: true,
+      data: { projectAvailable: true, projectTrusted: false, groups: { project: [] } },
+    });
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: project, isProjectTrusted: () => true },
+      ),
+    ).resolves.toMatchObject({ ok: false });
+    expect(existsSync(projectFile)).toBe(false);
+  });
+
+  it("rejects a project op when the admitted root path is replaced by a symlink", async () => {
+    const { home, project, handlePicotConfig } = await fixture();
+    vi.stubEnv(MARKER, project);
+    writeFileSync(trustFile(home), JSON.stringify({ [realpathSync(project)]: true }), "utf8");
+    // The host issued this canonical root at spawn. The directory is renamed
+    // away and its path now points at another tree that carries its own MCP
+    // files: the new target must not become an authorized root.
+    const outside = join(home, "outside");
+    mkdirSync(join(outside, ".pi"), { recursive: true });
+    const outsideFile = join(outside, ".pi", "mcp.json");
+    writeFileSync(
+      outsideFile,
+      JSON.stringify({ mcpServers: { leaked: { command: "x" } } }, null, 2),
+      "utf8",
+    );
+    const outsideBefore = readFileSync(outsideFile, "utf8");
+    const original = `${project}-original`;
+    renameSync(project, original);
+    symlinkSync(outside, project);
+
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: project, isProjectTrusted: () => true },
+      ),
+    ).resolves.toMatchObject({ ok: false });
+    expect(readFileSync(outsideFile, "utf8")).toBe(outsideBefore);
+    expect(existsSync(join(original, ".pi", "mcp.json"))).toBe(false);
+  });
+
+  it("rejects a project op when an ancestor of the admitted root is replaced", async () => {
+    const { home, handlePicotConfig } = await fixture();
+    const nested = join(home, "nest", "deep");
+    mkdirSync(join(nested, ".pi"), { recursive: true });
+    vi.stubEnv(MARKER, nested);
+    writeFileSync(trustFile(home), JSON.stringify({ [realpathSync(nested)]: true }), "utf8");
+    const outside = join(home, "outside-ancestor", "deep");
+    mkdirSync(join(outside, ".pi"), { recursive: true });
+    const outsideFile = join(outside, ".pi", "mcp.json");
+    writeFileSync(outsideFile, JSON.stringify({ mcpServers: {} }, null, 2), "utf8");
+    const outsideBefore = readFileSync(outsideFile, "utf8");
+    renameSync(join(home, "nest"), join(home, "nest-original"));
+    symlinkSync(join(home, "outside-ancestor"), join(home, "nest"));
+
+    // Both the marker and the request cwd still resolve to the same (new)
+    // directory, so a realpath-equality-only check would admit it.
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        { cwd: nested, isProjectTrusted: () => true },
+      ),
+    ).resolves.toMatchObject({ ok: false });
+    expect(readFileSync(outsideFile, "utf8")).toBe(outsideBefore);
+    expect(existsSync(join(home, "nest-original", "deep", ".pi", "mcp.json"))).toBe(false);
+  });
+});
+
+describe("picot config MCP agent root", () => {
+  it("reads the MCP globals and trust store from PI_CODING_AGENT_DIR", async () => {
+    const home = mkdtempSync(join(tmpdir(), "picot-config-home-"));
+    tempHomes.push(home);
+    const customAgent = mkdtempSync(join(tmpdir(), "picot-config-agent-"));
+    tempHomes.push(customAgent);
+    // The home agent dir holds a decoy: only the custom root may be read.
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(home, ".pi", "agent", "mcp.json"),
+      JSON.stringify({ mcpServers: { home_only: { command: "home" } } }),
+      "utf8",
+    );
+    writeFileSync(
+      join(customAgent, "mcp.json"),
+      JSON.stringify({ mcpServers: { custom_only: { command: "custom" } } }),
+      "utf8",
+    );
+    const projectRoot = join(home, "workspace");
+    mkdirSync(projectRoot, { recursive: true });
+    writeFileSync(
+      join(customAgent, "trust.json"),
+      JSON.stringify({ [realpathSync(projectRoot)]: false }),
+      "utf8",
+    );
+
+    vi.resetModules();
+    vi.stubEnv("PI_CODING_AGENT_DIR", customAgent);
+    process.env.HOME = home;
+    const { handlePicotConfig } = await import("./picot-config.ts");
+
+    const listed = await handlePicotConfig("mcp_list_servers", {}, { cwd: projectRoot });
+    expect(listed).toMatchObject({
+      ok: true,
+      data: { groups: { piGlobal: [{ name: "custom_only" }] } },
+    });
+
+    // The trust store of the custom root is the one that gates project writes.
+    vi.stubEnv("PI_STUDIO_MCP_PROJECT_ROOT", projectRoot);
+    await expect(
+      handlePicotConfig(
+        "mcp_import_global_overrides",
+        {},
+        {
+          cwd: projectRoot,
+          isProjectTrusted: () => true,
+        },
+      ),
+    ).resolves.toMatchObject({ ok: false, error: expect.stringMatching(/trust/i) });
+    expect(existsSync(join(projectRoot, ".pi", "mcp.json"))).toBe(false);
   });
 });

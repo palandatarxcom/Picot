@@ -824,6 +824,7 @@
       "sourceLabel": "来源",
       "sectionsAriaLabel": "MCP 层",
       "addMcp": "+ 添加MCP",
+      "refresh": "刷新",
       "migrateNotice": "旧配置 {file} 中有 {count} 个 server 未迁入原生 mcp.json（原生 Pi 不读该文件）。",
       "migrate": "迁移",
       "migrationFailed": "迁移失败。",
@@ -838,7 +839,9 @@
         "disabled": "已禁用",
         "error": "错误",
         "unknown": "状态未知",
-        "unavailable": "无法获取实时 MCP 状态。"
+        "unavailable": "无法获取实时 MCP 状态。",
+        "errors": "{count} 个服务器报告错误。",
+        "trustNote": "本次会话未信任项目的 MCP 服务器。"
       },
       "login": {
         "title": "登录到 {name}",
@@ -849,7 +852,32 @@
         "retry": "重试",
         "failed": "登录失败。",
         "cancelled": "登录已取消。"
-      }
+      },
+      "importGlobal": "导入全局设置",
+      "importSummary": "新增 {added}，已有 {existing}，跳过 {skipped}。",
+      "importFailed": "导入失败：{error}",
+      "importSkip": {
+        "existing": "{name}：项目内已有",
+        "namespaceConflict": "{name}：与 {conflict} 名称冲突",
+        "invalidGlobal": "{name}：全局条目无效（{detail}）"
+      },
+      "reloadRequired": "已保存。重新加载会话后生效。",
+      "trustRequired": "需要信任该项目才能管理其 MCP 服务器。",
+      "override": {
+        "sourceHint": "覆盖全局服务器 {name}；连接与登录设置仍来自全局。",
+        "toolExposure": "工具暴露映射（JSON）",
+        "mapHelp": "整表替换：键是工具名或 * 通配；精确名优先，多个通配按对象顺序先命中者生效。{} 清除单工具规则。",
+        "mapInvalid": "请输入 JSON 对象，例如 {}。",
+        "mapValueInvalid": "工具“{tool}”的值必须是 codemode、direct、deferred 或 hidden。",
+        "exposureInvalid": "请选择工具暴露方式。",
+        "remove": "移除项目覆盖",
+        "removeWarning": "只从本项目的 mcp.json 移除该项；全局服务器仍然生效，这与停用不同。",
+        "baseLost": "该覆盖对应的全局服务器已不存在。请移除本项，或恢复全局服务器。",
+        "staleDraft": "文件已在磁盘上变更，请重新加载后再保存。",
+        "needsAuthHint": "该服务器需要登录。请到“全局”页签操作；本项目条目只覆盖暴露方式。"
+      },
+      "noSession": "当前没有可用于 MCP 配置的会话。",
+      "targetChanged": "工作区已变更，MCP 请求未发送。"
     },
     "usage": "使用量",
     "quota": "配额",

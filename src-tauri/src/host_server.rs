@@ -2726,14 +2726,45 @@ async fn dispatch(
                             .and_then(|result| result.map(|()| json!({ "ok": true })))
                     }
                     "mcp_server_status" => {
+                        // `refresh: true` drops the 60s host cache after a
+                        // configuration write; an invalid value is a caller
+                        // error, not a silent no-op.
+                        let refresh = match args.get("refresh") {
+                            None => false,
+                            Some(Value::Bool(flag)) => *flag,
+                            Some(_) => {
+                                return Err((
+                                    "invalid_refresh",
+                                    "refresh must be a boolean".into(),
+                                ));
+                            }
+                        };
                         let binary = crate::pi_launch::resolve_bundled_pi(&state.static_dir)
                             .map_err(|error| ("mcp_unavailable", error))?;
-                        tokio::task::spawn_blocking(move || runner.list(&binary, &cwd))
-                            .await
-                            .map_err(|e| e.to_string())
-                            .and_then(|result| {
-                                result.map(|servers| json!({ "ok": true, "servers": servers }))
+                        tokio::task::spawn_blocking(move || {
+                            if refresh {
+                                runner.invalidate();
+                            }
+                            runner.list(&binary, &cwd)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|result| {
+                            // The runner already validated and projected the
+                            // report: only safe fields and fixed diagnostic
+                            // text leave this process.
+                            result.map(|report| {
+                                let mut response = json!({
+                                    "ok": true,
+                                    "servers": report.get("servers").cloned().unwrap_or(Value::Array(Vec::new())),
+                                    "errors": report.get("errors").cloned().unwrap_or(Value::Array(Vec::new())),
+                                });
+                                if let Some(note) = report.get("note") {
+                                    response["note"] = note.clone();
+                                }
+                                response
                             })
+                        })
                     }
                     _ => unreachable!(),
                 };

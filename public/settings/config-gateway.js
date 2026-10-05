@@ -74,7 +74,16 @@ export class ConfigGateway {
     return this.#send(op, params, options);
   }
 
-  #send(op, params, { timeoutMs = DEFAULT_TIMEOUT_MS, target: targetOverride }) {
+  #send(op, params, { timeoutMs = DEFAULT_TIMEOUT_MS, target: targetOverride, beforeSend }) {
+    // MCP-only local guard: readiness can resolve long after the user action,
+    // so the caller re-verifies its frozen routing target here, synchronously,
+    // immediately before the request is dispatched. It never awaits and never
+    // re-targets: a throw rejects the call with nothing sent.
+    try {
+      beforeSend?.();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const target = targetOverride ?? this.#getTarget();
     if (!target) return Promise.reject(new Error("No active session for configuration request"));
     const id = `cfg-${randomId()}`;

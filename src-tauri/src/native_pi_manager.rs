@@ -83,6 +83,26 @@ pub struct NativeLaunchSpec {
     pub no_tools: bool,
     pub readiness: ReadinessPolicy,
     pub cleanup: NativeCleanupResources,
+    /// Canonical project root of a registry-verified launch. Only the primary
+    /// launch wrapper sets it; Picot's config bridge compares it against the
+    /// request cwd before any project MCP read or write. It is never derived
+    /// from browser input or inherited from Picot's own environment.
+    pub mcp_project_root: Option<PathBuf>,
+}
+
+/// Host-issued project-root marker for project-scoped MCP operations.
+pub(crate) const MCP_PROJECT_ROOT_ENV: &str = "PI_STUDIO_MCP_PROJECT_ROOT";
+
+/// Every spawned Pi starts from a clean marker: an inherited value (a Picot
+/// process that was itself launched inside a workspace) must not look like a
+/// host-verified project root for Config/Quick/Side/Standby runtimes.
+fn apply_launch_environment<'a>(
+    command: &'a mut Command,
+    launch: &LaunchDescription,
+) -> &'a mut Command {
+    command
+        .env_remove(MCP_PROJECT_ROOT_ENV)
+        .envs(&launch.environment)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +162,12 @@ impl NativeLaunchSpec {
         }
         if let Some(secret) = &self.install_secret {
             environment.insert("PI_STUDIO_SKILL_INSTALL_SECRET".into(), secret.clone());
+        }
+        if let Some(project_root) = &self.mcp_project_root {
+            environment.insert(
+                MCP_PROJECT_ROOT_ENV.into(),
+                project_root.to_string_lossy().into_owned(),
+            );
         }
         let safe_environment = environment
             .iter()
@@ -357,9 +383,8 @@ impl NativePiManager {
         let launch = spec.command_description();
         let mut command = Command::new(&launch.program);
         configure_child_process(&mut command);
-        command
+        apply_launch_environment(&mut command, &launch)
             .args(&launch.args)
-            .envs(&launch.environment)
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1668,12 +1693,17 @@ fn configure_child_process(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeLaunchSpec, NativePiManager, NativeRuntimeType};
+    use super::{
+        apply_launch_environment, LaunchDescription, NativeLaunchSpec, NativePiManager,
+        NativeRuntimeType, ReadinessPolicy, MCP_PROJECT_ROOT_ENV,
+    };
     use crate::operation_registry::{OperationScope, OperationState};
     use crate::runtime_coordinator::RuntimeTarget;
     use crate::temp_resources::{canonical_temp_root, cleanup_quick_chat_dir};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::Duration;
 
     // ── P1.11 real-Pi lifecycle smoke ────────────────────────────────
@@ -1788,6 +1818,29 @@ mod tests {
     }
 
     #[test]
+    fn spawned_pi_starts_from_a_clean_project_root_marker() {
+        let launch = LaunchDescription {
+            program: PathBuf::from("/embedded/pi"),
+            args: Vec::new(),
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            safe_environment: BTreeMap::new(),
+            runtime_type: NativeRuntimeType::Config,
+            readiness: ReadinessPolicy::default(),
+        };
+        let mut command = Command::new(&launch.program);
+        apply_launch_environment(&mut command, &launch);
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new(MCP_PROJECT_ROOT_ENV), None)),
+            "an inherited marker must be removed before the owned environment is applied"
+        );
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("PATH"),
+            Some(std::ffi::OsStr::new("/usr/bin"))
+        )));
+    }
+
+    #[test]
     fn launch_spec_has_no_tcp_port_and_resumes_only_at_process_start() {
         let spec = NativeLaunchSpec {
             binary: PathBuf::from("/embedded/pi"),
@@ -1803,6 +1856,7 @@ mod tests {
             no_tools: false,
             readiness: super::ReadinessPolicy::default(),
             cleanup: super::NativeCleanupResources::default(),
+            mcp_project_root: None,
         };
         let launch = spec.command_description();
         assert_eq!(launch.program, PathBuf::from("/embedded/pi"));
@@ -1834,6 +1888,7 @@ mod tests {
             no_tools: false,
             readiness: super::ReadinessPolicy::default(),
             cleanup: super::NativeCleanupResources::default(),
+            mcp_project_root: None,
         };
         let launch = spec.command_description();
         assert!(launch
@@ -1905,6 +1960,7 @@ mod tests {
             no_tools: false,
             readiness: super::ReadinessPolicy::default(),
             cleanup: super::NativeCleanupResources::default(),
+            mcp_project_root: None,
         };
         let manager = NativePiManager::in_memory(8);
         let target = RuntimeTarget::new("workspace-exit", "session-exit", "instance-exit");
@@ -2336,6 +2392,7 @@ mod tests {
             no_tools: runtime_type == NativeRuntimeType::QuickChat,
             readiness: super::ReadinessPolicy::default(),
             cleanup: super::NativeCleanupResources::default(),
+            mcp_project_root: None,
         }
     }
 

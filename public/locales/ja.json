@@ -824,6 +824,7 @@
       "sourceLabel": "ソース",
       "sectionsAriaLabel": "MCP レイヤー",
       "addMcp": "+ MCPを追加",
+      "refresh": "更新",
       "migrateNotice": "旧設定 {file} にネイティブ Pi が読まないサーバーが {count} 件あります。",
       "migrate": "移行",
       "migrationFailed": "移行に失敗しました。",
@@ -838,7 +839,9 @@
         "disabled": "無効",
         "error": "エラー",
         "unknown": "状態不明",
-        "unavailable": "MCP のライブ状態を取得できません。"
+        "unavailable": "MCP のライブ状態を取得できません。",
+        "errors": "{count} 件のサーバーがエラーを報告しました。",
+        "trustNote": "このセッションではプロジェクトの MCP サーバーが信頼されていません。"
       },
       "login": {
         "title": "{name} にサインイン",
@@ -849,7 +852,32 @@
         "retry": "再試行",
         "failed": "サインインに失敗しました。",
         "cancelled": "サインインをキャンセルしました。"
-      }
+      },
+      "importGlobal": "グローバル設定をインポート",
+      "importSummary": "追加 {added}、既存 {existing}、スキップ {skipped}。",
+      "importFailed": "インポートに失敗しました：{error}",
+      "importSkip": {
+        "existing": "{name}：このプロジェクトに既にあります",
+        "namespaceConflict": "{name}：{conflict} と名前が衝突します",
+        "invalidGlobal": "{name}：グローバル項目が無効です（{detail}）"
+      },
+      "reloadRequired": "保存しました。セッションを再読み込みすると反映されます。",
+      "trustRequired": "このプロジェクトの MCP サーバーを管理するには信頼が必要です。",
+      "override": {
+        "sourceHint": "グローバルサーバー {name} を上書きします。接続とサインインの設定はグローバルのままです。",
+        "toolExposure": "ツール公開マップ（JSON）",
+        "mapHelp": "マップ全体を置き換えます。キーはツール名または * パターンで、完全一致が優先し、パターンは先に一致したものが有効です。{} でツール単位のルールを消去します。",
+        "mapInvalid": "JSON オブジェクトを入力してください（例：{}）。",
+        "mapValueInvalid": "ツール「{tool}」は codemode、direct、deferred、hidden のいずれかである必要があります。",
+        "exposureInvalid": "ツール公開を選択してください。",
+        "remove": "プロジェクト上書きを削除",
+        "removeWarning": "このプロジェクトの mcp.json からこの項目だけを削除します。グローバルサーバーは有効なままで、無効化とは異なります。",
+        "baseLost": "この上書きの対象となるグローバルサーバーがありません。項目を削除するか、グローバルサーバーを復元してください。",
+        "staleDraft": "ファイルがディスク上で変更されました。再読み込みしてから保存してください。",
+        "needsAuthHint": "このサーバーはサインインが必要です。「グローバル」タブで行ってください。このプロジェクト項目は公開設定のみを上書きします。"
+      },
+      "noSession": "MCP 設定に使用できるアクティブなセッションがありません。",
+      "targetChanged": "MCP リクエストの送信前にワークスペースが変わりました。"
     },
     "usage": "使用量",
     "quota": "クォータ",

@@ -236,3 +236,89 @@ describe("ConfigGateway timeout attribution", () => {
     }
   });
 });
+
+describe("ConfigGateway beforeSend guard", () => {
+  it("runs the guard synchronously after readiness and before the request is dispatched", async () => {
+    const order = [];
+    let sentId = null;
+    const runtime = {
+      request: vi.fn((command) => {
+        order.push("request");
+        sentId = JSON.parse(command.message.slice("/picot-config ".length)).id;
+        return Promise.resolve({ acceptance: "accepted" });
+      }),
+    };
+    const target = { workspaceId: "w", sessionId: "s", instanceId: "i" };
+    let ready = false;
+    const gateway = new ConfigGateway({
+      runtime,
+      getTarget: () => target,
+      waitUntilReady: () => {
+        ready = true;
+        return Promise.resolve();
+      },
+    });
+
+    const promise = gateway.call(
+      "mcp_import_global_overrides",
+      {},
+      {
+        beforeSend: () => {
+          order.push("beforeSend");
+          expect(ready).toBe(true);
+        },
+      },
+    );
+    expect(order).toEqual([]); // readiness has not resolved yet
+    await vi.waitFor(() => expect(runtime.request).toHaveBeenCalledTimes(1));
+    expect(order).toEqual(["beforeSend", "request"]);
+    gateway.consumeNotify({ message: JSON.stringify({ __picotConfig: sentId, ok: true }) });
+    await expect(promise).resolves.toEqual({ ok: true });
+  });
+
+  it("rejects without sending when the guard throws, on both gate paths", async () => {
+    const { runtime, gateway } = createHarness();
+    await expect(
+      gateway.call(
+        "mcp_save_server",
+        {},
+        {
+          beforeSend: () => {
+            throw new Error("Runtime target changed before MCP configuration was sent");
+          },
+        },
+      ),
+    ).rejects.toThrow(/Runtime target changed/);
+    expect(runtime.request).not.toHaveBeenCalled();
+
+    const gatedRuntime = { request: vi.fn().mockResolvedValue({ acceptance: "accepted" }) };
+    const gated = new ConfigGateway({
+      runtime: gatedRuntime,
+      getTarget: () => ({ workspaceId: "w", sessionId: "s", instanceId: "i" }),
+      waitUntilReady: () => Promise.resolve(),
+    });
+    await expect(
+      gated.call(
+        "mcp_import_global_overrides",
+        {},
+        {
+          beforeSend: () => {
+            throw new Error("MCP page is closed");
+          },
+        },
+      ),
+    ).rejects.toThrow(/closed/);
+    expect(gatedRuntime.request).not.toHaveBeenCalled();
+  });
+
+  it("keeps default callers unchanged when no guard is passed", async () => {
+    const { requests, gateway } = createHarness();
+    const promise = gateway.call("list_model_catalog");
+    expect(requests).toHaveLength(1);
+    const consumed = gateway.consumeNotify({
+      message: JSON.stringify({ __picotConfig: idFromRequest(requests[0]), ok: true, data: {} }),
+    });
+    expect(consumed).toBe(true);
+    await expect(promise).resolves.toEqual({ ok: true, data: {} });
+  });
+});

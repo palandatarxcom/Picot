@@ -824,6 +824,7 @@
       "sourceLabel": "Source",
       "sectionsAriaLabel": "MCP layers",
       "addMcp": "+ Add MCP",
+      "refresh": "Refresh",
       "migrateNotice": "Old config {file} holds {count} server(s) native Pi does not read.",
       "migrate": "Migrate",
       "migrationFailed": "Migration failed.",
@@ -838,7 +839,9 @@
         "disabled": "Disabled",
         "error": "Error",
         "unknown": "Unknown state",
-        "unavailable": "Live MCP status unavailable."
+        "unavailable": "Live MCP status unavailable.",
+        "errors": "{count} server(s) reported errors.",
+        "trustNote": "Project MCP servers are not trusted in this session."
       },
       "login": {
         "title": "Sign in to {name}",
@@ -849,7 +852,32 @@
         "retry": "Try again",
         "failed": "Sign-in failed.",
         "cancelled": "Sign-in cancelled."
-      }
+      },
+      "importGlobal": "Import global settings",
+      "importSummary": "Added {added}, already present {existing}, skipped {skipped}.",
+      "importFailed": "Import failed: {error}",
+      "importSkip": {
+        "existing": "{name}: already in this project",
+        "namespaceConflict": "{name}: collides with {conflict}",
+        "invalidGlobal": "{name}: not a valid global server ({detail})"
+      },
+      "reloadRequired": "Saved. Reload the session to apply.",
+      "trustRequired": "Trust this project to manage its MCP servers.",
+      "override": {
+        "sourceHint": "Overrides global server {name}. Connection and sign-in settings stay global.",
+        "toolExposure": "Tool exposure map (JSON)",
+        "mapHelp": "Replaces the whole map: keys are tool names or * patterns; an exact name wins and among patterns the first match wins. {} clears per-tool rules.",
+        "mapInvalid": "Enter a JSON object, for example {}.",
+        "mapValueInvalid": "Tool \"{tool}\" must map to codemode, direct, deferred or hidden.",
+        "exposureInvalid": "Choose a tool exposure.",
+        "remove": "Remove project override",
+        "removeWarning": "Removes this entry from the project mcp.json only. The global server still applies; this is not the same as disabling it.",
+        "baseLost": "The global server this override belongs to is gone. Remove the entry, or restore the global server.",
+        "staleDraft": "The file changed on disk. Reload before saving.",
+        "needsAuthHint": "This server needs sign-in. Use the Global tab; this project entry only overrides exposure."
+      },
+      "noSession": "No active session for MCP configuration.",
+      "targetChanged": "The workspace changed before the MCP request was sent."
     },
     "usage": "Usage",
     "quota": "Quota",
