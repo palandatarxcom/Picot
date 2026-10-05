@@ -941,6 +941,7 @@
         "writeLayerProject": "Current project {root}/.pi/settings.json",
         "writeLayerProjectUnknown": "Current project .pi/settings.json",
         "enable": "Enable",
+        "disabled": "Disable",
         "notSet": "Not set (inherit parent)"
       },
       "diagnostics": {

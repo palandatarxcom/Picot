@@ -441,7 +441,6 @@ const mobileAccessCard = setupMobileAccess({
 const landingSubagents = setupSubagentsTab({
   container: document.getElementById("settings-subagents"),
   transport,
-  t,
   getWorkspaceIdentity: () => null,
   landingOnly: true,
   configGateway: landingConfig.configGateway,

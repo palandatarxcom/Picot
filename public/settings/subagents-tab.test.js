@@ -5,7 +5,7 @@
 
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setMessages, t } from "../i18n.js";
+import { setMessages } from "../i18n.js";
 
 const LOCALES = ["en", "zh", "ja", "es"];
 const REQUIRED_COPY = [
@@ -53,101 +53,10 @@ describe("subagents locales", () => {
 import { WsTransport } from "../app/transport.js";
 import { setupSubagentsTab } from "./subagents-tab.js";
 
-// Kept as a value so the localization test can restore the English copy after
-// swapping in a real locale.
-const EN_MESSAGES = {
-  settings: {
-    subagents: {
-      title: "Subagents",
-      scopes: { global: "Global", project: "Current project" },
-      subtabs: { definitions: "Custom", packages: "Packages" },
-      groups: {
-        user: "Your definitions",
-        package: "Packages",
-        project: "Project definitions",
-        builtinExtension: "pi-subagents built-in extension (read-only)",
-      },
-      status: {
-        candidate: "Disk candidate — runtime winner unverified",
-        disabledOverride: "Disabled (override)",
-      },
-      diskOnlyMode: "Disk candidates only: effectiveness and collisions are unverified.",
-      state: {
-        loading: "Loading…",
-        empty: "No agent definitions in this scope.",
-        error: "Failed to load subagents.",
-        conflict: "The workspace or inventory changed. Refresh and retry.",
-      },
-      rescan: "Rescan",
-      detail: {
-        runtimeName: "Runtime name",
-        source: "Source",
-        path: "File",
-        noFile: "No definition file (built-in)",
-        scope: "Scope",
-        savedOverride: "Saved override",
-        model: "Model",
-        thinking: "Thinking",
-        advertise: "Show in parent agent directory",
-        disabled: "Disable",
-        inheritDefinition: "Unset (inherit definition)",
-        booleanOn: "On (true)",
-        booleanOff: "Off (false)",
-        none: "None",
-        inferred: "Inferred",
-        overrides: "Overrides",
-        save: "Save",
-        saved:
-          "Saved to disk. Reload or start a new session; verify with /subagents-models or /run.",
-        invalidModel: "Use a provider/model ID.",
-        reloadNotice: "Overrides take effect in new sessions (or after /reload).",
-        rawLoading: "Loading definition…",
-        rawUnavailable: "Definition unavailable.",
-        package: "Package",
-        noLayerOverride: "No override in this layer",
-        keepCurrent: "Keep current: {value}",
-        thinkingFalse: "Off (false)",
-        thinkingHint: "Only levels /subagents-models actually supports take effect.",
-        writeLayer:
-          "Write layer: {scope} · name-level override {runtimeName} · definition files are unchanged",
-        writeLayerGlobal: "Global ~/.pi/agent/settings.json",
-        writeLayerProject: "Current project {root}/.pi/settings.json",
-        writeLayerProjectUnknown: "Current project .pi/settings.json",
-      },
-      diagnostics: {
-        scanBudget: "Discovery budget exhausted.",
-        scanUnreadableSource: "Unreadable source directory skipped.",
-        scanUnreadableEntry: "Unreadable entry skipped.",
-        symlinkOmitted: "Symlinked source omitted.",
-        invalidSettings: "Invalid settings; discovery incomplete.",
-        projectRootMismatch:
-          "Extension project root differs from the workspace root; project writes disabled.",
-        outOfScope: "Out-of-scope occupancy not verified; no definition body read.",
-        builtinsDisabled: "Built-ins disabled by settings; runtime names unverified.",
-        builtinsUnavailable: "Installed extension built-ins unavailable; names unknown.",
-        invalidManifest: "Invalid package manifest.",
-        manifestOutsidePackageRoot: "Manifest agent path outside the package root.",
-        definitionUnreadable: "Definition unreadable, oversized, or not valid UTF-8.",
-        missingFrontmatter: "Missing frontmatter.",
-        unsupportedFrontmatter: "Unsupported frontmatter.",
-        unterminatedFrontmatter: "Unterminated frontmatter.",
-        invalidPackageName: "Invalid package name.",
-        nameCollision: "Duplicate runtime name or alias; runtime winner unverified.",
-        parityUnverified: "No live snapshot supplied; disk candidates only.",
-      },
-      alsoIn: "Also available in: {scopes}",
-      create: {
-        title: "New agent .md",
-        name: "Name",
-        description: "Description",
-        prompt: "Prompt",
-        submit: "Create",
-        disabled: "Creation unavailable: runtime identity unverified.",
-        invalid: "Enter a name, description, and nonempty prompt.",
-      },
-    },
-  },
-};
+// The English copy the panel renders is the shipped locale file, not a copy of
+// it: a fixture that mirrored the module's own table is what let 80 keys live
+// outside the locale files while these tests stayed green.
+const EN_MESSAGES = JSON.parse(readFileSync("public/locales/en.json", "utf8"));
 
 setMessages(EN_MESSAGES);
 
@@ -240,7 +149,6 @@ function setup(
   const page = setupSubagentsTab({
     container,
     transport,
-    t,
     getWorkspaceIdentity: () => current,
     landingOnly,
     confirmDiscard,
@@ -451,12 +359,12 @@ describe("subagents tab", () => {
     transport.listSubagents.mockRejectedValueOnce(hostError("config_unavailable", "boom"));
     container.querySelector(".subagents-retry").click();
     await flush();
-    expect(container.textContent).toContain("Failed to load subagents.");
+    expect(container.textContent).toContain(EN_MESSAGES.settings.subagents.state.error);
 
     transport.listSubagents.mockRejectedValueOnce(hostError("stale_generation"));
     container.querySelector(".subagents-retry").click();
     await flush();
-    expect(container.textContent).toContain("The workspace or inventory changed.");
+    expect(container.textContent).toContain(EN_MESSAGES.settings.subagents.state.conflict);
     expect(transport.listSubagents).toHaveBeenCalledTimes(3);
   });
 
@@ -525,7 +433,9 @@ describe("subagents tab", () => {
     expect(status.textContent).toBe("Disk candidate — runtime winner unverified");
     expect(container.querySelector("[data-winner]")).toBeNull();
     expect(container.querySelector("[data-effective]")).toBeNull();
-    expect(container.textContent).toContain("or after /reload");
+    // The notice is asserted against the shipped locale copy, not a paraphrase:
+    // it is the only place the panel tells the user how a save takes effect.
+    expect(container.textContent).toContain(EN_MESSAGES.settings.subagents.detail.reloadNotice);
   });
 
   it("disables override controls with a diagnostic for external/unknown runners", async () => {

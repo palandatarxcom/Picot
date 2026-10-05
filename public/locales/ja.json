@@ -941,6 +941,7 @@
         "writeLayerProject": "現在のプロジェクト {root}/.pi/settings.json",
         "writeLayerProjectUnknown": "現在のプロジェクト .pi/settings.json",
         "enable": "有効",
+        "disabled": "無効",
         "notSet": "未設定（親を継承）"
       },
       "diagnostics": {

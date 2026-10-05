@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -44,6 +44,8 @@ function extractPlaceholders(str) {
 
 const enKeys = new Set(flattenKeys(en));
 const zhKeys = new Set(flattenKeys(zh));
+const jaKeys = new Set(flattenKeys(ja));
+const esKeys = new Set(flattenKeys(es));
 
 // ── Key parity ────────────────────────────────────────────────────────
 
@@ -57,6 +59,23 @@ describe("locale key parity", () => {
     const extra = [...zhKeys].filter((k) => !enKeys.has(k));
     expect(extra, `zh.json has extra keys not in en.json: ${extra.join(", ")}`).toEqual([]);
   });
+
+  // ja/es used to be checked for value shape only, so a key added to en.json
+  // and zh.json but forgotten in ja/es shipped as untranslated English.
+  for (const [name, keys] of [
+    ["ja", jaKeys],
+    ["es", esKeys],
+  ]) {
+    it(`${name} contains every en key`, () => {
+      const missing = [...enKeys].filter((k) => !keys.has(k));
+      expect(missing, `${name}.json missing keys: ${missing.join(", ")}`).toEqual([]);
+    });
+
+    it(`en contains every ${name} key (no extra ${name} keys)`, () => {
+      const extra = [...keys].filter((k) => !enKeys.has(k));
+      expect(extra, `${name}.json has extra keys not in en.json: ${extra.join(", ")}`).toEqual([]);
+    });
+  }
 
   it("every locale value is a non-empty string or nested plain object", () => {
     const checkValues = (obj, path = "") => {
@@ -98,6 +117,132 @@ describe("locale key parity", () => {
       }
     }
     expect(mismatches, `Placeholder mismatches:\n${mismatches.join("\n")}`).toEqual([]);
+  });
+});
+
+// ── Module-local copy tables ──────────────────────────────────────────
+
+describe("settings copy lives in the locale files", () => {
+  // A module that ships its own `"settings.x.y": "English"` table escapes every
+  // key audit above: the keys never appear in public/locales/*.json, and the
+  // module-local English silently wins whenever a locale lacks the key. That is
+  // how the Subagents tab shipped 80 keys whose only home was the module.
+  const walk = (dir) => {
+    const files = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === "locales") continue;
+        files.push(...walk(path));
+      } else if (entry.name.endsWith(".js") && !entry.name.endsWith(".test.js")) {
+        files.push(path);
+      }
+    }
+    return files;
+  };
+
+  // Object keys only: a `t("settings.a.b")` call or a ternary branch is not a
+  // table, so the match is anchored to the start of a line and to the `:` that
+  // turns the string into a property.
+  const COPY_TABLE_KEY = /^[ \t]*(?:"|')(settings\.[A-Za-z0-9_.${}]+)(?:"|')[ \t]*:/;
+
+  it("no frontend module declares a settings.* copy table", () => {
+    const violations = [];
+    for (const file of walk(publicDir)) {
+      const lines = readFileSync(file, "utf-8").split("\n");
+      lines.forEach((line, index) => {
+        const match = COPY_TABLE_KEY.exec(line);
+        if (match) {
+          violations.push(
+            `${relative(publicDir, file)}:${index + 1} declares module-local copy for ${match[1]}`,
+          );
+        }
+      });
+    }
+    expect(
+      violations,
+      `Move these strings into public/locales/*.json:\n${violations.join("\n")}`,
+    ).toEqual([]);
+  });
+});
+
+// ── Settings module key references ────────────────────────────────────
+
+describe("subagents tab key references", () => {
+  const source = readFileSync(resolve(publicDir, "settings/subagents-tab.js"), "utf-8");
+
+  // Static `"settings.subagents.x"` strings plus the host-message map, which
+  // names its locale keys relative to the namespace. Template references
+  // (`settings.subagents.detail.${field}`) are collected too and checked as
+  // prefixes; subagents-locale-coverage.test.js walks the concrete values
+  // those templates expand to at render time.
+  const collectReferences = (text) => {
+    const references = new Map();
+    const remember = (key, line) => {
+      if (!references.has(key)) references.set(key, line);
+    };
+    text.split("\n").forEach((line, index) => {
+      for (const match of line.matchAll(
+        /settings\.subagents\.[A-Za-z0-9_.]*(?:\$\{[^}]*\}[A-Za-z0-9_.]*)*/g,
+      )) {
+        remember(match[0], index + 1);
+      }
+      for (const match of line.matchAll(/"(?:diagnostics|status)\.[A-Za-z0-9]+"/g)) {
+        remember(`settings.subagents.${match[0].slice(1, -1)}`, index + 1);
+      }
+    });
+    return references;
+  };
+
+  const references = collectReferences(source);
+  const locales = [
+    ["en", en],
+    ["zh", zh],
+    ["ja", ja],
+    ["es", es],
+  ];
+
+  it("collects every namespace the module renders", () => {
+    expect(references.size).toBeGreaterThan(50);
+  });
+
+  it("every concrete key the module uses exists in all four locales", () => {
+    const violations = [];
+    for (const [key, line] of references) {
+      if (key.includes("${")) continue;
+      for (const [name, messages] of locales) {
+        const value = lookupValue(messages, key);
+        if (typeof value !== "string" || value.length === 0) {
+          violations.push(`subagents-tab.js:${line} ${key} missing from ${name}.json`);
+        }
+      }
+    }
+    expect(violations, `Subagents keys absent from a locale:\n${violations.join("\n")}`).toEqual(
+      [],
+    );
+  });
+
+  it("every dynamic key prefix the module uses resolves in all four locales", () => {
+    const violations = [];
+    for (const [key, line] of references) {
+      if (!key.includes("${")) continue;
+      const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(`^${escaped.replace(/\\\$\\\{[^}]*\\\}/g, "[^.]+")}$`);
+      const matched = [...enKeys].filter((candidate) => pattern.test(candidate));
+      if (matched.length === 0) {
+        violations.push(`subagents-tab.js:${line} ${key} matches no en.json key`);
+        continue;
+      }
+      for (const [name, messages] of locales) {
+        for (const candidate of matched) {
+          const value = lookupValue(messages, candidate);
+          if (typeof value !== "string" || value.length === 0) {
+            violations.push(`subagents-tab.js:${line} ${candidate} missing from ${name}.json`);
+          }
+        }
+      }
+    }
+    expect(violations, `Subagents prefixes unresolved:\n${violations.join("\n")}`).toEqual([]);
   });
 });
 

@@ -941,6 +941,7 @@
         "writeLayerProject": "当前项目 {root}/.pi/settings.json",
         "writeLayerProjectUnknown": "当前项目 .pi/settings.json",
         "enable": "启用",
+        "disabled": "停用",
         "notSet": "不设置（继承父代理）"
       },
       "diagnostics": {

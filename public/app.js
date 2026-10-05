@@ -7232,7 +7232,6 @@ let packageManager = null;
 const subagentsPage = setupSubagentsTab({
   container: document.getElementById("settings-subagents"),
   transport,
-  t,
   configGateway,
   getWorkspaceIdentity: () => {
     const workspaceId = wsClient.getRuntimeTarget()?.workspaceId;
