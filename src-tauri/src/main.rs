@@ -10,6 +10,9 @@ mod browser_pane;
 mod cache_optimizer_config;
 mod caveman_config;
 mod child_supervision;
+mod environment_install;
+mod environment_probe;
+mod environment_prompt;
 mod fff_config;
 mod goal_config;
 mod host_capability;
@@ -2754,6 +2757,9 @@ fn current_owner_session(
     Ok(expected.to_string())
 }
 
+/// The running environment installer, reachable from the app exit path.
+struct EnvironmentInstaller(Arc<environment_install::Installer>);
+
 /// Build + install the async handler for authenticated HostServer v2 controls.
 /// It maps command names to shared host cores, so every desktop operation has
 /// one authorization and execution path.
@@ -2771,6 +2777,15 @@ fn install_control_handler(
     app: AppHandle,
     ephemeral_hub: SharedEphemeralHub,
 ) -> ControlHandler {
+    // One install at a time. The embedded Pi resolves the tool itself; the host
+    // only decides whether it may start and whether the tool works afterwards.
+    let installer: Result<Arc<environment_install::Installer>, String> =
+        pi_launch::resolve_bundled_pi(&static_dir)
+            .map(|binary| Arc::new(environment_install::Installer::new(binary)))
+            .map_err(|error| format!("the embedded Pi is unavailable: {error}"));
+    if let Ok(installer) = installer.as_ref() {
+        let _ = app.manage(EnvironmentInstaller(installer.clone()));
+    }
     let handler: ControlHandler = Arc::new(
         move |ctx: VerifiedClientContext, canonical: Value, progress: ProgressSink| {
             let (command, args) = match canonical.get("type").and_then(Value::as_str) {
@@ -2817,6 +2832,7 @@ fn install_control_handler(
             let metadata = metadata.clone();
             let app = app.clone();
             let ephemeral_hub = ephemeral_hub.clone();
+            let installer = installer.clone();
             Box::pin(async move {
                 let arg = |key: &str| args.get(key).cloned().unwrap_or(Value::Null);
                 let arg_str = |key: &str| arg(key).as_str().map(|s| s.to_string());
@@ -3031,6 +3047,47 @@ fn install_control_handler(
                             .to_string(),
                     ),
                     "get_pi_version" => Ok(Value::from(locked_pi_version())),
+                    "environment_check" => {
+                        require_native_owner(&ctx)?;
+                        // Real processes with a per-tool timeout: keep this off
+                        // the async runtime's worker threads.
+                        let tools =
+                            tauri::async_runtime::spawn_blocking(environment_probe::probe_all)
+                                .await
+                                .map_err(|error| format!("environment check failed: {error}"))?;
+                        Ok(serde_json::json!({ "tools": tools }))
+                    }
+                    "environment_install_start" => {
+                        require_native_owner(&ctx)?;
+                        let installer = installer.as_ref().map_err(|error| error.clone())?;
+                        let tool_arg = arg_str("tool").unwrap_or_default();
+                        let tool = environment_probe::ToolId::from_str(&tool_arg)
+                            .ok_or("tool must be git, python3, npm, uv, officecli or dws")?;
+                        let action = match arg_str("action").as_deref() {
+                            Some("install") => environment_probe::ToolAction::Install,
+                            Some("update") => environment_probe::ToolAction::Update,
+                            _ => return Err("action must be install or update".to_string()),
+                        };
+                        // The prompt is built from the host's own facts, never
+                        // from the page: the page cannot widen the scope.
+                        let probe = environment_probe::probe_one(tool);
+                        let snapshot = installer.start(tool, action, &probe)?;
+                        Ok(serde_json::to_value(snapshot).map_err(|error| error.to_string())?)
+                    }
+                    "environment_install_status" | "environment_install_cancel" => {
+                        require_native_owner(&ctx)?;
+                        let installer = installer.as_ref().map_err(|error| error.clone())?;
+                        let snapshot = if command == "environment_install_cancel" {
+                            installer.cancel()
+                        } else {
+                            installer.status()
+                        };
+                        match snapshot {
+                            Some(snapshot) => Ok(serde_json::to_value(snapshot)
+                                .map_err(|error| error.to_string())?),
+                            None => Ok(Value::Null),
+                        }
+                    }
                     "pi_path_status" => {
                         // Toggle surface for Settings → General: the toggle
                         // lives everywhere (landing included) but is release-
@@ -4763,6 +4820,9 @@ fn main() {
                 install_termination_handlers(app_handle.clone());
             }
             if let tauri::RunEvent::Exit = event {
+                if let Some(installer) = app_handle.try_state::<EnvironmentInstaller>() {
+                    installer.0.stop_for_app_exit();
+                }
                 if let Some(manager) = app_handle.try_state::<NativePiManagerState>() {
                     manager.stop_for_app_exit();
                 }
