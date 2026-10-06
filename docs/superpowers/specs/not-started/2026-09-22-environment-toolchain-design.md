@@ -1,28 +1,27 @@
 # Picot 环境与工具链维护设计
 
 **状态：** Draft，待 Dr. Lin 评审
-**日期：** 2026-09-22
+**日期：** 2026-10-06（第二版：安装机制收敛为「交给内嵌 Pi」）
 
 ## 目标
 
-在 Settings 新增独立「环境」页，面向非程序员检查、安装和更新 Picot 常用的外部工具：
+在 Settings 新增独立「环境」页，面向非程序员检查与维护 Picot 常用的外部工具：
 
-1. 以确定性的 host 白名单探测显示工具状态、版本和实际路径。
-2. 对单项或全部选中工具，启动内嵌 Pi 的无会话 maintenance agent 实际安装或更新。
-3. agent 只能使用 Picot 内置的官方文档 URL 与选中工具范围；结束后必须由 host 复检，不能只信 agent 文本或 exit code。
-4. 支持 macOS 与 Windows；Landing 同样可打开、检查和维护。
-5. 遇管理员权限、UAC、重启、非官方来源或额外工具时停止自动化，展示并允许复制本次实际维护 prompt，交用户手动继续。
+1. host 侧确定性探测显示工具状态、版本与实际路径。
+2. 安装/更新交给内嵌 Pi 执行：`pi --no-session -p "<prompt>"`，一次一个工具。
+3. agent 只被授权当前工具与官方入口；结束后由 host 复检，不采信 agent 文本或 exit code。
+4. 支持 macOS 与 Windows；Landing 与已打开 workspace 都可访问。
+5. 遇管理员权限、UAC、重启、交互式安装器或额外依赖时停止，展示并允许复制本次实际 prompt，交用户手动继续。
 
 ## 非目标
 
-- 不把系统工具混入现有「软件包」页。该页管理 Pi 的 npm packages/extensions/skills，不管理 Git/Python 等 OS 工具。
-- 不把功能藏进「高级配置」。环境检查与安装是 onboarding/诊断功能，必须独立、易发现。
-- 不支持 Linux 安装与更新；v1 不在 Linux 上显示受支持的维护动作。
-- 不检查或安装 hunk。Picot 将内建 review/fixer 工作流，Hunk 不属于基础依赖。
-- 不执行 `dws auth login`、`dws skill setup` 等使用侧配置。环境页只维护 `dws` binary 本身；登录与技能包装到 agent home 属于聊天会话里的用户/agent 行为，且 skill 安装与 Picot 自身的「软件包」页职责重叠。
-- 不检查系统 Bun。Picot 启动使用内嵌 Pi/Bun，系统 Bun 不是前提。
-- 不自行实现 Homebrew、winget、UAC、sudo、PATH 或 installer 的完整安装器。
+- 不把系统工具混入「软件包」页（该页管理 Pi 的 npm packages/extensions/skills）。
+- 不把功能藏进「高级配置」。
+- 不支持 Linux 的安装与更新。
+- 不检查或安装 hunk、不检查系统 Bun。
+- 不自行实现 Homebrew、winget、UAC、sudo 或 installer 的完整安装器。
 - 不写 sqlite、不新增遥测、不把安装日志上传网络。
+- **不做进程监督子系统**：不保证子进程树零逃逸、不做重启后可恢复的清理状态、不做 Windows Job Object。取消维护只 kill 直接子进程，可能留下孤儿——与「不引入 OS 级沙箱」是同一种已接受的代价。
 
 ## 工具清单与分级
 
@@ -33,57 +32,29 @@
 | 基础 | npm | npm 来源 Pi extension 与 Node 工具 | `https://nodejs.org/en/download` |
 | 基础 | uv | Python 工具/项目依赖管理 | `https://docs.astral.sh/uv/getting-started/installation/` |
 | 可选 | officecli | Word/Excel/PowerPoint 的 agent 工具 | `https://github.com/iOfficeAI/OfficeCLI#readme` |
-| 可选 | dws | 钉钉工作台 CLI（`dws`），供 agent 操作钉钉消息、文档、日历、审批等 | `https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli#readme` |
+| 可选 | dws | 钉钉工作台 CLI，供 agent 操作钉钉消息、文档、日历、审批等 | `https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli#readme` |
 
-基础工具缺失时显著标红，但不阻止 Picot 启动或普通聊天。officecli、dws 缺失标黄，只影响各自相关能力。
-
-OfficeCLI 与 dws 的官方入口均固定为 README，而不是固化某条 npm、curl 脚本或 Releases 命令。maintenance agent 必须先读 README 中当前安装说明；README 指向 Releases 或安装脚本时，才按当前平台执行。
-
-dws 的官方渠道存在已验证的 skills 副作用：快速安装脚本默认安装 multi 技能包到 agent home，`dws upgrade` 升级 binary 时也会替换 agent 目录中的技能包。因此 dws 的安装仅允许 GitHub Releases 预编译 binary；更新不得使用 `dws upgrade` 默认流程，如走自升级必须带 `--skip-skills`；npm、Homebrew、安装脚本渠道无法确认无 skills 副作用时立即停止并转人工确认。
-
-## 已验证事实
-
-1. Picot 当前「软件包」相关实现（`src-tauri/src/package_manager.rs`、`public/settings/package-manager.js`）只管理 Pi 的 npm package source、extensions、skills 与 prompts，不适合承载系统工具。
-2. Picot 已有 Landing 的 `--no-session` Pi runtime 路径；内嵌 Pi 是唯一可启动的 Pi binary，不能调用用户 `$PATH` 里的 `pi`。`resolve_bundled_pi` 存在 `PI_BIN` 环境变量覆盖例外，该例外对 maintenance 不适用。
-3. Pi CLI 支持非持久 prompt 模式：`pi --no-session -p "<prompt>"`。适合一次性维护任务：完成即退出，不写 agent session。
-4. `src-tauri/src/pi_launch.rs` 已为内嵌 Pi 子进程扩展 PATH，包含 Homebrew Intel/Apple Silicon、npm global bin 和 Bun 目录等常见路径。
-5. `src-tauri/src/temp_resources.rs` 的 `~/.pi/tmp` 是 Picot owner-only 临时根。maintenance runtime 必须使用同一根，但不得复用 quick-chat 专用删除 token 逻辑。
-6. OfficeCLI 官方 README 明确将安装 binary 交给 agent skill 指导；其安装路径可能随平台或版本变化，因此 Picot 只固定 README，不复制固定安装脚本。
-7. dws（DingTalk Workspace CLI）官方 README 提供六条安装渠道（curl 脚本、PowerShell、npm stable/beta、Homebrew、GitHub Releases、`dws upgrade` 自升级），覆盖 macOS/Linux/Windows；`dws --version` 输出单行版本，可直接作 host 探测命令。
-8. dws 快速安装脚本默认安装 multi 技能包到 agent home，`dws upgrade` 升级时同时替换 agent 目录技能包（`--skip-skills` 可跳过）；GitHub Releases 提供纯 binary 渠道。
-9. 内嵌 Pi `pi --help` 证实：`--approve` 语义为「Trust project-local files for this run」（非安装授权），`--no-approve` 为其反义；`--no-extensions/--no-skills/--no-prompt-templates/--no-context-files` 可禁用全局发现加载。
-10. Landing settings 页已有统一的模型可用性方案：`setupLandingConfigRuntime` 懒启动 sessionless/toolless Pi 承载 picot-bridge，ConfigGateway（含 `list_model_catalog`、`list_scoped_models`、`check_model_health`）在 Landing 与 workspace 行为一致（`public/landing/landing-config-runtime.js`、`extensions/picot-config.ts`）。
+基础工具缺失时标红但不阻止 Picot 启动或普通聊天；可选工具缺失标黄。
 
 ## 页面位置与可用性
 
-新增 Settings 顶级「环境」页：
-
-- Landing 与已打开 workspace 都可访问。
-- 打开页面不自动运行任何 command。初始状态显示「尚未检查」与**检查环境**按钮。
-- 检查完成后显示**重新检查**。
-- 模型可用性沿用现有 settings 页的 ConfigGateway 模式，不新增独立预检机制：workspace 沿用当前 session runtime，Landing 沿用懒启动的 sessionless/toolless config runtime（`spawnConfigRuntime`，见 `2026-09-18-landing-bridge-runtime-design.md`）。
-- 「无可用模型」判定复用 Models 页同源数据（`list_model_catalog`）。Landing 无可用模型时仍可检查；安装/更新按钮显示“先配置模型”，跳转模型配置页。
-- 环境页不提供模型选择，也不预显示模型。maintenance agent 由内嵌 Pi 启动时自行从 settings 解析当前默认模型；如需展示本次运行模型，以维护进程自身输出为准，不由页面另行解析、不新增默认模型解析接口。维护启动后可选用现有 `check_model_health` 做健康检查（注意其有网络请求与偏好写入副作用，仅可在用户明确启动后运行，且须检查返回的逐模型状态）；失败则停止并显示原因。即使误判，维护失败仍走「失败/需人工确认」+ host 复检，不新增安全边界。
+- Settings 顶级「环境」页，Landing 与已打开 workspace 都可访问。
+- 打开页面**不自动探测任何工具**：初始显示「尚未检查」与**检查环境**按钮；检查完成后显示**重新检查**。
+- 检查在 host 侧执行，不需要模型。
+- 安装/更新需要模型。未配置模型时该次运行会失败，页面显示失败原因，不额外做预检门禁。
+- 页面显示本次运行的 provider/model 不做要求；`pi -p` 自行从 settings 解析默认模型。
 
 ## 每项展示与操作
 
-每项工具统一展示：
+- 名称、用途、级别（基础/可选）、状态、版本、实际可执行路径、官方链接。
+- 状态：`尚未检查`、`已就绪`、`缺失`、`失败`（含原因）。
+- 操作：`缺失` → **安装**；`已就绪` → **更新**；`失败` → **重试**。
+- 运行中显示：可折叠日志、**复制 prompt**（复制实际传给 `pi -p` 的同一份字符串）、**取消**。
+- 终态显示 host 复检结果与原因；`已就绪` 才算成功。更新后版本未变化时如实显示「版本未变化」。
 
-- 名称、用途、基础/可选级别。
-- 状态：尚未检查、检查中、已就绪、缺失、不可执行、需更新、维护中、需人工确认、失败。
-- 检测到的版本、实际可执行路径、官方 URL、上次检查时间。
-- **检查**、**安装**、**更新**操作；缺失项仅显示安装，已安装项显示更新。
-- 可展开的压缩过程日志与**复制详情**；日志不常驻占据页面。
+## Host 探测
 
-页头提供**检查环境**、**重新检查**与**维护全部**：
-
-- 维护全部仅处理基础工具中缺失或用户明确选择更新的项，以及用户勾选的可选 officecli、dws。
-- 执行顺序固定：`git → python3 → npm → uv → officecli → dws`。
-- 每项维护后立即 host 复检；失败或需要人工确认时停止后续项。
-
-## Host 白名单探测
-
-检查不使用模型、网络或 WebView shell。Rust host 通过固定 command 白名单启动短进程并解析版本：
+检查不使用模型、网络或 WebView shell。host 通过固定命令白名单启动短进程并解析版本：
 
 | 工具 | 探测命令 | 版本来源 |
 | --- | --- | --- |
@@ -94,122 +65,68 @@ dws 的官方渠道存在已验证的 skills 副作用：快速安装脚本默�
 | officecli | `officecli --version` | stdout/stderr |
 | dws | `dws --version` | stdout |
 
-探测必须返回：规范 tool id、可执行路径、版本字符串、状态、失败原因、探测时间。
+- 每候选 5 秒超时；超时按失败处理，不杀主 app。
+- 路径解析交给 OS 启动器（`Command` 自身按 PATH/PATHEXT 查找）；host 另做一次简单 PATH 扫描仅用于**显示**实际路径。
+- 版本必须来自该工具自己的那一行：git 要求 `git version` 前缀、python3 要求 `Python` 前缀、dws 要求 `dws version` 前缀；只读 stdout（python3/officecli 例外，可读 stderr）。错误行里出现的其它版本号（如 npm 报错提到 Node 版本、连接失败提到 IP）不得被当成该工具版本。
+- 每条探测返回：规范 tool id、状态、版本、可执行路径、失败原因、官方 URL、级别。
 
-- 路径查找用与 Pi launch 一致的 PATH 扩展规则。macOS 同时覆盖 `/opt/homebrew/bin` 与 `/usr/local/bin`；不猜测用户 shell rc 文件。
-- 找到文件但无执行权限/启动失败为 `不可执行`，与 `缺失` 区分。
-- 每条探测设置短超时；超时为失败，不杀主 app。
-- host 探测才是页面状态的唯一事实来源。
+## 安装与更新
 
-## Maintenance agent
-
-### 启动与授权
-
-用户点击单项安装/更新，或维护全部，即明确授权**本次选中工具**的官方安装/更新流程。Picot 启动内嵌 Pi：
+用户点安装/更新即授权**当前这一个工具**的官方安装/更新流程。host 启动内嵌 Pi：
 
 ```text
-<embedded-pi> --no-session --no-approve --no-extensions --no-skills --no-prompt-templates --no-context-files -p "<maintenance prompt>"
+<embedded-pi> --no-session -p "<prompt>"
 ```
 
-- `--no-session`：不创建或污染当前聊天 session。
-- `--no-approve`：忽略项目本地文件。`--approve` 的实际语义是「Trust project-local files for this run」，并非安装授权，也不能免 shell command 确认（军师审查修正）；maintenance cwd 是空临时目录，无需信任任何项目文件。
-- `--no-extensions --no-skills --no-prompt-templates --no-context-files`：禁止加载全局 extensions、skills、prompt templates 与 AGENTS.md/CLAUDE.md。maintenance runtime 不得读入用户 Pi 配置中的任何可执行副作用；认证与默认模型解析所需的配置不受影响。隔离契约须在实施时以真实内嵌 Pi 验证。
-- 内嵌 Pi 以随包 binary 启动，忽略 `PI_BIN` 环境变量覆盖。
-- 临时根必须位于 `~/.pi/tmp`；HOME 不可用导致回退系统 temp 目录时不启动维护进程（fail closed）。
-- 同时最多一个 maintenance runtime；页面关闭不停止任务，其他维护按钮禁用。
-- 用户可点**取消维护**；host 终止整个 Pi process tree，随后对已处理项执行 host 复检。
-- 维护全部串行执行；一个工具失败、超时或需人工确认则停止。
-- 「维护全部」按固定顺序为每个工具启动一个独立的一次性 Pi 进程：prompt 仅含当前工具，前一项 host 复检通过后才启动下一项，不给任何进程预授权后续工具。用户可复制的「本次维护 prompt」指当前正在执行/最近完成的单项 prompt，以及已完成各项的逐项 prompt。
+- 工作目录设为系统临时目录，避免 agent 在 workspace 里动手。
+- 同时最多一个任务；运行中其它安装按钮禁用。
+- prompt 由 host 用探测到的事实渲染（工具、动作、平台、架构、状态、版本、路径、官方 URL），页面「复制 prompt」用的是**同一份字符串**。
+- 无硬性总超时之外的预算设计：单个任务 15 分钟后被 kill。
+- 用户可取消：kill 直接子进程，随后对当前工具做 host 复检。
 
-### Prompt bundle
+### Prompt 内容
 
-Picot 随包提供 `extensions/maintenance/install-tools-prompt.md`。它包含：
+prompt 内联在 host 代码中（`environment_prompt.rs`），包含：当前工具与动作、官方 URL、验证命令、停止条件、以及「完成后 host 会自己复检」的说明。停止条件：需要 `sudo`/管理员密码/UAC、需要重启、需要交互式或 GUI 安装器、需要额外语言运行时；遇到即停下说明，不绕过。同时要求不读取或修改项目文件、凭据、登录状态与 Picot 设置。
 
-- 当前 OS 与架构、所选工具、维护动作（install/update）、检查前的版本/路径/状态。
-- 上表内置官方 URL；OfficeCLI 使用 README URL。
-- 工具范围白名单：只能处理用户本次选择的工具。
-- 只使用内置官方 URL 及该官方页面直接链接的资源。
-- 每项先确认当前状态，再安装/更新，再运行对应版本命令验证。
-- 不得处理其他工具、凭据、项目文件、Git workspace 内容或系统设置；不得安装或更新 agent skills（含 dws 技能包）。
-- 遇 `sudo`、Windows UAC、Homebrew/winget bootstrap、重启、交互式安装器、非内置 URL 或额外依赖时，立即停止，不绕过、不替代、不猜测。
-- 最终输出一行 machine-readable JSON（工具结果、是否需人工确认、原因）；此前的文本仅作过程日志。
+### 复检
 
-环境页展示的维护 prompt 与实际传给 `-p` 的内容是**同一份**。暂停/失败时，用户可复制完整 prompt，交当前聊天 agent 或终端自行继续。
-
-### 超时与验证
-
-- 每工具有硬超时；维护全部另有整体硬超时。超时后终止 process tree、停止队列、host 复检。
-- agent 的 exit code、自然语言总结和最终 JSON 都不是成功依据。
-- 每项结束后 host 重新运行白名单探测；仅当预期 binary 能执行且版本被识别，页面才显示已就绪。
-- agent 报成功但复检仍缺失、不可执行或版本未改变时，状态为**需人工确认**，并显示日志、官方 URL 与复制 prompt。
-
-### 需人工确认
-
-下列情况不继续自动化：
-
-- sudo 密码、Windows UAC、管理员 installer 或系统重启。
-- Homebrew/winget 等包管理器自身 bootstrap。
-- 非内置官方 URL、重定向到未知来源、额外工具/依赖。
-- 需要交互输入、许可确认、浏览器登录或 GUI 安装器。
-
-页面显示原因、官方 URL、最后已验证状态和完整可复制 prompt。Picot 不收集密码、不弹伪造 UAC、不试图把交互式提权塞给 `--no-session` agent。
+- agent 的 exit code、自然语言总结都不是成功依据。
+- 进程退出后 host 立即重新探测该工具；只有探测为 `已就绪` 才算成功。
+- 进程正常退出但复检未就绪 → `失败`，显示复检原因；更新后版本未变化 → 显示「版本未变化」。
 
 ## 跨平台范围
 
-### macOS
-
-- 支持 Apple Silicon 与 Intel PATH。
-- agent 可按官方文档使用已存在的 Homebrew、官方 pkg、curl 下载或 release binary。
-- 没有 Homebrew 时，bootstrap 属“需人工确认”。
-
-### Windows
-
-- 支持 Git for Windows、Python Launcher、Node.js/npm、uv、OfficeCLI 与 dws 的官方安装路径。dws 在 Windows 上同样仅允许 GitHub Releases 预编译 binary；官方 PowerShell 安装脚本因带 skills 副作用不使用。
-- UAC、winget bootstrap、MSI/EXE GUI installer 属“需人工确认”。
-- host 取消维护必须终止整个子进程树，不能只结束外层 Pi。
-
-### Linux
-
-v1 不提供受支持的安装/更新入口；未来单独设计 apt/dnf/pacman/snap 等分发差异与提权体验。
+- **macOS**：Apple Silicon 与 Intel；Homebrew 或官方 pkg/下载均可，由 agent 按官方说明选择。
+- **Windows**：Git for Windows、Python Launcher、Node.js/npm、uv、officecli、dws 的官方安装路径。`py -3` 不可用时回退 `python`。
+- 两平台都不引入 OS 级隔离或进程容器；取消只 kill 直接子进程。
+- **Linux**：不提供安装/更新入口，仅检查。
 
 ## 状态机
 
 ```text
-尚未检查
-  → 检查中
-  → 已就绪 | 缺失 | 不可执行 | 失败
-
-缺失 | 不可执行 | 已就绪
-  → 维护中
-  → 已就绪 | 需人工确认 | 失败
-
-维护中
-  → 已就绪 | 需人工确认 | 失败
+尚未检查 → 检查中 → 已就绪 | 缺失 | 失败
+缺失 | 已就绪 | 失败 → 运行中 → 已就绪 | 失败 | 已取消
 ```
 
-`需更新` 是用户主动点更新后的维护意图，不由页面联网比较“最新版本”产生。更新是否可用由 maintenance agent 按官方文档判断；最终仍由 host 本地版本探测确认。
+`已就绪` 只能由 host 复检给出。
 
 ## 安全与所有权
 
-- Rust host：唯一执行环境探测、启动/取消 maintenance runtime、捕获 stdout/stderr、解析最终 JSON、执行最终复检。
-- Prompt bundle：只定义维护范围和官方来源，不能替代 host 白名单与进程边界。
-- WebView：只请求检查/维护、展示状态和日志；不执行 shell、不访问系统 PATH、不直接操作临时文件。
-- maintenance agent：一次性、无 session、仅本次 prompt 范围；不读取或写入当前 workspace/session。
-- v1 边界（明确接受的残余风险）：prompt 约束与能力裁剪（禁 extensions/skills、空临时 cwd、单工具、硬超时）不是 OS 级强制隔离；maintenance agent 保有 shell 能力，对官方 URL/范围限制的遵守属模型行为而非内核边界，host 无法证明过程中未触及其他资源。Picot 接受该残余风险作为 v1 边界，不引入 OS 级沙箱；事后事实一律以 host 白名单复检为准。
-- 所有环境维护请求继承 desktop-owner 门禁；Landing 不放开给 LAN/mobile client。
+- **host**：唯一执行探测、启动/取消安装进程、执行复检的一方。
+- **prompt**：定义范围与官方来源，不是强制隔离；agent 保有 shell 能力，遵守程度属模型行为。这是 v1 明确接受的残余风险，不引入 OS 级沙箱。
+- **WebView**：只请求检查/安装、展示状态与日志；不执行 shell。
+- 所有环境请求继承 desktop-owner 门禁；Landing 放行，LAN/mobile client 不放开。
 
 ## 测试与验证
 
-1. **Rust probe 单测**：stub command runner，覆盖每个 tool 的 command/版本解析、PATH 命中、缺失、不可执行、超时和 macOS/Windows Python 回退。
-2. **Prompt 单测**：选择单项/多项、OS、状态、官方 URL 生成的 prompt；断言 OfficeCLI 指向 README；断言未选工具、workspace、凭据不出现。
-3. **维护编排单测**：固定顺序、逐项复检、失败停止、需人工确认停止、单例拒绝、取消 process tree、工具/整体超时。
-4. **结果解析单测**：有效/无效最终 JSON；agent 成功但 host 复检失败转需人工确认。
-5. **WebView 单测**：初始不自动检查、逐项信息展示、基础/可选样式、Landing 无模型禁用维护、日志展开、复制 prompt、取消/重试状态。
-6. **跨平台手测**：macOS ARM/Intel 与 Windows 的缺失/已安装/需 UAC 各一例；真实安装后确认工具进入 Pi launch PATH。
+1. **探测单测**：六工具的版本解析、错误行不被误读、畸形版本被拒、前缀要求、超时与启动失败、缺失。
+2. **prompt 单测**：只含当前工具与其 URL、上下文 JSON 是合法单行、含停止条件、不出现其它工具。
+3. **复检单测**：agent 正常退出但复检未就绪 → 失败；复检就绪 → 成功；更新后版本未变化如实标注；取消优先。
+4. **前端单测**：打开不自动探测、六行渲染与状态、基础/可选样式、按钮差异、运行中禁用与取消、终态展示、复制 prompt 用 Snapshot.prompt、错误可见。
+5. **手测**：macOS 至少一次真实安装或更新；Landing 与 workspace 都能打开页面。
 
 ## Follow-up
 
-- 实施时更新 `ARCHITECTURE.md`：环境页的 desktop-owner 边界、host probe 白名单、maintenance runtime lifecycle/进程树取消、prompt bundle 所有权、`~/.pi/tmp` 临时资源边界与最终复检契约。
+- 实施后更新 `ARCHITECTURE.md`：环境页的 desktop-owner 边界、host 探测白名单、四个控制 op、prompt 所有权与复检契约。
 - Linux 安装支持。
-- 已启用 skill/extension 的动态依赖声明与按需工具建议。
-- “维护全部”后可选的更新检查策略。当前不做页面联网 version parser。
+- 「维护全部」：v1 只做单工具；批量需要再设计（注意它正是上一版失控的入口）。

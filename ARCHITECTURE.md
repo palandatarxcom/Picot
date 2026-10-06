@@ -256,6 +256,10 @@ pi runtime 的存活不依赖 Picot 的 teardown：`pi` 在 stdin EOF 时退出�
 | `telemetry.rs` | D10 匿名遥测 schema（Stage 0 接线） |
 | `process_tree.rs` | 进程树管理（Unix pgid / Windows Job Object） |
 | `child_supervision.rs` | 运行时注册表 + 启动孤儿清扫 + 终止信号兜底（复用 process_tree 的终止语义） |
+| `environment_probe.rs` | 环境配置页的 host 探测：六工具固定版本命令、5s/候选超时、版本行前缀校验、只读 PATH 扫描供显示 |
+| `environment_prompt.rs` | 安装 prompt 渲染（内联模板 + 单行 JSON 上下文），一次只授权一个工具 |
+| `environment_install.rs` | 环境配置页的安装执行：spawn 内嵌 Pi `--no-session -p`、15min 上限、取消、结束后 host 复检 |
+| `child_supervision.rs` | 运行时注册表 + 启动孤儿清扫 + 终止信号兜底（复用 process_tree 的终止语义） |
 
 ## Widget mirror registry
 
@@ -359,6 +363,39 @@ Pi 以 `~/.pi/agent/trust.json`（键为 canonical 路径，值为 true/false/nu
 - **写入协议**：复刻 Pi 的 proper-lockfile 语义——`create_dir`（原子 EEXIST，绝不可用 `create_dir_all`）在 `trust.json.lock` 目录上获取锁，10s mtime 过期阈值，20ms 重试、上限 750 次，`remove_dir` 释放；read-modify-write 保留其他条目，键排序 + 2 空格 JSON + 尾随换行与 Pi 的 `writeTrustFile` 逐字节一致，tmp+rename 原子落盘。
 - **查询语义**：`skill_scope_context` 改用 `is_project_trusted`，对齐 Pi 的 `findNearestTrustEntry`——从项目根向上找最近的 true/false 条目（更近的显式 `false` 覆盖受信父目录），null/缺失继续上溯，无条目则不信任。
 
+## Settings → 环境配置（host 探测 + 交给 Pi 安装）
+
+新增顶级「环境配置」页，导航顺序为 通用 / 外观 / 模型 / 扩展包 / 技能 / MCP / 子代理 / 环境配置 / 高级配置 / 使用量；Landing 与已注册 workspace 都可访问。页面只展示与转发，事实全部来自 host。
+
+### Host 探测
+
+host 用固定命令白名单跑短进程解析版本：`git --version`、`python3 --version`（Windows 先 `py -3 --version` 再回退 `python --version`）、`npm --version`、`uv --version`、`officecli --version`、`dws --version`；每候选 5s 超时，超时按失败处理，不杀主 app。不使用模型、不联网、不经 WebView shell。路径解析交给 OS 启动器（`Command` 自身按 PATH/PATHEXT 查找），host 另做一次只读 PATH 扫描**仅用于显示**实际路径。
+
+版本必须来自该工具自己那一行：git 要求 `git version` 前缀、python3 要求 `Python` 前缀、dws 要求 `dws version` 前缀；只读 stdout（python3/officecli 例外，可读 stderr）。错误行里出现的其它版本号（npm 报错提到 Node 版本、连接失败提到 IP）不得被当成该工具版本。
+
+### 安装与更新（交给内嵌 Pi）
+
+用户点安装/更新即授权**当前这一个工具**。host 执行 `<embedded-pi> --no-session -p "<prompt>"`，cwd 为系统临时目录，同时最多一个任务。取消与 app 退出都只 kill 直接子进程：**不保证进程树零逃逸、不做重启后仍可恢复的清理状态、不使用 Windows Job Object**——与「不引入 OS 级沙箱」是同一种已接受的残余风险（见下节）。
+
+prompt 由 host 用探测事实渲染（`environment_prompt.rs` 内联模板：当前工具与动作、官方 URL、验证命令、停止条件），页面「复制 prompt」用的是**同一份字符串**；上下文只有 host 事实，页面无法扩大授权范围。
+
+### 复检契约
+
+agent 的 exit code 与自然语言都不是成功依据：进程退出后 host 立即重新探测该工具，只有探测 `ready` 才算成功；正常退出但复检未就绪 → `failed` 并显示复检原因；更新后版本未变化则如实标注。任务结束后 `status` 仍返回**最后一次快照**，切走页面再回来仍能看出是哪个工具、什么动作、什么结果。
+
+任务到终态时页面发一条系统通知（复用既有 `show_task_notification` 数据帧，不带 workspace/session，因此 Landing 也能用）：**只在用户不在该页面或窗口不可见时发**，因为页面自己就在显示判决文案。该帧在宿主侧受两重约束——desktop-owner 门禁（LAN 配对设备不能弹横幅）与用户的通知偏好 `notifications.taskCompletion`（Settings 开关写入）。无 session 的通知没有点击跳转目标，因而不产生 `notification_activated`。页面在任务运行期间**不因离开页面而停掉轮询**（只在空闲时停），否则「离开后完成」这一情形永远观察不到。
+
+### 控制 op（逐个 `require_native_owner`）
+
+| op | payload | 返回 |
+| --- | --- | --- |
+| `environment_check` | — | `{tools: Probe[]}`（跑真实进程，须离开 async worker） |
+| `environment_install_start` | `{tool, action:"install"\|"update"}` | `Snapshot`；已有任务时 `maintenance_busy` |
+| `environment_install_status` | — | `Snapshot \| null` |
+| `environment_install_cancel` | — | `Snapshot \| null` |
+
+`Probe = {toolId, status:"ready"|"missing"|"failed", version?, executablePath?, reason?, officialUrl, tier}`；`Snapshot = {tool, action, phase:"running"|"done"|"failed"|"cancelled", prompt, log, probe?, reason?}`。四个 op 走既有 `host_request` 控制面，不新增 `/api/*` 路由；页面打开不自动探测。不做联网的「最新版本」比较。
+
 ## Office 文件原生预览（anydoc）
 
 选中候选 Office 文件（后缀 `doc/docx/rtf/odt/ppt/pptx/odp/xls/xlsx/ods` 共十种）时，`file_read` 走内嵌 `anydoc` crate（精确 pin `=0.2.4`，MIT）的原生转换分支，产物为只读 Markdown（`previewStatus:"ready"` + `renderAs:"markdown"`）。安全与资源边界：
@@ -418,6 +455,7 @@ Pi 以 `~/.pi/agent/trust.json`（键为 canonical 路径，值为 true/false/nu
 4. **Generation 失效**：workspace transition 使旧代授权、操作与导出令牌全部失效；旧代 runtime 进程保留存活但不可达（授权闸门拒收），至窗口销毁/owner 撤销/app 退出、显式 restart（`restart_runtime` 控制面命令，Registered owner 经 Settings 触发）或返回 rebind
 5. **跨 workspace 事件可见性**（2026-09-20 拍板）：持有 desktop capability 的本机窗口可订阅任意 live runtime 的全部非阻塞事件（消息正文、tool 输出、widget、notify）；阻塞式 `extension_ui_request`（select/confirm/input/editor）仍只投 `authorize_target` 通过的订阅者。desktop capability 只由原生窗口 owner registry 铸发，LAN 配对设备（Browser 类客户端）拿不到。
 6. **匿名遥测**：仅 allowlisted 粗粒度字段，无 per-user/per-token 维度
+7. **环境配置页的安装**（2026-10-06 定调）：安装由内嵌 Pi 执行 `pi --no-session -p "<prompt>"`，prompt 里的范围与官方来源约束**是模型行为、不是内核边界**——agent 保有 shell 能力，host 无法证明过程中未触及其他资源。v1 明确接受这一残余风险：不引入 OS 级沙箱、不做进程树零逃逸保证、不做重启可恢复的清理状态、不使用 Windows Job Object；取消与 app 退出只 kill 直接子进程，可能留下孤儿。事后事实一律以 host 复检为准。
 
 ## 测试文件系统边界
 
