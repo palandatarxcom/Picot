@@ -17,7 +17,7 @@
  * per-asset). Bumping the version is an explicit, reviewable change.
  *
  * Output: `src-tauri/resources/pi/` containing the extracted release tree
- * (binary `pi` / `pi.exe`, theme/, assets/, node_modules/, etc.) plus a
+ * (binary `pi` / `pi.exe`, theme/, assets/, docs/, etc.) plus a
  * `.version` marker file used for idempotency.
  *
  * Idempotency

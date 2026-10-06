@@ -15,6 +15,7 @@ const MODELS_DOCS_URL =
   "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/models.md";
 const PROVIDER_ICON_ALIASES = {
   "amazon-bedrock": "aws",
+  azure: "azure",
   "azure-openai-responses": "azure",
   "github-copilot": "github-copilot",
   "google-vertex": "google",
