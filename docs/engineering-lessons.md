@@ -134,3 +134,60 @@ same error as a non-existent operation.
 
 **Rule**: Error codes must not form an oracle for resource existence across
 authorization boundaries.
+
+### 11. Adversarial review cannot substitute for a design review
+
+**What happened**: An "environment check + install" feature was built as a
+process-supervision subsystem (~11,700 lines): one embedded-Pi process per
+tool, provable cross-platform process-tree containment, Windows Job Objects
+with suspended creation and handle-ownership tables, restart-survivable
+cleanup state, typed cleanup verdicts, inode-anchored temp deletion. Four
+rounds of adversarial code review each returned ~10 blocking defects and
+never passed the code. Deleting the subsystem and reducing "install" to a
+single `pi --no-session -p "<prompt>"` call left ~1,034 lines.
+
+**Fix**: Ask whether the mechanism needs to exist before reviewing how it is
+implemented. The AI performs the install; nothing else was required.
+
+**Rule**: When review rounds keep finding ever-deeper defects in the same
+design, the evidence points at the design, not at the code needing another
+pass. Stop, restate the goal, and cut. A review that is correct about a
+wrong design is still a wrong plan.
+
+### 12. Structural source lines must not be rewritten by line-oriented bulk edits
+
+**What happened**: `sed 's/^#[cfg(test)]$//'` over a Rust source file removed
+all three `#[cfg(test)]` gates at once; the production build then reported
+test-only imports as unused. The same class of risk applies to `#[cfg(...)]`,
+attributes, and macro delimiters.
+
+**Fix**: `git checkout -- <file>` and redo with targeted edits.
+
+**Rule**: Never bulk-replace structural lines (attributes, gates, macros) with
+line-oriented tools. Use anchored edits. When a bulk edit has already gone
+wrong, restore from git instead of patching on top of the damage.
+
+### 13. An anchor insertion keeps the anchor line — check for duplication
+
+**What happened**: `@INS.BEFORE`/`@INS.AFTER` preserve the anchor line. Twice
+the anchor line was also written into the inserted block, producing a
+duplicated `fn read_bounded` definition and a duplicated
+`## Office 文件原生预览` heading in `ARCHITECTURE.md`.
+
+**Rule**: After any anchor-based insertion, inspect the anchor line
+immediately for duplication.
+
+### 14. Before deleting a "no callers" method, find the state chain it serves
+
+**What happened**: `Installer::last()` was deleted as dead code. It was the
+accessor for the terminal snapshot: `status()` returned a snapshot only while
+a job was running, so the page cleared its result panel as soon as the run
+finished, and a user who left Settings and came back could not tell which
+tool had been installed or updated.
+
+**Fix**: Return the last snapshot when idle, with a regression test that keeps
+polling after the run ends.
+
+**Rule**: Contact with a state machine, snapshot, or lifecycle accessor cannot
+be established by call sites alone — verify whether a UI or recovery path
+depends on the value surviving before calling it dead.
