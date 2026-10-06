@@ -139,6 +139,21 @@ impl HostDataPlane {
     }
 
     pub fn new(metadata: crate::metadata_store::SharedMetadataStore) -> Self {
+        Self::with_metadata(metadata)
+    }
+
+    /// A boolean user preference, or `None` when unset. One accessor so every
+    /// caller reads the same DB-backed value the Settings toggles write.
+    pub fn preference_bool(&self, key: &str) -> Option<bool> {
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|store| store.pref_get(key).ok())
+            .flatten()
+            .and_then(|value| value.as_bool())
+    }
+
+    fn with_metadata(metadata: crate::metadata_store::SharedMetadataStore) -> Self {
         Self {
             metadata,
             session_root: None,

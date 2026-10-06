@@ -73,6 +73,7 @@ fn mobile_lan_access_enabled(metadata: &crate::metadata_store::SharedMetadataSto
 }
 
 /// Best-effort primary LAN URL for the running host, discovered with a
+/// Best-effort primary LAN URL for the running host, discovered with a
 /// routing-table probe (a UDP `connect` sends no packets). Returns `None` on
 /// machines without a default route so the UI falls back to manual entry.
 fn primary_lan_url(port: u16) -> Option<String> {
@@ -3120,6 +3121,9 @@ async fn dispatch(
                         | "officecli_watch_stop"
                         | "officecli_watch_status"
                         | "officecli_watch_mark"
+                        // The Environment page may notify with no workspace
+                        // open; a session is optional for this one frame.
+                        | "show_task_notification"
                 ) {
                     return true;
                 }
@@ -3265,11 +3269,27 @@ async fn dispatch(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    let response = json!({
+                        "type": "data_response",
+                        "requestId": request_id,
+                        "operation": "show_task_notification",
+                    });
+                    // The user's own switch wins: a notification the Settings
+                    // toggle turned off must not appear because another page
+                    // asked for it.
+                    // The Settings toggle writes this DB-backed preference; the
+                    // host honours it so every caller is gated the same way.
+                    // Absent means enabled, which is the toggle's default.
+                    if state.data.preference_bool("notifications.taskCompletion") == Some(false) {
+                        return Ok(response);
+                    }
+                    // The Environment page installs tools with no workspace
+                    // open, so a session is optional. Without one there is no
+                    // click-through target and that path is skipped below.
                     let session_id = frame
                         .get("sessionId")
                         .and_then(Value::as_str)
-                        .ok_or(("invalid_session", "sessionId is required".into()))?
-                        .to_string();
+                        .map(str::to_string);
                     // macOS attributes UN notifications to a bundle identifier.
                     // The host server never sees the Tauri config, so this
                     // mirrors tauri.conf.json's identifier.
@@ -3285,6 +3305,10 @@ async fn dispatch(
                                 format!("Cannot show task notification: {error}"),
                             )
                         })?;
+                    // Without a session there is nothing to click through to.
+                    let Some(session_id) = session_id else {
+                        return Ok(response);
+                    };
                     let session_file = state
                         .data
                         .session_file_path(workspace_id, &session_id)
@@ -3312,11 +3336,7 @@ async fn dispatch(
                             }));
                         });
                     });
-                    Ok(json!({
-                        "type": "data_response",
-                        "requestId": request_id,
-                        "operation": "show_task_notification",
-                    }))
+                    Ok(response)
                 }
                 Some("list_files") => {
                     let workspace_id = frame
