@@ -1412,7 +1412,85 @@
     "taskNotificationsDescription": "Muestra una notificación del sistema operativo cuando finaliza una tarea.",
     "taskCompleteTitle": "Tarea completada",
     "taskCompleteMessage": "Tu tarea ha finalizado.",
-    "taskFailedTitle": "La tarea falló"
+    "taskFailedTitle": "La tarea falló",
+    "environment": {
+      "title": "Configuración del entorno",
+      "check": "Comprobar el entorno",
+      "recheck": "Volver a comprobar",
+      "checking": "Comprobando…",
+      "neverChecked": "Aún sin comprobar",
+      "checked": "Comprobado: {ready}/{total} herramientas listas",
+      "checkFailed": "La comprobación del entorno falló: {message}",
+      "statusFailed": "No se pudo leer el estado del mantenimiento: {message}",
+      "startFailed": "No se pudo iniciar el mantenimiento: {message}",
+      "cancelFailed": "No se pudo cancelar: {message}",
+      "copyFailed": "No se pudo copiar el prompt: {message}",
+      "promptCopied": "Prompt copiado",
+      "tier": {
+        "basic": "Básico",
+        "optional": "Opcional"
+      },
+      "statusLabel": "Estado",
+      "status": {
+        "unchecked": "Aún sin comprobar",
+        "ready": "Listo",
+        "missing": "No encontrado",
+        "failed": "No ejecutable"
+      },
+      "version": "Versión",
+      "path": "Ruta",
+      "siteLabel": "Página oficial",
+      "install": "Instalar",
+      "update": "Actualizar",
+      "retry": "Reintentar",
+      "cancel": "Cancelar",
+      "log": "Registro",
+      "logEmpty": "Todavía sin salida",
+      "copyPrompt": "Copiar el prompt",
+      "runAction": {
+        "install": "Instalando {tool}",
+        "update": "Actualizando {tool}"
+      },
+      "runPhase": {
+        "running": "En ejecución…",
+        "done": "Terminado",
+        "failed": "Fallido",
+        "cancelled": "Cancelado"
+      },
+      "recheckResult": "Nueva comprobación: {status} · {version} · {path}",
+      "tools": {
+        "git": {
+          "name": "Git",
+          "purpose": "Control de versiones, panel Git, diffs, historial, commits y push"
+        },
+        "python3": {
+          "name": "Python 3",
+          "purpose": "Entorno de ejecución para proyectos Python, scripts y herramientas del agente"
+        },
+        "npm": {
+          "name": "npm",
+          "purpose": "Extensiones de Pi de origen npm y herramientas de Node"
+        },
+        "uv": {
+          "name": "uv",
+          "purpose": "Gestión de dependencias de herramientas y proyectos Python"
+        },
+        "officecli": {
+          "name": "OfficeCLI",
+          "purpose": "Herramientas del agente para archivos Word, Excel y PowerPoint"
+        },
+        "dws": {
+          "name": "dws",
+          "purpose": "CLI del espacio de trabajo de DingTalk para mensajes, documentos, calendario y aprobaciones"
+        }
+      },
+      "runVerdict": {
+        "done": "{tool} finalizado",
+        "failed": "{tool} falló",
+        "cancelled": "Cancelado"
+      },
+      "notifyTitle": "Entorno"
+    }
   },
   "cost": {
     "documentTitle": "Picot - Uso",

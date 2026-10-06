@@ -1412,7 +1412,85 @@
     "taskNotificationsDescription": "Show an operating system notification when a task finishes.",
     "taskCompleteTitle": "Task completed",
     "taskCompleteMessage": "Your task has finished.",
-    "taskFailedTitle": "Task failed"
+    "taskFailedTitle": "Task failed",
+    "environment": {
+      "title": "Environment configuration",
+      "check": "Check environment",
+      "recheck": "Check again",
+      "checking": "Checking…",
+      "neverChecked": "Not checked yet",
+      "checked": "Checked: {ready}/{total} tools ready",
+      "checkFailed": "Environment check failed: {message}",
+      "statusFailed": "Could not read the maintenance status: {message}",
+      "startFailed": "Could not start the maintenance run: {message}",
+      "cancelFailed": "Could not cancel: {message}",
+      "copyFailed": "Could not copy the prompt: {message}",
+      "promptCopied": "Prompt copied",
+      "tier": {
+        "basic": "Basic",
+        "optional": "Optional"
+      },
+      "statusLabel": "Status",
+      "status": {
+        "unchecked": "Not checked yet",
+        "ready": "Ready",
+        "missing": "Missing",
+        "failed": "Not runnable"
+      },
+      "version": "Version",
+      "path": "Path",
+      "siteLabel": "Official page",
+      "install": "Install",
+      "update": "Update",
+      "retry": "Retry",
+      "cancel": "Cancel",
+      "log": "Log",
+      "logEmpty": "No output yet",
+      "copyPrompt": "Copy prompt",
+      "runAction": {
+        "install": "Installing {tool}",
+        "update": "Updating {tool}"
+      },
+      "runPhase": {
+        "running": "Running…",
+        "done": "Finished",
+        "failed": "Failed",
+        "cancelled": "Cancelled"
+      },
+      "recheckResult": "Re-check: {status} · {version} · {path}",
+      "tools": {
+        "git": {
+          "name": "Git",
+          "purpose": "Version control, the Git panel, diffs, history, commits and push"
+        },
+        "python3": {
+          "name": "Python 3",
+          "purpose": "Runtime for Python projects, scripts and agent tools"
+        },
+        "npm": {
+          "name": "npm",
+          "purpose": "npm-sourced Pi extensions and Node tools"
+        },
+        "uv": {
+          "name": "uv",
+          "purpose": "Python tool and project dependency management"
+        },
+        "officecli": {
+          "name": "OfficeCLI",
+          "purpose": "Agent tools for Word, Excel and PowerPoint files"
+        },
+        "dws": {
+          "name": "dws",
+          "purpose": "DingTalk workspace CLI for messages, documents, calendar and approvals"
+        }
+      },
+      "runVerdict": {
+        "done": "{tool} finished",
+        "failed": "{tool} failed",
+        "cancelled": "Cancelled"
+      },
+      "notifyTitle": "Environment"
+    }
   },
   "cost": {
     "documentTitle": "Picot - Usage",

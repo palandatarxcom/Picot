@@ -1412,7 +1412,85 @@
     "taskNotificationsDescription": "タスクの完了時にOS通知を表示します。",
     "taskCompleteTitle": "タスクが完了しました",
     "taskCompleteMessage": "タスクが完了しました。",
-    "taskFailedTitle": "タスクが失敗しました"
+    "taskFailedTitle": "タスクが失敗しました",
+    "environment": {
+      "title": "環境設定",
+      "check": "環境を確認",
+      "recheck": "再確認",
+      "checking": "確認中…",
+      "neverChecked": "未確認",
+      "checked": "確認済み：{ready}/{total} 件が準備完了",
+      "checkFailed": "環境の確認に失敗しました：{message}",
+      "statusFailed": "メンテナンス状態を読み取れません：{message}",
+      "startFailed": "メンテナンスを開始できません：{message}",
+      "cancelFailed": "キャンセルできません：{message}",
+      "copyFailed": "prompt をコピーできません：{message}",
+      "promptCopied": "prompt をコピーしました",
+      "tier": {
+        "basic": "基本",
+        "optional": "オプション"
+      },
+      "statusLabel": "状態",
+      "status": {
+        "unchecked": "未確認",
+        "ready": "準備完了",
+        "missing": "見つかりません",
+        "failed": "実行不可"
+      },
+      "version": "バージョン",
+      "path": "パス",
+      "siteLabel": "公式ページ",
+      "install": "インストール",
+      "update": "更新",
+      "retry": "再試行",
+      "cancel": "キャンセル",
+      "log": "ログ",
+      "logEmpty": "出力はまだありません",
+      "copyPrompt": "prompt をコピー",
+      "runAction": {
+        "install": "{tool} をインストール中",
+        "update": "{tool} を更新中"
+      },
+      "runPhase": {
+        "running": "実行中…",
+        "done": "完了",
+        "failed": "失敗",
+        "cancelled": "キャンセル済み"
+      },
+      "recheckResult": "再確認：{status} · {version} · {path}",
+      "tools": {
+        "git": {
+          "name": "Git",
+          "purpose": "バージョン管理、Git パネル、diff、履歴、コミットと push"
+        },
+        "python3": {
+          "name": "Python 3",
+          "purpose": "Python プロジェクト、スクリプト、agent ツールの実行環境"
+        },
+        "npm": {
+          "name": "npm",
+          "purpose": "npm 由来の Pi 拡張と Node ツール"
+        },
+        "uv": {
+          "name": "uv",
+          "purpose": "Python ツールとプロジェクトの依存関係管理"
+        },
+        "officecli": {
+          "name": "OfficeCLI",
+          "purpose": "Word、Excel、PowerPoint ファイル向けの agent ツール"
+        },
+        "dws": {
+          "name": "dws",
+          "purpose": "メッセージ、ドキュメント、カレンダー、承認を操作する DingTalk ワークスペース CLI"
+        }
+      },
+      "runVerdict": {
+        "done": "{tool} 完了",
+        "failed": "{tool} 失敗",
+        "cancelled": "キャンセル済み"
+      },
+      "notifyTitle": "環境設定"
+    }
   },
   "cost": {
     "documentTitle": "Picot - 使用量",

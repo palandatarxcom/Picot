@@ -126,8 +126,11 @@ describe("settings page split", () => {
       "models",
       "extensions",
       "skills",
-      "subagents",
       "mcp",
+      "subagents",
+      // Environment sits at the end of the feature group, before the advanced
+      // configuration and usage entries.
+      "environment",
       "configuration",
       "usage",
     ]);

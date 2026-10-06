@@ -19,6 +19,12 @@
 const NO_TIMEOUT = 0;
 const SPAWN_TIMEOUT_MS = 60000;
 const PACKAGE_TIMEOUT_MS = 120000;
+// `environment_check` spawns one version process per tool, each with a hard 5s
+// host timeout plus up to 1s to drain its pipes, and the host runs all six in
+// order: 6 × 6s ≈ 36s worst case, already past the 30s default control
+// timeout. 60s covers that plus process-start overhead while still failing a
+// genuinely wedged check instead of waiting forever.
+const ENVIRONMENT_CHECK_TIMEOUT_MS = 60000;
 
 export class WsTransport {
   constructor(wsClient, env = globalThis.window || globalThis) {
@@ -82,6 +88,42 @@ export class WsTransport {
 
   isDev() {
     return this._control("is_dev", {});
+  }
+
+  // ── Environment toolchain (host probe + one-shot maintenance installer) ────
+  // The host owns both sides: it runs the fixed version commands and, after a
+  // maintenance run, re-checks the tool itself. The page only asks and displays.
+
+  checkEnvironment() {
+    return this._control("environment_check", {}, { timeoutMs: ENVIRONMENT_CHECK_TIMEOUT_MS });
+  }
+
+  // Starting only spawns the embedded Pi; the install runs on the host and is
+  // followed by polling, so this covers the spawn, not the 15-minute
+  // maintenance budget.
+  startEnvironmentInstall({ tool, action }) {
+    return this._control(
+      "environment_install_start",
+      { tool, action },
+      { timeoutMs: SPAWN_TIMEOUT_MS },
+    );
+  }
+
+  // `null` when nothing has run in this app session.
+  getEnvironmentInstall() {
+    return this._control("environment_install_status", {});
+  }
+
+  cancelEnvironmentInstall() {
+    return this._control("environment_install_cancel", {});
+  }
+
+  // A finished install is worth an OS notification: it runs for minutes and the
+  // user has usually moved on. The frame carries no workspace or session, so the
+  // page can notify from Landing too; the host still applies the desktop-owner
+  // gate and the user's own notification preference.
+  notifyEnvironmentFinished({ title, body }) {
+    return this.wsClient.sendData("show_task_notification", { title, body });
   }
 
   listPiPackages() {

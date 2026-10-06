@@ -93,6 +93,38 @@ describe("WsTransport", () => {
     expect(ws.sendControl).toHaveBeenCalledWith("mcp_server_status", {}, { timeoutMs: 60000 });
   });
 
+  test("environment ops ride the host control plane with per-op timeouts", async () => {
+    const ws = fakeWsClient();
+    const transport = new WsTransport(ws, {});
+
+    await transport.checkEnvironment();
+    await transport.startEnvironmentInstall({ tool: "git", action: "install" });
+    await transport.getEnvironmentInstall();
+    await transport.cancelEnvironmentInstall();
+
+    // The check runs six version processes serially (5s timeout + 1s pipe
+    // drain each), so it needs more than the 30s default control timeout.
+    expect(ws.sendControl).toHaveBeenCalledWith("environment_check", {}, { timeoutMs: 60000 });
+    // Starting only spawns the embedded Pi: a spawn-grade timeout, never the
+    // 15-minute maintenance budget.
+    expect(ws.sendControl).toHaveBeenCalledWith(
+      "environment_install_start",
+      { tool: "git", action: "install" },
+      { timeoutMs: 60000 },
+    );
+    expect(ws.sendControl).toHaveBeenCalledWith("environment_install_status", {}, {});
+    expect(ws.sendControl).toHaveBeenCalledWith("environment_install_cancel", {}, {});
+
+    // The completion banner is a plain data frame: no workspace or session, so
+    // the Environment page can notify from Landing too (the host still applies
+    // the desktop-owner gate and the user's own notification preference).
+    await transport.notifyEnvironmentFinished({ title: "Environment", body: "uv finished" });
+    expect(ws.sendData).toHaveBeenCalledWith("show_task_notification", {
+      title: "Environment",
+      body: "uv finished",
+    });
+  });
+
   test("onMcpLoginUpdate forwards only the frame payload and unsubscribes", () => {
     const listeners = new Map();
     const ws = {

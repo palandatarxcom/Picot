@@ -89,6 +89,7 @@ import { createScrollOwner } from "./session/scroll-ownership.js";
 import { SessionUiStateStore } from "./session-ui-state.js";
 import { ConfigGateway, consumeConfigResponseFrame } from "./settings/config-gateway.js";
 import { createConfigReadiness } from "./settings/config-readiness.js";
+import { setupEnvironmentPage } from "./settings/environment-page.js";
 import { setupExtensionsTabShell } from "./settings/extensions-tab-shell.js";
 import { createMcpHostOps, setupMcpPage } from "./settings/mcp-page.js";
 import { setupMobileAccess } from "./settings/mobile-access.js";
@@ -7241,9 +7242,17 @@ const subagentsPage = setupSubagentsTab({
   },
 });
 
+// Nothing here probes on open: the host is only asked when the user clicks
+// Check, and a running maintenance job is resumed from the host's snapshot.
+const environmentPage = setupEnvironmentPage({
+  transport,
+  openExternal: (url) => transport.openExternal(url),
+});
+
 function selectSettingsTab(tabKey = "general") {
   const targetTabKey = tabKey === "auth" ? "configuration" : tabKey;
   if (targetTabKey !== "subagents" && !subagentsPage.leave()) return false;
+  if (targetTabKey !== "environment") environmentPage.leave();
   // The MCP nav item stays hidden until the pi-mcp-adapter package is
   // detected; refreshAvailability caches after the first check.
   void mcpPage.refreshAvailability();
@@ -7275,6 +7284,7 @@ function selectSettingsTab(tabKey = "general") {
     void mcpPage.activate();
   }
   if (targetTabKey === "subagents") void subagentsPage.activate();
+  if (targetTabKey === "environment") void environmentPage.activate();
   if (targetTabKey === "usage") {
     void document.getElementById("settings-cost-dashboard")?.ensureLoaded();
     // The quota panel loads once at boot; re-request on every entry so a

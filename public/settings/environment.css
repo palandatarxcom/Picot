@@ -1,0 +1,204 @@
+/* ═══════════════════════════════════════════════════════
+   Environment page — external tool status, install and logs
+   (public/settings/environment-page.js)
+   ═══════════════════════════════════════════════════════ */
+
+.env-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+/* `.settings-help` carries a 12px bottom margin for stacked help text. As a
+   flex item beside the button that margin joins the box, so `align-items:
+   center` centres the box and leaves the visible line sitting above the
+   button's centre. Drop it here to line the two up. */
+.env-toolbar .settings-help {
+  margin: 0;
+}
+
+/* The result of a finished run, where the running line used to sit. */
+.env-run-verdict {
+  font-weight: 600;
+}
+
+.env-run-verdict.is-done {
+  color: var(--success);
+}
+
+.env-run-verdict.is-failed {
+  color: var(--error);
+}
+
+.env-run-verdict.is-cancelled {
+  color: var(--text-muted);
+}
+
+.env-notice {
+  margin-bottom: var(--space-3);
+}
+
+.env-notice.is-error {
+  color: var(--error);
+}
+
+.env-tools {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.env-tool {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-left-width: 2px;
+  border-radius: var(--radius-md);
+}
+
+/* Level is the whole point of the split: a missing basic tool breaks Git,
+   diffs and scripts, a missing optional tool only limits its own feature. */
+.env-tool-basic {
+  border-left-color: var(--error);
+}
+
+.env-tool-optional {
+  border-left-color: var(--warning);
+}
+
+.env-tool-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.env-tool-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.env-tier {
+  padding: 0 var(--space-1-5);
+  font-size: var(--font-size-sm);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-pill);
+}
+
+.env-tier.is-basic {
+  color: var(--error);
+}
+
+.env-tier.is-optional {
+  color: var(--warning);
+}
+
+.env-tool-purpose {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--font-size-sm);
+}
+
+.env-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-2) var(--space-3);
+}
+
+.env-fact {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: var(--space-0-5);
+}
+
+.env-fact-label {
+  color: var(--text-dim);
+  font-size: var(--font-size-sm);
+}
+
+.env-fact-value {
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+}
+
+.env-status.is-ready .env-fact-value {
+  color: var(--success);
+}
+
+.env-status.is-missing .env-fact-value,
+.env-status.is-failed .env-fact-value {
+  color: var(--error);
+}
+
+.env-site .env-link {
+  color: var(--accent-text);
+}
+
+.env-btn {
+  align-self: flex-start;
+}
+
+.env-run {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.env-run.is-failed {
+  border-color: var(--error);
+}
+
+.env-run.is-done {
+  border-color: var(--success);
+}
+
+.env-run-action {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.env-run-phase,
+.env-recheck {
+  color: var(--text-dim);
+  font-size: var(--font-size-sm);
+}
+
+.env-run-reason {
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.env-log summary {
+  color: var(--text-dim);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.env-log-text {
+  max-height: 240px;
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2);
+  overflow: auto;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg-glass-strong, var(--bg-glass));
+  border-radius: var(--radius-xs);
+}
+
+.env-run-actions {
+  display: flex;
+  gap: var(--space-2);
+}

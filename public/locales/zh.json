@@ -1412,7 +1412,85 @@
     "taskNotificationsDescription": "任务完成时显示操作系统通知。",
     "taskCompleteTitle": "任务已完成",
     "taskCompleteMessage": "你的任务已完成。",
-    "taskFailedTitle": "任务失败"
+    "taskFailedTitle": "任务失败",
+    "environment": {
+      "title": "环境配置",
+      "check": "检查环境",
+      "recheck": "重新检查",
+      "checking": "正在检查…",
+      "neverChecked": "尚未检查",
+      "checked": "已检查：{ready}/{total} 项已就绪",
+      "checkFailed": "环境检查失败：{message}",
+      "statusFailed": "无法读取维护状态：{message}",
+      "startFailed": "无法启动维护：{message}",
+      "cancelFailed": "取消失败：{message}",
+      "copyFailed": "复制 prompt 失败：{message}",
+      "promptCopied": "prompt 已复制",
+      "tier": {
+        "basic": "基础",
+        "optional": "可选"
+      },
+      "statusLabel": "状态",
+      "status": {
+        "unchecked": "尚未检查",
+        "ready": "已就绪",
+        "missing": "缺失",
+        "failed": "不可执行"
+      },
+      "version": "版本",
+      "path": "路径",
+      "siteLabel": "官方页面",
+      "install": "安装",
+      "update": "更新",
+      "retry": "重试",
+      "cancel": "取消",
+      "log": "日志",
+      "logEmpty": "暂无输出",
+      "copyPrompt": "复制 prompt",
+      "runAction": {
+        "install": "正在安装 {tool}",
+        "update": "正在更新 {tool}"
+      },
+      "runPhase": {
+        "running": "运行中…",
+        "done": "已完成",
+        "failed": "失败",
+        "cancelled": "已取消"
+      },
+      "recheckResult": "复检结果：{status} · {version} · {path}",
+      "tools": {
+        "git": {
+          "name": "Git",
+          "purpose": "版本控制、Git 面板、diff、历史、提交与推送"
+        },
+        "python3": {
+          "name": "Python 3",
+          "purpose": "Python 项目、脚本与 agent 工具的运行时"
+        },
+        "npm": {
+          "name": "npm",
+          "purpose": "npm 来源的 Pi 扩展与 Node 工具"
+        },
+        "uv": {
+          "name": "uv",
+          "purpose": "Python 工具与项目依赖管理"
+        },
+        "officecli": {
+          "name": "OfficeCLI",
+          "purpose": "Word、Excel、PowerPoint 文件的 agent 工具"
+        },
+        "dws": {
+          "name": "dws",
+          "purpose": "钉钉工作台 CLI，供 agent 操作消息、文档、日历与审批"
+        }
+      },
+      "runVerdict": {
+        "done": "{tool} 已完成",
+        "failed": "{tool} 失败",
+        "cancelled": "已取消"
+      },
+      "notifyTitle": "环境配置"
+    }
   },
   "cost": {
     "documentTitle": "Picot - 使用量",

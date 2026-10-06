@@ -43,6 +43,7 @@ import {
 } from "./preferences-client.js";
 import { renderPreviewThemeOptions } from "./preview-themes.js";
 import { QuickChatDialog } from "./quick-chat-dialog.js";
+import { setupEnvironmentPage } from "./settings/environment-page.js";
 import { setupExtensionsTabShell } from "./settings/extensions-tab-shell.js";
 import { createMcpHostOps, setupMcpPage } from "./settings/mcp-page.js";
 import { setupMobileAccess } from "./settings/mobile-access.js";
@@ -327,6 +328,7 @@ wsClient.addEventListener("registryChanged", () => {
 const LANDING_FUNCTIONAL_SETTINGS_TABS = new Set([
   "general",
   "appearance",
+  "environment",
   "usage",
   "skills",
   "subagents",
@@ -446,6 +448,13 @@ const landingSubagents = setupSubagentsTab({
   configGateway: landingConfig.configGateway,
 });
 
+// Environment works at landing too: check and install are host control-plane
+// ops, so no config runtime or Pi session is involved. It probes on click only.
+const environmentPage = setupEnvironmentPage({
+  transport,
+  openExternal: (url) => transport.openExternal(url),
+});
+
 function selectLandingSettingsTab(tabKey) {
   const target = LANDING_FUNCTIONAL_SETTINGS_TABS.has(tabKey) ? tabKey : "general";
   document.querySelectorAll(".settings-nav-item[data-settings-tab]").forEach((item) => {
@@ -459,6 +468,11 @@ function selectLandingSettingsTab(tabKey) {
     void landingSubagents.activate();
   } else {
     landingSubagents.leave();
+  }
+  if (target === "environment") {
+    void environmentPage.activate();
+  } else {
+    environmentPage.leave();
   }
   if (target === "usage") {
     // Same lazy-load contract as the workspace shell: the dashboard fetches

@@ -101,6 +101,7 @@
     <link rel="stylesheet" href="ui/image-lightbox.css" />
     <link rel="stylesheet" href="info-panel.css" />
     <link rel="stylesheet" href="settings/settings-config.css" />
+    <link rel="stylesheet" href="settings/environment.css" />
     <link rel="stylesheet" href="vendor/xterm.css" />
     <script>
       // Detect macOS for overlay title bar padding (TitleBarStyle::Overlay in Rust
@@ -1049,6 +1050,13 @@
         </button>
         <button
           class="settings-nav-item"
+          data-settings-tab="mcp"
+          data-i18n="settings.mcp.title"
+        >
+          MCP
+        </button>
+        <button
+          class="settings-nav-item"
           data-settings-tab="subagents"
           data-i18n="settings.subagents.title"
           type="button"
@@ -1057,10 +1065,11 @@
         </button>
         <button
           class="settings-nav-item"
-          data-settings-tab="mcp"
-          data-i18n="settings.mcp.title"
+          data-settings-tab="environment"
+          data-i18n="settings.environment.title"
+          type="button"
         >
-          MCP
+          Environment
         </button>
         <button
           class="settings-nav-item"
@@ -1648,6 +1657,34 @@
                 ></button>
               </div>
             </div>
+          </div>
+        </div>
+
+        <div class="settings-tab" data-settings-panel="environment">
+          <div class="settings-header">
+            <h3 data-i18n="settings.environment.title">Environment</h3>
+          </div>
+          <div class="settings-body">
+            <div class="env-toolbar">
+              <!-- The button's copy is owned by environment-page.js: it flips
+                   between Check / Check again / Checking…, so no data-i18n. -->
+              <button
+                type="button"
+                class="settings-value-btn is-primary"
+                id="environment-check-btn"
+              >
+                Check environment
+              </button>
+              <p class="settings-help" id="environment-status" aria-live="polite">
+                Not checked yet
+              </p>
+            </div>
+            <p
+              class="settings-help env-notice hidden"
+              id="environment-notice"
+              aria-live="polite"
+            ></p>
+            <div class="env-tools" id="environment-tools"></div>
           </div>
         </div>
 
