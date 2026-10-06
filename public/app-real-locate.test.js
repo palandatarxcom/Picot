@@ -1,6 +1,6 @@
 // ABOUTME: End-to-end locate check with a REAL session file — every Info panel
 // ABOUTME: row must locate (direct anchor or ancestor fallback), zero warnings.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
@@ -9,6 +9,14 @@ const enMessages = JSON.parse(readFileSync(join(process.cwd(), "public/locales/e
 const SESSION_FILE =
   process.env.PICOT_LOCATE_SESSION ||
   "/Users/linyong/.pi/agent/sessions/--Users-linyong-tmp-PI-picot-v3--/2026-08-26T11-17-48-874Z_01a03dca-62ca-770d-ad85-ab3ad3cf7bf6.jsonl";
+// A real session file is machine-local user data, not a repo fixture: when it
+// is absent (another machine, a pruned session bucket, a sandboxed HOME) the
+// probe skips instead of failing the suite. Point PICOT_LOCATE_SESSION at any
+// local session .jsonl to run it against your own data.
+const SESSION_AVAILABLE = existsSync(SESSION_FILE);
+if (!SESSION_AVAILABLE) {
+  console.warn(`[app-real-locate] session file not found, skipping: ${SESSION_FILE}`);
+}
 
 const BOOTSTRAP_TARGET = {
   workspaceId: "ws-uuid-1",
@@ -157,68 +165,72 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("every Info panel row locates the transcript on a real session", async () => {
-  // Real file → fixtures replicating the host's two data-plane shapes.
-  const entries = [];
-  for (const line of readFileSync(SESSION_FILE, "utf8").split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const e = JSON.parse(line);
-      if (typeof e.id === "string") entries.push(e);
-    } catch {
-      // skip malformed
+test.skipIf(!SESSION_AVAILABLE)(
+  "every Info panel row locates the transcript on a real session",
+  async () => {
+    // Real file → fixtures replicating the host's two data-plane shapes.
+    const entries = [];
+    for (const line of readFileSync(SESSION_FILE, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const e = JSON.parse(line);
+        if (typeof e.id === "string") entries.push(e);
+      } catch {
+        // skip malformed
+      }
     }
-  }
-  const byId = new Map(entries.map((e) => [e.id, e]));
-  let tip = null;
-  for (const e of entries) if (e.type === "message") tip = e;
-  // read_session_messages shape: tip-chain messages, entryId on user/assistant.
-  const chain = [];
-  {
-    const visited = new Set();
-    let cur = tip;
-    while (cur && !visited.has(cur.id)) {
-      visited.add(cur.id);
-      chain.unshift(cur);
-      cur = cur.parentId ? byId.get(cur.parentId) : null;
+    const byId = new Map(entries.map((e) => [e.id, e]));
+    let tip = null;
+    for (const e of entries) if (e.type === "message") tip = e;
+    // read_session_messages shape: tip-chain messages, entryId on user/assistant.
+    const chain = [];
+    {
+      const visited = new Set();
+      let cur = tip;
+      while (cur && !visited.has(cur.id)) {
+        visited.add(cur.id);
+        chain.unshift(cur);
+        cur = cur.parentId ? byId.get(cur.parentId) : null;
+      }
     }
-  }
-  const diskMessages = chain
-    .filter((e) => e.type === "message" && e.message)
-    .map((e) => ({
-      ...e.message,
-      ...(e.message.role === "user" || e.message.role === "assistant" ? { entryId: e.id } : {}),
-    }));
-  FakeWebSocket.treeData = { entries, leafId: tip.id };
-  FakeWebSocket.diskMessages = diskMessages;
+    const diskMessages = chain
+      .filter((e) => e.type === "message" && e.message)
+      .map((e) => ({
+        ...e.message,
+        ...(e.message.role === "user" || e.message.role === "assistant" ? { entryId: e.id } : {}),
+      }));
+    FakeWebSocket.treeData = { entries, leafId: tip.id };
+    FakeWebSocket.diskMessages = diskMessages;
 
-  await import("./app.js?real-locate");
+    await import("./app.js?real-locate");
 
-  document.getElementById("file-sidebar-info-tab").click();
-  await vi.waitFor(() => {
-    expect(document.querySelectorAll("#info-panel .info-panel-row").length).toBeGreaterThan(0);
-  });
-  await vi.waitFor(() => {
-    expect(document.querySelectorAll("#messages [data-entry-id]").length).toBeGreaterThan(0);
-  });
+    document.getElementById("file-sidebar-info-tab").click();
+    await vi.waitFor(() => {
+      expect(document.querySelectorAll("#info-panel .info-panel-row").length).toBeGreaterThan(0);
+    });
+    await vi.waitFor(() => {
+      expect(document.querySelectorAll("#messages [data-entry-id]").length).toBeGreaterThan(0);
+    });
 
-  const warns = [];
-  vi.spyOn(console, "warn").mockImplementation((...args) => {
-    warns.push(args.join(" "));
-  });
-  const rows = [...document.querySelectorAll("#info-panel .info-panel-row.active")];
-  expect(rows.length).toBeGreaterThan(0);
-  for (const row of rows) {
-    row.click();
-    // jsdom has no scrollIntoView; locating = no "no transcript anchor" warn.
-  }
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  const noAnchor = warns.filter((w) => w.includes("no transcript anchor"));
-  expect(
-    noAnchor,
-    `rows failing to locate:\n${[...rows]
-      .filter((r) => noAnchor.some((w) => w.includes(r.dataset.entryId)))
-      .map((r) => `${r.dataset.entryId}: ${r.textContent.slice(0, 50)}`)
-      .join("\n")}`,
-  ).toEqual([]);
-}, 60000);
+    const warns = [];
+    vi.spyOn(console, "warn").mockImplementation((...args) => {
+      warns.push(args.join(" "));
+    });
+    const rows = [...document.querySelectorAll("#info-panel .info-panel-row.active")];
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      row.click();
+      // jsdom has no scrollIntoView; locating = no "no transcript anchor" warn.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const noAnchor = warns.filter((w) => w.includes("no transcript anchor"));
+    expect(
+      noAnchor,
+      `rows failing to locate:\n${[...rows]
+        .filter((r) => noAnchor.some((w) => w.includes(r.dataset.entryId)))
+        .map((r) => `${r.dataset.entryId}: ${r.textContent.slice(0, 50)}`)
+        .join("\n")}`,
+    ).toEqual([]);
+  },
+  60000,
+);
