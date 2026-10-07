@@ -228,6 +228,33 @@ pi runtime 的存活不依赖 Picot 的 teardown：`pi` 在 stdin EOF 时退出�
 - crash/restart → Pending → Indeterminate（不可重放）
 - 聊天终止（主聊天 + Quick/Side Chat）：宿主确认 owner/workspace/session/instance 与运行中操作 scope（每实例最近受理操作）后，向 Pi 发送原生 `{ "type": "abort" }`。Pi 0.85.1 的 `agent_start`/`turn_start` 与命令响应均不携带 `turnId`（实测 + rpc-commands.md），turn-bound abort 机制（turnId 事件绑定、显式 turnId 校验）已整体移除；若未来 Pi 上报 turnId，按 `pi-upgrade-impact` 流程基于新文档重新设计，不复活旧实现。
 
+## 内嵌 Pi 版本与升级
+
+内嵌二进制（`src-tauri/resources/pi/`）是 Picot 启动的唯一 Pi runtime，不依赖、
+不探测用户安装的 `pi`。版本由 `scripts/pi-version.json` 唯一锁定：版本号 +
+六平台 sha256（取自官方 SHA256SUMS 资产）。`bun run fetch:pi`
+（`scripts/fetch-pi-binary.js`）按 pin 下载 release `pi-<platform>.tar.gz`、
+校验 sha256、flatten 后落到 gitignored 的 `src-tauri/resources/pi/`（本地构建
+产物，永不提交）。
+
+升级流程（评估与动作分离）：
+
+1. 上游新版本先由 `.agents/skills/pi-upgrade-impact` 出影响报告，不动 pin；
+2. Dr. Lin 确认后按 `.agents/skills/upgrade-embedded-pi` 执行：改 pin →
+   `bun run fetch:pi` → `bun run smoke:pi-rpc` 对照
+   `tests/fixtures/pi-rpc/<version>/` 契约 → `bun run check` / `bun run test` /
+   `bun run check:rust` 与 `bun run dev` 冒烟；
+3. 提交仅 pin + RPC 契约 fixture（+ 经评估的必要小改），永不提交
+   `src-tauri/resources/pi/`。
+
+除 `version` 字段外的任何 RPC 契约漂移必须逐项解释后才可合入。1.0.2 → 1.0.4
+（2026-10-06）实测结论：release tar 命名与内部布局同 1.0.2 逐项一致；上游安装
+方式变化（managed installer、npm 区不再 pin 依赖）只影响用户侧 `~/.pi/agent`
+布局，不影响 Picot fetch/布局/运行三层；1.0.3 Azure provider 改名
+`azure-openai-responses` → `azure`，`extensions/picot-config.ts` 保留旧串映射
+兼容、`public/settings/models-page.js` 图标 alias 新旧并存。完整分析见
+`docs/superpowers/specs/process-evidence/2026-10-06-pi-1.0.4-impact.md`。
+
 ## 模块清单
 
 | 模块 | 职责 |

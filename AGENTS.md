@@ -131,7 +131,7 @@ The WebView is vanilla JavaScript with no framework.
 
 The embedded binary is the only Pi runtime Picot launches; do not rely on a
 user-installed `pi` from `$PATH`. To upgrade it, follow the verified procedure
-in [`ARCHITECTURE.md`](ARCHITECTURE.md#如何读这个仓库): change
-`scripts/pi-version.json`, run `bun run fetch:pi`, smoke-test the embedded
-binary and `bun run dev`, then commit only the version pin—not
-`src-tauri/resources/pi/`.
+in [`ARCHITECTURE.md`](ARCHITECTURE.md#内嵌-pi-版本与升级) and
+`.agents/skills/upgrade-embedded-pi/SKILL.md`: assess impact first
+(`.agents/skills/pi-upgrade-impact`), bump the pin, run `bun run fetch:pi`,
+smoke-test, then commit only the version pin—not `src-tauri/resources/pi/`.
