@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Picot installer — macOS & Linux
-# Usage:  curl -fsSL https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.sh | bash
-# Or:     curl -fsSL https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.sh | bash -s -- --version v0.3.0
+# Usage:  curl -fsSL https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.sh | bash
+# Or:     curl -fsSL https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.sh | bash -s -- --version v0.3.0
 set -euo pipefail
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-REPO="shixin-guo/picot"
+REPO="palandatarxcom/Picot"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
 APP_NAME="Picot"

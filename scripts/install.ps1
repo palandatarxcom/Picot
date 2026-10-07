@@ -1,8 +1,8 @@
 # Picot installer — Windows (PowerShell 5.1+)
 # Usage:
-#   irm https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.ps1 | iex
 # Or with a pinned version:
-#   & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.ps1'))) -Version v0.3.0
+#   & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.ps1'))) -Version v0.3.0
 # Or with MSI (for enterprise/GPO deployment):
 #   & ([scriptblock]::Create((irm '...'))) -MSI
 [CmdletBinding()]
@@ -42,7 +42,7 @@ $ArchNorm = switch ($CpuArch) {
 }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-$Repo       = "shixin-guo/picot"
+$Repo       = "palandatarxcom/Picot"
 $ApiBase    = "https://api.github.com/repos/$Repo/releases"
 $DlBase     = "https://github.com/$Repo/releases/download"
 $AppName    = "Picot"

@@ -5,7 +5,7 @@
 本地桌面 GUI，专为 [Pi](https://github.com/badlogic/pi-mono) 编程 Agent 打造。无需云端，无需账号，完全在本机运行。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Latest release](https://img.shields.io/github/v/release/shixin-guo/picot?include_prereleases&label=release)](https://github.com/shixin-guo/picot/releases)
+[![Latest release](https://img.shields.io/github/v/release/palandatarxcom/Picot?include_prereleases&label=release)](https://github.com/palandatarxcom/Picot/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#%E5%AE%89%E8%A3%85)
 
 Picot 将 `pi` 运行时**直接打包进 .app**，无需单独安装 `pi`，无需配置 PATH，也不存在版本不一致的问题。打开任意项目文件夹，与 Agent 对话，浏览会话和文件——无需打开终端。多个项目可以并行运行，每个项目有独立窗口和独立 Agent 进程。
@@ -32,16 +32,16 @@ Picot 将 `pi` 运行时**直接打包进 .app**，无需单独安装 `pi`，无
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.ps1 | iex
 ```
 
-或 [从 GitHub Releases 下载](https://github.com/shixin-guo/picot/releases)。
+或 [从 GitHub Releases 下载](https://github.com/palandatarxcom/Picot/releases)。
 
 **无需单独安装 `pi` CLI** — Picot 内置了自己的 pi 运行时。
 
@@ -285,8 +285,8 @@ Picot 不重新实现 Agent 逻辑——它内嵌 Pi 并通过原生 UI 暴露�
 ### 从源码构建
 
 ```bash
-git clone https://github.com/shixin-guo/picot.git
-cd picot
+git clone https://github.com/palandatarxcom/Picot.git
+cd Picot
 bun install --frozen-lockfile
 bun run dev      # 下载内嵌 pi 二进制 + 启动 tauri dev 热重载
 ```

@@ -5,7 +5,7 @@
 A local desktop GUI for the [Pi](https://github.com/badlogic/pi-mono) coding agent. No cloud, no account — runs entirely on your machine.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Latest release](https://img.shields.io/github/v/release/shixin-guo/picot?include_prereleases&label=release)](https://github.com/shixin-guo/picot/releases)
+[![Latest release](https://img.shields.io/github/v/release/palandatarxcom/Picot?include_prereleases&label=release)](https://github.com/palandatarxcom/Picot/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#install)
 
 Picot ships a known-good build of the `pi` runtime **inside the .app bundle**, so there's no separate `pi` install to manage, no PATH shenanigans, and no version drift between Picot and the agent it talks to. Open any project folder, start chatting with the agent, browse sessions and files — no terminal required. Multiple projects run in parallel, each in its own window with its own isolated agent process.
@@ -36,13 +36,13 @@ Picot has completed its native runtime migration. Each workspace spawns a headle
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.ps1 | iex
 ```
 
 The Linux installer picks a `.deb` or `.rpm` for your package manager. On distros with
@@ -50,10 +50,10 @@ neither — or to install per-user without `sudo` — add `--appimage` to get th
 `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shixin-guo/picot/main/scripts/install.sh | bash -s -- --appimage
+curl -fsSL https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.sh | bash -s -- --appimage
 ```
 
-Or [download from GitHub Releases](https://github.com/shixin-guo/picot/releases).
+Or [download from GitHub Releases](https://github.com/palandatarxcom/Picot/releases).
 
 You **do not** need to install the `pi` CLI separately — Picot bundles its own pi runtime.
 
@@ -342,8 +342,8 @@ Picot does not re-implement agent logic — it embeds Pi and exposes its runtime
 ### Build from source
 
 ```bash
-git clone https://github.com/shixin-guo/picot.git
-cd picot
+git clone https://github.com/palandatarxcom/Picot.git
+cd Picot
 bun install --frozen-lockfile
 bun run dev      # fetch embedded pi binary + start tauri dev with hot reload
 ```

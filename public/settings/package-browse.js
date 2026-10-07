@@ -10,7 +10,7 @@ export function setupPackageBrowse({
   renderPackageInstallFailure,
   setExtensionActionButton,
   onInstalledChanged,
-  catalogUrl = "https://raw.githubusercontent.com/hello-kukoo/picot/private/features-v3/community-extensions.json",
+  catalogUrl = "https://raw.githubusercontent.com/palandatarxcom/Picot/main/community-extensions.json",
 }) {
   // Catalog is a committed snapshot refreshed manually via
   // scripts/build_extension_catalog.py; see that script before changing the

@@ -19,7 +19,7 @@ Usage:
     python3 scripts/build_extension_catalog.py
 
 Run manually when refreshing the catalog, review the generated JSON
-diff, then commit and push it to the ``private/features-v3`` branch.
+diff, then commit and push it to the ``main`` branch.
 No secrets or third-party dependencies are required.
 """
 
