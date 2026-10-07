@@ -411,6 +411,9 @@ impl EphemeralRegistry {
 
     /// Mark the exact record for a naturally exited child as closing and return
     /// its cleanup lease. A stale port or pid cannot affect a newer record.
+    /// Records without a process (pid 0: unspawned replacement candidates)
+    /// are never matchable — zero identity means "no child attached", so a
+    /// crash report carrying `pid().unwrap_or_default()` cannot close them.
     pub fn process_exit_cleanup(
         &self,
         port: u16,
@@ -420,7 +423,8 @@ impl EphemeralRegistry {
         let mut state = self.inner.lock().expect("ephemeral registry lock poisoned");
         for (owner, partition) in state.iter_mut() {
             for record in partition.all_records_mut() {
-                if record.port == port
+                if record.pid != 0
+                    && record.port == port
                     && record.pid == pid
                     && record.child_identity == child_identity
                 {
@@ -988,6 +992,33 @@ mod tests {
         commit_with_identity(&reg, &replacement, 5800, 5801);
         assert_eq!(reg.process_exit_cleanup(5800, 15_800, 5800), None);
         assert_eq!(reg.descriptors(&owner).len(), 1);
+    }
+
+    #[test]
+    fn process_exit_cleanup_ignores_zero_identity_candidate() {
+        let reg = EphemeralRegistry::default();
+        let owner = owner("w-zero-candidate");
+        let original = reg
+            .reserve_create(&owner, EphemeralKind::QuickChat)
+            .unwrap();
+        commit(&reg, &original, 5800);
+
+        let replacement = reg.reserve_quick_replacement(&owner).unwrap();
+        // The in-flight candidate carries no process identity yet (port/pid/
+        // child_identity all zero): a crash-cleanup call with a zero triple —
+        // e.g. a runtime that failed before spawn yielded a pid — must not
+        // match it. Zero identity means "no process attached", never a
+        // matchable child.
+        assert_eq!(
+            reg.process_exit_cleanup(0, 0, 0),
+            None,
+            "zero-identity triple must not match the replacement candidate"
+        );
+
+        let descriptors = reg.descriptors(&owner);
+        assert_eq!(descriptors.len(), 2, "candidate and original both survive");
+        assert_eq!(descriptors[0].state, EphemeralState::Replacing);
+        assert_eq!(descriptors[1].state, EphemeralState::Creating);
     }
 
     #[test]
