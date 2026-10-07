@@ -155,8 +155,11 @@ fn settings(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Value {
     }
 }
 
-// Pi 0.73.1 uses a permissive frontmatter parser, not full YAML. Reject ambiguous
-// values instead of manufacturing a valid winner from a malformed definition.
+// Pi >=0.76.0 (upstream #2681) serializes a multi-line description as a YAML block
+// scalar (`description: |-` plus indented lines), so the marker is not the value and
+// indented continuation lines are folded into the description. The parser is still
+// permissive rather than full YAML: reject other ambiguous values instead of
+// manufacturing a valid winner from a malformed definition.
 fn frontmatter(raw: &str) -> Result<(String, String, String, Vec<String>, String), &'static str> {
     let mut lines = raw.lines();
     if lines.next() != Some("---") {
@@ -165,6 +168,7 @@ fn frontmatter(raw: &str) -> Result<(String, String, String, Vec<String>, String
     let mut fields = BTreeMap::new();
     let mut closed = false;
     let mut last = String::new();
+    let mut block_description = false;
     for line in lines {
         if line == "---" {
             closed = true;
@@ -186,13 +190,19 @@ fn frontmatter(raw: &str) -> Result<(String, String, String, Vec<String>, String
                     return Err("unsupported frontmatter");
                 }
                 last = key.to_string();
+                block_description = key == "description"
+                    && matches!(value.trim(), "|" | "|-" | "|+" | ">" | ">-" | ">+");
                 fields.insert(
                     last.clone(),
-                    value
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string(),
+                    if block_description {
+                        String::new()
+                    } else {
+                        value
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string()
+                    },
                 );
                 continue;
             }
@@ -220,6 +230,23 @@ fn frontmatter(raw: &str) -> Result<(String, String, String, Vec<String>, String
             if key == "type" {
                 fields.insert("runner".to_string(), value.trim().to_string());
             }
+        } else if block_description
+            && line.starts_with(char::is_whitespace)
+            && !line.trim().is_empty()
+        {
+            // ponytail: folds block scalar lines with a single space and drops blank
+            // lines; upstream foldBlock preserves those newline breaks, which the
+            // single-line inventory display does not need. Upgrade if a caller wants
+            // the exact multi-line description back.
+            let text = line.trim();
+            fields
+                .entry("description".to_string())
+                .and_modify(|value: &mut String| {
+                    if !value.is_empty() {
+                        value.push(' ');
+                    }
+                    value.push_str(text);
+                });
         } else if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
             return Err("unsupported frontmatter");
         }
@@ -1975,5 +2002,90 @@ mod tests {
             .unwrap()
             .contains("OUT_OF_SCOPE_SENTINEL"));
         assert!(result.diagnostics.iter().any(|d| d.source == ".agents/"));
+    }
+    #[test]
+    fn subagents_inventory_block_scalar_description_folds_continuation_lines() {
+        let (_, _, description, _, _) =
+            frontmatter("---\nname: x\ndescription: |-\n  first line\n  second line\n---\nbody")
+                .unwrap();
+        assert_eq!(description, "first line second line");
+        let (_, _, description, _, _) =
+            frontmatter("---\nname: x\ndescription: |\n  first line\n\n  second line\n---\nbody")
+                .unwrap();
+        assert_eq!(description, "first line second line");
+        for marker in ["|", "|-", "|+", ">", ">-", ">+"] {
+            let raw = format!("---\nname: x\ndescription: {marker}\n  one\n  two\n---\nbody");
+            let (_, _, description, _, _) = frontmatter(&raw).unwrap();
+            assert_eq!(description, "one two", "marker {marker}");
+        }
+    }
+    #[test]
+    fn subagents_inventory_block_scalar_keeps_neighbouring_fields() {
+        let (runtime, name, description, aliases, runner) = frontmatter(
+            "---\nname: x\ndescription: >-\n  first\n  second\naliases: a, b\nrunner:\n  type: cli\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!((runtime.as_str(), name.as_str()), ("x", "x"));
+        assert_eq!(description, "first second");
+        assert_eq!(aliases, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(runner, "cli");
+        // Shape emitted by pi-subagents >=0.76.0 serializeAgent: the block scalar is
+        // followed by advertise/tools/model keys and an indented runner block.
+        let (runtime, name, description, aliases, runner) = frontmatter(
+            "---\nname: reviewer\npackage: core\ndescription: |-\n  Review diffs for\n  correctness and scope.\nadvertise: true\naliases: rvw, review\ntools: read, grep\nmodel: sonnet\nrunner:\n  type: cli\n  command: claude\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(
+            (runtime.as_str(), name.as_str()),
+            ("core.reviewer", "reviewer")
+        );
+        assert_eq!(description, "Review diffs for correctness and scope.");
+        assert_eq!(aliases, vec!["rvw".to_string(), "review".to_string()]);
+        assert_eq!(runner, "cli");
+    }
+    #[test]
+    fn subagents_inventory_block_scalar_hash_lines_are_content() {
+        assert_eq!(
+            frontmatter("---\nname: x\ndescription: |-\n---\nbody"),
+            Err("missing name or description")
+        );
+        assert_eq!(
+            frontmatter("---\nname: x\ndescription: |\n\n  # only a heading\n---\nbody")
+                .unwrap()
+                .2,
+            "# only a heading"
+        );
+    }
+    #[test]
+    fn subagents_inventory_non_block_scalar_values_keep_strictness() {
+        assert_eq!(
+            frontmatter("---\nname: x\ndescription: d\n  stray\n---\nbody"),
+            Err("unsupported frontmatter")
+        );
+        let (_, _, description, _, _) =
+            frontmatter("---\nname: x\ndescription: \"|\"\n---\nbody").unwrap();
+        assert_eq!(description, "|");
+    }
+    #[test]
+    fn subagents_inventory_block_scalar_description_lists_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agent");
+        fs::create_dir_all(agent.join("agents")).unwrap();
+        fs::write(
+            agent.join("agents/multi.md"),
+            "---\nname: multi\ndescription: |-\n  first line\n  second line\n---\nbody",
+        )
+        .unwrap();
+        let snapshot = inventory(&agent, None, ParityEvidence::default()).unwrap();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.runtime_name == "multi")
+            .expect("block scalar definition is listed");
+        assert_eq!(entry.parsed_fields["description"], "first line second line");
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .all(|d| d.message != "unsupported frontmatter"));
     }
 }
