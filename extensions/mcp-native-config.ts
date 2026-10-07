@@ -88,6 +88,7 @@ function namespaceKey(name: string): string {
 
 function isLoopbackRedirectUri(value: string): boolean {
   if (!URL.canParse(value)) return false;
+  // pi-lens-ignore: unchecked-throwing-call — the canParse guard above ensures construction cannot throw.
   const url = new URL(value);
   return (
     url.protocol === "http:" &&
@@ -118,6 +119,7 @@ function validateOAuth(value: unknown): string | undefined {
     if (typeof value.callbackUrl !== "string" || !isLoopbackRedirectUri(value.callbackUrl)) {
       return "oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment";
     }
+    // pi-lens-ignore: unchecked-throwing-call — isLoopbackRedirectUri() on the previous line already validated parseability.
     const urlPort = new URL(value.callbackUrl).port;
     if (urlPort && port !== undefined && Number(urlPort) !== port) {
       return "oauth.callbackUrl and oauth.callbackPort name different ports";
@@ -137,6 +139,7 @@ function validateOAuth(value: unknown): string | undefined {
     if (value.clientId !== undefined || value.clientName !== undefined) {
       return 'oauth.clientRegistration "cimd" cannot be combined with oauth.clientId or oauth.clientName';
     }
+    // pi-lens-ignore: unchecked-throwing-call — callbackUrl passed isLoopbackRedirectUri() validation earlier in this function.
     const callback = typeof value.callbackUrl === "string" ? new URL(value.callbackUrl) : undefined;
     if (callback && (callback.hostname === "[::1]" || callback.pathname !== "/callback")) {
       return 'oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback';
@@ -146,6 +149,7 @@ function validateOAuth(value: unknown): string | undefined {
   if (metadataUrl !== undefined) {
     const url =
       typeof metadataUrl === "string" && URL.canParse(metadataUrl)
+        // pi-lens-ignore: unchecked-throwing-call — canParse is part of the ternary guard itself.
         ? new URL(metadataUrl)
         : undefined;
     if (
@@ -221,6 +225,7 @@ export function validateNativeMcpEntry(
     typeof value.url === "string" &&
     (type === undefined || type === "http" || type === "streamable-http")
   ) {
+    // pi-lens-ignore: unchecked-throwing-call — || short-circuits: new URL only runs when canParse passed.
     if (!URL.canParse(value.url) || !/^https?:$/.test(new URL(value.url).protocol)) {
       return `server "${name}": url must be an http or https URL`;
     }
@@ -237,6 +242,7 @@ export function validateNativeMcpEntry(
       ) {
         return `server "${name}": auth.provider must be a provider name`;
       }
+      // pi-lens-ignore: unchecked-throwing-call — value.url cleared the canParse+protocol check at the top of this branch.
       const url = new URL(value.url);
       if (url.protocol !== "https:" && !LOOPBACK_HOSTS.includes(url.hostname)) {
         return `server "${name}": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]`;

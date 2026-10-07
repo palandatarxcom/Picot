@@ -844,7 +844,7 @@ function projectEntry(
     // compatibility gap instead of pretending native Pi reads these entries.
     const error = strictError ?? "project MCP config is unreadable";
     const kind = isRecord(raw) && !isMcpOverride(raw) ? "definition" : "invalid";
-    return { ...base, kind, validationError: error };
+    return { ...base, kind, enabled: true, validationError: error };
   }
   const classified = classifyProjectEntry(name, raw, globals, filePath);
   return {

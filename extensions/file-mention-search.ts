@@ -210,6 +210,8 @@ export async function searchFileMentions(options: SearchOptions): Promise<FileMe
     options.readDir ??
     (async (dir: string) => {
       const { readdir } = await import("node:fs/promises");
+      // SAFETY: readdir(withFileTypes) returns node's Dirent structs; ReadableDirent
+      // is this extension's narrower structural view of that same data.
       return (await readdir(dir, { withFileTypes: true })) as unknown as ReadableDirent[];
     });
 
