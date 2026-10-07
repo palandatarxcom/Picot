@@ -13,6 +13,7 @@ export function quotaLocaleBundle() {
     fiveHour: t("cost.quota.fiveHour"),
     weekly: t("cost.quota.weekly"),
     monthly: t("cost.quota.monthly"),
+    remaining: t("cost.quota.remaining"),
     needsLogin: t("cost.quota.needsLogin"),
     unavailable: t("cost.quota.unavailable"),
     justNow: t("cost.quota.justNow"),

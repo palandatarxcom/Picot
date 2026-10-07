@@ -1557,7 +1557,7 @@
       "refresh": "Refresh",
       "refreshing": "Refreshing…",
       "resetsAt": "resets {when}",
-      "used": "{n}% used",
+      "remaining": "{n}% left",
       "fiveHour": "5-hour limit",
       "weekly": "Weekly limit",
       "monthly": "30-day limit",

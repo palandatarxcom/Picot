@@ -1557,7 +1557,7 @@
       "refresh": "刷新",
       "refreshing": "刷新中…",
       "resetsAt": "{when} 重置",
-      "used": "已用 {n}%",
+      "remaining": "剩余 {n}%",
       "fiveHour": "5 小时限额",
       "weekly": "每周限额",
       "monthly": "30 天限额",

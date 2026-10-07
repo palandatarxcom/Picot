@@ -1557,7 +1557,7 @@
       "refresh": "更新",
       "refreshing": "更新中…",
       "resetsAt": "{when} リセット",
-      "used": "{n}% 使用",
+      "remaining": "残り {n}%",
       "fiveHour": "5 時間上限",
       "weekly": "週次上限",
       "monthly": "30 日上限",

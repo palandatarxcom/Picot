@@ -10,6 +10,7 @@ const locale = {
   fiveHour: "5-hour limit",
   weekly: "Weekly limit",
   monthly: "30-day limit",
+  remaining: "剩余 {n}%",
   needsLogin: "Re-login required",
   unavailable: "Temporarily unavailable",
   justNow: "just now",
@@ -567,12 +568,12 @@ test("bar tone bands switch at 75% and 90%", async () => {
     w90: "is-warning",
     w91: "is-critical",
   });
-  // The badge rides the bar's tone family and shows the bare percent.
+  // The badge rides the bar's tone family and shows the remaining percent.
   expect(badgeByLabel).toEqual({
-    w74: "74%/is-ok",
-    w75: "75%/is-warning",
-    w90: "90%/is-warning",
-    w91: "91%/is-critical",
+    w74: "剩余 26%/is-ok",
+    w75: "剩余 25%/is-warning",
+    w90: "剩余 10%/is-warning",
+    w91: "剩余 9%/is-critical",
   });
 });
 

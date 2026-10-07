@@ -117,26 +117,29 @@ function formatResetStamp(resetAt, locale) {
   return locale.resetsAt.replace("{when}", when);
 }
 
-/** Usage tone thresholds: below 75% is healthy, 75–90% is warning, above
- * 90% is critical (spec update 2026-09-27; opencodex's old 80/95 bands). */
 /** A custom window whose label is a currency amount is a balance, not a
  * percentage window (deepseek / moonshot shape). */
 function isBalanceLabel(label) {
   return /[$¥€]|CNY|USD|EUR|RMB/i.test(String(label ?? ""));
 }
 
-function toneFor(percent) {
-  if (percent > 90) return "is-critical";
-  if (percent >= 75) return "is-warning";
+/** Mirror of the 2026-09-27 usage bands (≥75% used warning, >90% critical):
+ * ≤25% left is warning, under 10% is critical. */
+function toneForRemaining(remaining) {
+  if (remaining < 10) return "is-critical";
+  if (remaining <= 25) return "is-warning";
   return "is-ok";
 }
 
 /** Percent rows are two lines (2026-09-27): line 1 = label + tone-tinted
- * percent badge (left) and the reset stamp (right); line 2 = full-width bar —
- * full width makes every bar start at the card's left edge by construction. */
+ * remaining badge (left) and the reset stamp (right); line 2 = full-width bar
+ * that empties as the quota is consumed — full width makes every bar start at
+ * the card's left edge by construction. Probes report used percent; the badge
+ * and bar display its complement, 剩余 {n}%. */
 function windowRow({ label, percent, resetAt }, locale) {
-  const clamped = Math.max(0, Math.min(100, Math.round(percent)));
-  const tone = toneFor(clamped);
+  const used = Math.max(0, Math.min(100, Math.round(percent)));
+  const remaining = 100 - used;
+  const tone = toneForRemaining(remaining);
   const row = document.createElement("div");
   row.className = "quota-row";
   const top = document.createElement("div");
@@ -146,7 +149,7 @@ function windowRow({ label, percent, resetAt }, locale) {
   name.textContent = label;
   const badge = document.createElement("span");
   badge.className = `quota-pct-badge ${tone}`;
-  badge.textContent = `${clamped}%`;
+  badge.textContent = locale.remaining.replace("{n}", String(remaining));
   const stamp = document.createElement("span");
   stamp.className = "quota-row-reset";
   stamp.textContent = formatResetStamp(resetAt, locale);
@@ -156,7 +159,7 @@ function windowRow({ label, percent, resetAt }, locale) {
   bar.setAttribute("role", "presentation");
   const fill = document.createElement("div");
   fill.className = `quota-bar-fill ${tone}`;
-  fill.style.width = `${clamped}%`;
+  fill.style.width = `${remaining}%`;
   bar.append(fill);
   row.append(top, bar);
   return row;
