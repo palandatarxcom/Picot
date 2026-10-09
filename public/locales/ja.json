@@ -796,7 +796,7 @@
       "saved": "保存しました。",
       "saveFailed": "保存に失敗しました: {message}",
       "notConfigured": "API キーはまだ設定されていません。",
-      "configuredAt": "{path} に設定済み（{mask}）"
+      "configuredAt": "設定済み（{mask}）"
     },
     "extensionTavily": {
       "title": "Tavily Search",
@@ -808,7 +808,7 @@
       "saved": "保存しました。",
       "saveFailed": "保存に失敗しました: {message}",
       "notConfigured": "API キーはまだ設定されていません。",
-      "configuredAt": "{path} に設定済み（{mask}）"
+      "configuredAt": "設定済み（{mask}）"
     },
     "mcp": {
       "title": "MCP",

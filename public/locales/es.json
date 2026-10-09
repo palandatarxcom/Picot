@@ -796,7 +796,7 @@
       "saved": "Guardado.",
       "saveFailed": "Error al guardar: {message}",
       "notConfigured": "Aún no hay clave de API configurada.",
-      "configuredAt": "Configurada en {path} ({mask})"
+      "configuredAt": "Configurada ({mask})"
     },
     "extensionTavily": {
       "title": "Tavily Search",
@@ -808,7 +808,7 @@
       "saved": "Guardado.",
       "saveFailed": "Error al guardar: {message}",
       "notConfigured": "Aún no hay clave de API configurada.",
-      "configuredAt": "Configurada en {path} ({mask})"
+      "configuredAt": "Configurada ({mask})"
     },
     "mcp": {
       "title": "MCP",

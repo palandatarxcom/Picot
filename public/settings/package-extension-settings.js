@@ -1440,7 +1440,6 @@ async function buildSearchEnvSettingsSection(
     if (current?.globalKeyMasked) {
       rows.push(
         t(`settings.${localePrefix}.configuredAt`, {
-          path: current.globalPath ?? "",
           mask: current.globalKeyMasked,
         }),
       );

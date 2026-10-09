@@ -796,7 +796,7 @@
       "saved": "Saved.",
       "saveFailed": "Save failed: {message}",
       "notConfigured": "No API key configured yet.",
-      "configuredAt": "Configured in {path} ({mask})"
+      "configuredAt": "Configured ({mask})"
     },
     "extensionTavily": {
       "title": "Tavily Search",
@@ -808,7 +808,7 @@
       "saved": "Saved.",
       "saveFailed": "Save failed: {message}",
       "notConfigured": "No API key configured yet.",
-      "configuredAt": "Configured in {path} ({mask})"
+      "configuredAt": "Configured ({mask})"
     },
     "mcp": {
       "title": "MCP",

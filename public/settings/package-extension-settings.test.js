@@ -32,7 +32,7 @@ setMessages({
       saved: "Saved.",
       saveFailed: "Save failed: {message}",
       notConfigured: "No API key configured yet.",
-      configuredAt: "Configured in {path} ({mask})",
+      configuredAt: "Configured ({mask})",
     },
     extensionTavily: {
       title: "Tavily Search",
@@ -44,7 +44,7 @@ setMessages({
       saved: "Saved.",
       saveFailed: "Save failed: {message}",
       notConfigured: "No API key configured yet.",
-      configuredAt: "Configured in {path} ({mask})",
+      configuredAt: "Configured ({mask})",
     },
     extensionFff: {
       title: "pi-fff",
@@ -1888,13 +1888,15 @@ describe("datarx-essential search renderers (brave + tavily)", () => {
     await vi.waitFor(() => expect(sections(detailEl).length).toBe(2));
   });
 
-  it("renders no scope select and shows the global path with the masked key", async () => {
+  it("renders no scope select and shows the masked key without the path", async () => {
     const transport = searchTransport();
     const detailEl = await renderDatarx("/x/datarx-essential", transport);
     const section = braveSection(detailEl);
     // No scope control survives the global-only simplification.
     expect(section.querySelector("select")).toBeNull();
-    expect(section.textContent).toContain("/home/u/.pi/agent/.env");
+    // The hint covers where the key lives; the status line must not repeat it.
+    expect(section.textContent).not.toContain("/home/u/.pi/agent/.env");
+    expect(section.textContent).toContain("Configured");
     expect(section.textContent).toContain("••••9999");
     // The key input never carries a stored value.
     expect(section.querySelector('input[type="password"]').value).toBe("");

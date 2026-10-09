@@ -796,7 +796,7 @@
       "saved": "已保存。",
       "saveFailed": "保存失败：{message}",
       "notConfigured": "尚未配置 API Key。",
-      "configuredAt": "已在 {path} 配置（{mask}）"
+      "configuredAt": "已配置（{mask}）"
     },
     "extensionTavily": {
       "title": "Tavily Search",
@@ -808,7 +808,7 @@
       "saved": "已保存。",
       "saveFailed": "保存失败：{message}",
       "notConfigured": "尚未配置 API Key。",
-      "configuredAt": "已在 {path} 配置（{mask}）"
+      "configuredAt": "已配置（{mask}）"
     },
     "mcp": {
       "title": "MCP",
