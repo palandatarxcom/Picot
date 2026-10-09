@@ -308,6 +308,11 @@ wsClient.addEventListener("hostCapabilities", () => {
   // authenticated hello first.
   document.getElementById("quick-chat-btn")?.classList.remove("hidden");
   void sidebar.refresh();
+  // The module-top updater init ran before hello_ack and hid the whole
+  // Updates section (hasUpdater gates on capabilities.native); re-run it now
+  // that capabilities are real — same fix class as loadLandingPiVersion,
+  // and the same shape app.js already uses for its own updater init.
+  void updater.initUpdaterUI();
 });
 // App-global registry changed in another window — stay in sync. The
 // initiating window is already navigating when it launched the change.

@@ -240,6 +240,24 @@ function installDom() {
       <div id="settings-subagents"></div>
       <div id="settings-install-skills"></div>
       <div id="settings-package-skills"></div>
+      <div class="settings-section" id="setting-updater-section">
+        <div class="settings-row" id="setting-pi-version">
+          <span id="setting-pi-version-value">Loading...</span>
+        </div>
+        <div class="settings-row">
+          <span id="setting-app-version-value">Loading...</span>
+        </div>
+        <div class="settings-row">
+          <button id="btn-check-updates">Check now</button>
+        </div>
+        <div class="settings-row" id="setting-update-status-row" hidden>
+          <span id="setting-update-status"></span>
+        </div>
+        <div class="settings-row" id="setting-update-install-row" hidden>
+          <button id="btn-install-update"></button>
+        </div>
+      </div>
+      <button id="sidebar-update-btn" class="hidden"></button>
       <button data-extensions-tab="installed">Installed</button>
       <button data-extensions-tab="community">Community</button>
       <div id="extensions-installed">
@@ -572,6 +590,40 @@ test("Pi version row recovers when settings opens before hello_ack", async () =>
     expect(value.textContent).toBe("0.87.1");
   });
   expect(value.dataset.loaded).toBe("1");
+});
+
+test("Updates section re-inits when landing boots before hello_ack", async () => {
+  // Cold-start race: landing.js runs updater.initUpdaterUI() at module top,
+  // before the authenticated hello lands. hasUpdater gates on
+  // capabilities.native, so the whole Updates section (Pi version, Picot
+  // version, check button) gets hidden — and must come back once host
+  // capabilities arrive, without reopening settings.
+  installDom();
+  harness.origin = window.location.origin;
+  harness.transport = makeTransportStub();
+  harness.transport.capabilities = { native: false };
+  harness.transport.hasUpdater = false;
+  harness.transport.getAppVersion = async () => "0.5.1";
+  harness.transport.isDev = async () => false;
+  harness.refreshCalls = [];
+  harness.prepares = [];
+  harness.generations = [];
+  harness.commits = [];
+  harness.pickerCalls = [];
+  document.cookie = "picot-language=en; Max-Age=600; path=/";
+  await import("./landing.js");
+
+  const section = document.getElementById("setting-updater-section");
+  expect(section.hidden).toBe(true);
+
+  harness.transport.capabilities = { native: true };
+  harness.transport.hasUpdater = true;
+  harness.wsClient.dispatchEvent(new Event("hostCapabilities"));
+  await vi.waitFor(() => {
+    expect(section.hidden).toBe(false);
+    expect(document.getElementById("setting-app-version-value").textContent).toBe("0.5.1");
+  });
+  expect(document.getElementById("btn-check-updates").disabled).toBe(false);
 });
 
 test("errors render into the landing notice, never a chat renderer", async () => {
