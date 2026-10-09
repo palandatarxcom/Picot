@@ -42,6 +42,7 @@ Dr. Lin's hand edits there always win over agent merges.
 
 Use **Bun** exclusively. Never run `npm install` or `npm ci`; they create a
 stray `package-lock.json` that conflicts with `bun.lock`.
+
 ### Bun lockfile discipline
 
 Tauri CLI 2.11.2+ hard-blocks `tauri build` when any `@tauri-apps/<plugin>`
@@ -53,6 +54,7 @@ mysterious "Found version mismatched Tauri packages" error and a half-built
 `src-tauri/target/`.
 
 Rules:
+
 - **Never** run `bun install` bare. Always `bun install --frozen-lockfile`
   (or `--lockfile-only` if you only want to refresh the lockfile from the
   current `package.json`).
@@ -135,3 +137,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md#内嵌-pi-版本与升级) and
 `.agents/skills/upgrade-embedded-pi/SKILL.md`: assess impact first
 (`.agents/skills/pi-upgrade-impact`), bump the pin, run `bun run fetch:pi`,
 smoke-test, then commit only the version pin—not `src-tauri/resources/pi/`.
+
+## Git worktrees
+
+Follow the `using-git-worktrees` skill, with these repository-specific rules:
+
+- Ask before creating a worktree (global rule). A request for isolated work counts as consent.
+- Run the skill's Step 0 first. If already inside a linked worktree, reuse it; never nest worktrees.
+- Location: `.worktrees/<name>` in the repository root, with the branch named `<name>`. This declaration overrides the skill's `worktrees/` alternative.
+- Verify `git check-ignore -q .worktrees` before creating. If it is not ignored, add it to `.gitignore` and commit first.
+- Create: `git worktree add -b <branch> .worktrees/<name> <base>`.
+- Setup: `bun install --frozen-lockfile`. Never run bare `bun install` or `npm install`.
+- Baseline: run the relevant suite (`bun run test:focused <file>` or `bun run test`) and report failures before editing.
