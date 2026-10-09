@@ -1003,7 +1003,7 @@ mod tests {
             .unwrap();
         commit(&reg, &original, 5800);
 
-        let replacement = reg.reserve_quick_replacement(&owner).unwrap();
+        let _replacement = reg.reserve_quick_replacement(&owner).unwrap();
         // The in-flight candidate carries no process identity yet (port/pid/
         // child_identity all zero): a crash-cleanup call with a zero triple —
         // e.g. a runtime that failed before spawn yielded a pid — must not
