@@ -102,7 +102,6 @@ export class RpivTodoMirrorPanel {
 
   toggleExpanded() {
     this.#expanded = !this.#expanded;
-    this.#element.classList.toggle("is-collapsed", !this.#expanded);
     this.#render();
   }
 

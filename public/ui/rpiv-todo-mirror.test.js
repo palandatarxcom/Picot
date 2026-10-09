@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { setMessages } from "../i18n.js";
 import {
@@ -127,7 +129,7 @@ describe("rpiv todo mirror", () => {
       },
     });
     panel.toggleExpanded();
-    expect(panel.element.classList.contains("is-collapsed")).toBe(false);
+    expect(panel.element.classList.contains("is-collapsed")).toBe(true);
     panel.clear();
     expect(panel.element.classList.contains("is-collapsed")).toBe(true);
     expect(panel.element.classList.contains("hidden")).toBe(true);
@@ -155,7 +157,7 @@ describe("rpiv todo mirror", () => {
     expect(clear.parentElement).toBe(more.parentElement);
     expect(element.classList.contains("is-collapsed")).toBe(true);
     panel.toggleExpanded();
-    expect(element.classList.contains("is-collapsed")).toBe(false);
+    expect(element.classList.contains("is-collapsed")).toBe(true);
     expect(clear.parentElement).toBe(more.parentElement);
   });
 
@@ -175,5 +177,31 @@ describe("rpiv todo mirror", () => {
     expect(panel.element.querySelectorAll(".rpiv-todo-panel__task")).toHaveLength(5);
     panel.toggleExpanded();
     expect(panel.element.querySelectorAll(".rpiv-todo-panel__task")).toHaveLength(6);
+  });
+
+  it("keeps the pill auto-hide rule active after show-more expands the list", () => {
+    const style = document.createElement("style");
+    style.textContent = readFileSync(resolve("public/ui/rpiv-todo-mirror.css"), "utf8");
+    document.head.append(style);
+    document.body.innerHTML = '<div class="input-area"><form></form></div>';
+    const panel = new RpivTodoMirrorPanel({ container: document.querySelector(".input-area") });
+    panel.applyToolResult({
+      details: {
+        tasks: Array.from({ length: 6 }, (_, index) => ({
+          id: index + 1,
+          subject: `Task ${index + 1}`,
+          status: "pending",
+        })),
+        nextId: 7,
+      },
+    });
+
+    // Auto-hide is CSS-only and keyed on .is-collapsed; jsdom cannot simulate
+    // :hover, so the test checks the class contract and the pointer-outside state.
+    panel.toggleExpanded();
+    expect(panel.element.classList.contains("is-collapsed")).toBe(true);
+    expect(panel.element.querySelectorAll(".rpiv-todo-panel__task")).toHaveLength(6);
+    const list = panel.element.querySelector(".rpiv-todo-panel__list");
+    expect(getComputedStyle(list).display).toBe("none");
   });
 });
