@@ -1230,12 +1230,13 @@ export class SessionSidebar {
     return null;
   }
 
-  /** Rename mirrors the delete gate: the open session and any session with a
-   * running turn keep a stable identity until they go idle. */
+  /** Rename is blocked only while the session is the open one or has a
+   * running turn. An idle session with a background runtime stays renameable:
+   * renaming appends one `session_info` name event instead of rewriting the
+   * transcript. (Delete is stricter and still refuses live runtimes.) */
   renameBlockedReason(filePath) {
     if (filePath === this.activeSessionFile) return t("sidebar.renameDisabledActive");
     if (this.streamingFiles.has(filePath)) return t("sidebar.renameDisabledStreaming");
-    if (this.isLiveSession(filePath)) return t("sidebar.renameDisabledRunning");
     return null;
   }
 
@@ -1848,6 +1849,7 @@ export class SessionSidebar {
         this.unread.has(row.session.filePath),
         this.streamingFiles?.has(row.session.filePath) || false,
         row.session.filePath === this.activeSessionFile,
+        this.isLiveSession(row.session.filePath), // delete gate reads the live snapshot
       ]),
       this.searchQuery ? "searching" : "browse",
       project.workspaceId === "" ? String(Math.random()) : "stable", // live rows always rebuild

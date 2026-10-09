@@ -687,8 +687,7 @@
     "removeDisabledCurrent": "現在のワークスペースは削除できません",
     "addFailed": "プロジェクトを追加できませんでした",
     "renameDisabledActive": "現在のセッションの名前は変更できません",
-    "renameDisabledStreaming": "ストリーミング中のセッションの名前は変更できません",
-    "renameDisabledRunning": "実行中のセッションの名前は変更できません"
+    "renameDisabledStreaming": "ストリーミング中のセッションの名前は変更できません"
   },
   "updater": {
     "update": "更新",

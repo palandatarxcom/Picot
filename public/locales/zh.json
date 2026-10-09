@@ -687,8 +687,7 @@
     "removeDisabledCurrent": "无法移除当前工作区",
     "addFailed": "添加项目失败",
     "renameDisabledActive": "无法重命名当前会话",
-    "renameDisabledStreaming": "无法重命名正在流式输出的会话",
-    "renameDisabledRunning": "无法重命名正在运行的会话"
+    "renameDisabledStreaming": "无法重命名正在流式输出的会话"
   },
   "updater": {
     "update": "更新",

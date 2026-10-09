@@ -687,8 +687,7 @@
     "removeDisabledCurrent": "Cannot remove the current workspace",
     "addFailed": "Could not add project",
     "renameDisabledActive": "Cannot rename the current session",
-    "renameDisabledStreaming": "Cannot rename a streaming session",
-    "renameDisabledRunning": "Cannot rename a running session"
+    "renameDisabledStreaming": "Cannot rename a streaming session"
   },
   "updater": {
     "update": "Update",

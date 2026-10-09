@@ -687,8 +687,7 @@
     "removeDisabledCurrent": "No se puede quitar el espacio de trabajo actual",
     "addFailed": "No se pudo añadir el proyecto",
     "renameDisabledActive": "No se puede cambiar el nombre de la sesión actual",
-    "renameDisabledStreaming": "No se puede cambiar el nombre de una sesión en streaming",
-    "renameDisabledRunning": "No se puede cambiar el nombre de una sesión en ejecución"
+    "renameDisabledStreaming": "No se puede cambiar el nombre de una sesión en streaming"
   },
   "updater": {
     "update": "Actualizar",

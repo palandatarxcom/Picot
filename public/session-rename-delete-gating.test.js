@@ -1,4 +1,5 @@
 // ABOUTME: Regression tests for gating rename/delete on active or busy sessions.
+// ABOUTME: Rename is gated by active/streaming only; delete also by live instances.
 // ABOUTME: Covers in-place toggling, entry guards and the live-instance snapshot.
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -44,6 +45,24 @@ function rowFor(sidebar, overrides = {}) {
   );
 }
 
+function renderedRow(sidebar, filePath) {
+  return sidebar.container.querySelector(`.session-item[data-file-path="${filePath}"]`);
+}
+
+/** One expanded workspace with two idle sessions, rendered by the real render(). */
+function sessionsWorkspace() {
+  return {
+    workspaceId: "ws-1",
+    path: "/w",
+    folderName: "w",
+    sessions: [
+      { filePath: "/sessions/a.jsonl", name: "A", mtime: "2026-01-01T00:00:00.000Z" },
+      { filePath: "/sessions/b.jsonl", name: "B", mtime: "2026-01-02T00:00:00.000Z" },
+    ],
+    sessionCount: 2,
+  };
+}
+
 function visibleButtons(item) {
   const rename = item.querySelector(".session-rename-btn");
   const del = item.querySelector(".session-delete-btn");
@@ -82,7 +101,9 @@ describe("rename/delete gating on blocked sessions", () => {
     expect(state.deleteDisabled).toBe(false);
   });
 
-  test("streaming and live sessions gate rename too", () => {
+  // 2026-10-09: rename no longer mirrors delete. A live instance only blocks
+  // delete; the rename gate is the strict subset active ∨ streaming.
+  test("streaming gates rename while a live instance only gates delete", () => {
     const sidebar = makeSidebar();
     sidebar.activeSessionFile = "/sessions/other.jsonl";
     sidebar.streamingFiles.add("/sessions/a.jsonl");
@@ -90,7 +111,9 @@ describe("rename/delete gating on blocked sessions", () => {
 
     sidebar.streamingFiles.delete("/sessions/a.jsonl");
     sidebar.getLiveInstances = () => [{ sessionFile: "/sessions/a.jsonl" }];
-    expect(visibleButtons(rowFor(sidebar)).renameHidden).toBe(true);
+    const live = visibleButtons(rowFor(sidebar));
+    expect(live.renameHidden).toBe(false);
+    expect(live.deleteHidden).toBe(true);
   });
 
   test("raw node builder honors explicit blocked reasons (Focus path)", () => {
@@ -121,6 +144,105 @@ describe("rename/delete gating on blocked sessions", () => {
   });
 });
 
+// 2026-10-09 rename-gating tightening: rename is blocked only while the
+// session is the active one or has a running turn. An idle session with a
+// background runtime stays renameable; delete keeps its live gate.
+describe("rename gating: active or streaming only", () => {
+  test("R1: switching away releases the previously active session for rename", () => {
+    const sidebar = makeSidebar();
+    sidebar.projects = [sessionsWorkspace()];
+    sidebar.expandedWorkspaces.add("ws-1");
+    // A is open and still has a background runtime (live, but idle).
+    sidebar.getLiveInstances = () => [{ sessionFile: "/sessions/a.jsonl" }];
+
+    sidebar.setActive("/sessions/a.jsonl");
+    expect(sidebar.renameBlockedReason("/sessions/a.jsonl")).toBe("sidebar.renameDisabledActive");
+    expect(visibleButtons(renderedRow(sidebar, "/sessions/a.jsonl")).renameHidden).toBe(true);
+
+    sidebar.setActive("/sessions/b.jsonl");
+
+    expect(sidebar.renameBlockedReason("/sessions/a.jsonl")).toBeNull();
+    const state = visibleButtons(renderedRow(sidebar, "/sessions/a.jsonl"));
+    expect(state.renameHidden).toBe(false);
+    expect(state.renameDisabled).toBe(false);
+    // The delete gate is untouched: A is still live in the background.
+    expect(state.deleteHidden).toBe(true);
+  });
+
+  test("R2: an idle live session keeps rename available but stays delete-blocked", () => {
+    const sidebar = makeSidebar();
+    sidebar.activeSessionFile = "/sessions/other.jsonl";
+    sidebar.getLiveInstances = () => [{ sessionFile: "/sessions/a.jsonl" }];
+
+    expect(sidebar.renameBlockedReason("/sessions/a.jsonl")).toBeNull();
+    const state = visibleButtons(rowFor(sidebar));
+    expect(state.renameHidden).toBe(false);
+    expect(state.renameDisabled).toBe(false);
+    expect(sidebar.deletionBlockedReason("/sessions/a.jsonl")).toBe(
+      "sidebar.deleteDisabledRunning",
+    );
+    expect(state.deleteHidden).toBe(true);
+    expect(state.deleteDisabled).toBe(true);
+  });
+
+  test("R3: a streaming session still blocks rename", () => {
+    const sidebar = makeSidebar();
+    sidebar.activeSessionFile = "/sessions/other.jsonl";
+    sidebar.streamingFiles.add("/sessions/a.jsonl");
+
+    expect(sidebar.renameBlockedReason("/sessions/a.jsonl")).toBe(
+      "sidebar.renameDisabledStreaming",
+    );
+    const state = visibleButtons(rowFor(sidebar));
+    expect(state.renameHidden).toBe(true);
+    expect(state.renameDisabled).toBe(true);
+  });
+
+  test("R4: the active session still blocks rename, and active wins over streaming", () => {
+    const sidebar = makeSidebar();
+    sidebar.setActive("/sessions/a.jsonl");
+
+    expect(sidebar.renameBlockedReason("/sessions/a.jsonl")).toBe("sidebar.renameDisabledActive");
+    expect(visibleButtons(rowFor(sidebar)).renameHidden).toBe(true);
+
+    sidebar.streamingFiles.add("/sessions/a.jsonl");
+    expect(sidebar.renameBlockedReason("/sessions/a.jsonl")).toBe("sidebar.renameDisabledActive");
+  });
+
+  test("R5: a refresh reporting a live instance leaves the cached row renameable", () => {
+    const sidebar = makeSidebar();
+    sidebar.projects = [sessionsWorkspace()];
+    sidebar.expandedWorkspaces.add("ws-1");
+    sidebar.liveInstancesSnapshot = [{ sessionFile: "/sessions/a.jsonl" }];
+
+    sidebar.render();
+    expect(visibleButtons(renderedRow(sidebar, "/sessions/a.jsonl")).renameHidden).toBe(false);
+    expect(visibleButtons(renderedRow(sidebar, "/sessions/a.jsonl")).deleteHidden).toBe(true);
+
+    // Repeated refreshes reuse the keyed workspace row: its action state must
+    // follow the current gate instead of a stale snapshot decision.
+    sidebar.render();
+    const state = visibleButtons(renderedRow(sidebar, "/sessions/a.jsonl"));
+    expect(state.renameHidden).toBe(false);
+    expect(state.deleteHidden).toBe(true);
+  });
+
+  test("R6: a refresh that drops the live instance re-enables the cached row's delete", () => {
+    const sidebar = makeSidebar();
+    sidebar.projects = [sessionsWorkspace()];
+    sidebar.expandedWorkspaces.add("ws-1");
+    sidebar.liveInstancesSnapshot = [{ sessionFile: "/sessions/a.jsonl" }];
+    sidebar.render();
+    expect(visibleButtons(renderedRow(sidebar, "/sessions/a.jsonl")).deleteHidden).toBe(true);
+
+    // The runtime stopped; the next refresh reports no live instance. The keyed
+    // row must not keep the delete action disabled from the earlier snapshot.
+    sidebar.liveInstancesSnapshot = [];
+    sidebar.render();
+    expect(visibleButtons(renderedRow(sidebar, "/sessions/a.jsonl")).deleteHidden).toBe(false);
+  });
+});
+
 describe("state flips update rendered rows in place", () => {
   test("idle → streaming → idle toggles button visibility without rebuild", () => {
     const sidebar = makeSidebar();
@@ -137,14 +259,16 @@ describe("state flips update rendered rows in place", () => {
     expect(visibleButtons(item).deleteHidden).toBe(false);
   });
 
-  test("live-instance snapshot feeds the running gate", async () => {
+  test("live-instance snapshot feeds the delete gate, not rename", async () => {
     const sidebar = makeSidebar();
     transport.runtimeInstances.mockResolvedValueOnce({
       instances: [{ sessionFile: "/sessions/a.jsonl" }],
     });
     await sidebar.fetchLiveInstances();
     expect(sidebar.isLiveSession("/sessions/a.jsonl")).toBe(true);
-    expect(visibleButtons(rowFor(sidebar)).renameHidden).toBe(true);
+    const state = visibleButtons(rowFor(sidebar));
+    expect(state.renameHidden).toBe(false);
+    expect(state.deleteHidden).toBe(true);
   });
 });
 
