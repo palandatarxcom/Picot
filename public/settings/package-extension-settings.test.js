@@ -22,6 +22,30 @@ setMessages({
       saved: "Saved.",
       saveFailed: "Save failed: {message}",
     },
+    extensionBraveSearch: {
+      title: "Brave Search",
+      hint: "Writes to the chosen .env; new sessions pick the values up.",
+      keyLabel: "Brave Search API key",
+      keyPlaceholder: "paste to set · empty clears",
+      countLabel: "Results per search",
+      countError: "Must be an integer between 1 and 20",
+      saved: "Saved.",
+      saveFailed: "Save failed: {message}",
+      notConfigured: "No API key configured yet.",
+      configuredAt: "Configured in {path} ({mask})",
+    },
+    extensionTavily: {
+      title: "Tavily Search",
+      hint: "Writes to the chosen .env; new sessions pick the values up.",
+      keyLabel: "Tavily API key",
+      keyPlaceholder: "paste to set · empty clears",
+      countLabel: "Results per search",
+      countError: "Must be an integer between 1 and 20",
+      saved: "Saved.",
+      saveFailed: "Save failed: {message}",
+      notConfigured: "No API key configured yet.",
+      configuredAt: "Configured in {path} ({mask})",
+    },
     extensionFff: {
       title: "pi-fff",
       hint: "Changes take effect after restarting Picot",
@@ -1785,5 +1809,332 @@ describe("goal legacy setting", () => {
     expect(detailEl.textContent).toContain("Removed legacy setting");
     expect(detailEl.querySelectorAll('[role="switch"]').length).toBeGreaterThan(0);
     expect(detailEl.querySelector(".pkg-ext-error")).toBeNull();
+  });
+});
+
+describe("datarx-essential search renderers (brave + tavily)", () => {
+  const LOADED = {
+    ok: true,
+    globalPath: "/home/u/.pi/agent/.env",
+    globalKeyMasked: "••••9999",
+    defaultCount: 5,
+  };
+
+  // One transport serves both global-.env twins; every call is tagged with the
+  // extension that owns the op so assertions can tell the two apart.
+  function searchTransport({ get = {}, set = {} } = {}) {
+    const calls = [];
+    const make = (ext, op) => async (arg) => {
+      const config = op === "get" ? get : set;
+      const perExt = config[ext] ?? config;
+      calls.push(op === "get" ? { ext, op } : { ext, op, payload: arg });
+      if (perExt.error) throw new Error(perExt.error);
+      return { ...LOADED, ...(perExt.value ?? {}) };
+    };
+    return {
+      calls,
+      getBraveSearchConfig: make("brave", "get"),
+      setBraveSearchConfig: make("brave", "set"),
+      getTavilySearchConfig: make("tavily", "get"),
+      setTavilySearchConfig: make("tavily", "set"),
+    };
+  }
+
+  const callsOf = (transport, ext, op) =>
+    transport.calls.filter((call) => call.ext === ext && call.op === op);
+
+  async function renderDatarx(source, transport) {
+    const detailEl = document.createElement("div");
+    // Exactly the pre-slice-B 3-argument context: no workspaceCwd.
+    renderExtensionSettings(detailEl, { source }, { transport });
+    await vi.waitFor(() => {
+      if (!detailEl.querySelector(".pkg-ext-settings")) throw new Error("section not mounted");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return detailEl;
+  }
+
+  const sections = (detailEl) => detailEl.querySelectorAll(".pkg-ext-settings");
+  const braveSection = (detailEl) => sections(detailEl)[0];
+  const tavilySection = (detailEl) => sections(detailEl)[1];
+  const status = (el) => el.querySelector(".pkg-ext-status").textContent;
+
+  beforeEach(() => {
+    document.body.replaceChildren();
+  });
+
+  it("routes a local-path install and its .git form to the same renderer", async () => {
+    for (const source of [
+      "/home/u/.pi/agent/extensions/datarx-essential",
+      "\\home\\u\\extensions\\datarx-essential.git",
+    ]) {
+      const detailEl = await renderDatarx(source, searchTransport());
+      // Both global-.env twins render — brave first, each with its own title.
+      expect(
+        [...sections(detailEl)].map((s) => s.querySelector(".pkg-ext-title").textContent),
+      ).toEqual(["Brave Search", "Tavily Search"]);
+      expect(detailEl.textContent).toContain("••••9999");
+    }
+  });
+
+  it("renders from the pre-slice-B 3-argument context with no workspaceCwd", async () => {
+    const detailEl = document.createElement("div");
+    // The package manager is back to the 3-arg call; both sections still mount.
+    renderExtensionSettings(
+      detailEl,
+      { source: "/x/datarx-essential" },
+      { transport: searchTransport() },
+    );
+    await vi.waitFor(() => expect(sections(detailEl).length).toBe(2));
+  });
+
+  it("renders no scope select and shows the global path with the masked key", async () => {
+    const transport = searchTransport();
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const section = braveSection(detailEl);
+    // No scope control survives the global-only simplification.
+    expect(section.querySelector("select")).toBeNull();
+    expect(section.textContent).toContain("/home/u/.pi/agent/.env");
+    expect(section.textContent).toContain("••••9999");
+    // The key input never carries a stored value.
+    expect(section.querySelector('input[type="password"]').value).toBe("");
+    // The load carries no cwd.
+    expect(callsOf(transport, "brave", "get")).toEqual([{ ext: "brave", op: "get" }]);
+  });
+
+  it("reports notConfigured when the global tier holds no key", async () => {
+    const transport = searchTransport({ get: { value: { globalKeyMasked: null } } });
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    expect(status(braveSection(detailEl))).toBe("No API key configured yet.");
+  });
+
+  it("submitting an empty key clears the line; an untouched key sends nothing", async () => {
+    const transport = searchTransport();
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const keyInput = braveSection(detailEl).querySelector('input[type="password"]');
+    // No edit yet: a change event on the pristine (empty) field is not a
+    // clear — the host has no plaintext to hand back, so "untouched" and
+    // "emptied" must stay distinguishable.
+    keyInput.dispatchEvent(new Event("change"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(callsOf(transport, "brave", "set")).toEqual([]);
+    // Typing then clearing (a real browser fires `input` per keystroke).
+    keyInput.dispatchEvent(new Event("input"));
+    keyInput.value = "  ";
+    keyInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      // The clear payload carries ONLY apiKey — never scope/cwd.
+      expect(callsOf(transport, "brave", "set")).toEqual([
+        { ext: "brave", op: "set", payload: { apiKey: "" } },
+      ]);
+    });
+    await vi.waitFor(() => expect(status(braveSection(detailEl))).toContain("Saved."));
+  });
+
+  it("writes a typed key, then clears it on the next edit, without scope/cwd", async () => {
+    const transport = searchTransport();
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const keyInput = braveSection(detailEl).querySelector('input[type="password"]');
+    keyInput.dispatchEvent(new Event("input"));
+    keyInput.value = "BSA-fixture-key"; // gitleaks:allow
+    keyInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(callsOf(transport, "brave", "set")).toEqual([
+        { ext: "brave", op: "set", payload: { apiKey: "BSA-fixture-key" } },
+      ]);
+    });
+    // Clearing is an explicit edit: the browser fires `input`, which is the
+    // only signal that separates "emptied" from "never touched".
+    keyInput.value = "";
+    keyInput.dispatchEvent(new Event("input"));
+    keyInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(callsOf(transport, "brave", "set")[1]).toEqual({
+        ext: "brave",
+        op: "set",
+        payload: { apiKey: "" },
+      });
+    });
+  });
+
+  it("writes the count and sends null when the field is emptied", async () => {
+    const transport = searchTransport({ set: { value: { defaultCount: 9 } } });
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const countInput = braveSection(detailEl).querySelector('input[type="number"]');
+    expect(countInput.value).toBe("5");
+    countInput.value = "9";
+    countInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(callsOf(transport, "brave", "set")).toEqual([
+        { ext: "brave", op: "set", payload: { defaultCount: 9 } },
+      ]);
+    });
+    await vi.waitFor(() => expect(countInput.value).toBe("9"));
+    countInput.value = "";
+    countInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(callsOf(transport, "brave", "set")[1]).toEqual({
+        ext: "brave",
+        op: "set",
+        payload: { defaultCount: null },
+      });
+    });
+  });
+
+  it("blocks an out-of-range count client-side without a request", async () => {
+    const transport = searchTransport();
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const section = braveSection(detailEl);
+    const countInput = section.querySelector('input[type="number"]');
+    for (const bad of ["0", "21", "1.5"]) {
+      countInput.value = bad;
+      countInput.dispatchEvent(new Event("change"));
+      await vi.waitFor(() =>
+        expect(section.querySelector(".pkg-ext-notice").textContent).toBe(
+          "Must be an integer between 1 and 20",
+        ),
+      );
+      expect(callsOf(transport, "brave", "set")).toEqual([]);
+      // The invalid edit leaves the persisted value on screen.
+      expect(countInput.value).toBe("5");
+    }
+  });
+
+  it("reports saveFailed and rolls the field back when the set rejects", async () => {
+    const transport = searchTransport({ set: { error: "boom" } });
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const section = braveSection(detailEl);
+    const keyInput = section.querySelector('input[type="password"]');
+    keyInput.dispatchEvent(new Event("input"));
+    keyInput.value = "BSA-fixture-key"; // gitleaks:allow
+    keyInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => expect(status(section)).toContain("Save failed: boom"));
+    expect(keyInput.value).toBe("");
+  });
+
+  it("surfaces a rejected load instead of mounting dead controls", async () => {
+    const transport = searchTransport({ get: { error: "transport offline" } });
+    const detailEl = document.createElement("div");
+    renderExtensionSettings(detailEl, { source: "/x/datarx-essential" }, { transport });
+    await vi.waitFor(() => expect(status(braveSection(detailEl))).toBe("transport offline"));
+  });
+
+  it("renders the tavily section from its own locale block and ops", async () => {
+    const transport = searchTransport({
+      get: { tavily: { value: { globalKeyMasked: "••••7777" } } },
+    });
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const section = tavilySection(detailEl);
+    expect(section.querySelector(".pkg-ext-title").textContent).toBe("Tavily Search");
+    expect(section.textContent).toContain("Tavily API key");
+    expect(section.textContent).toContain("••••7777");
+    expect(section.querySelector("select")).toBeNull();
+    // The tavily load rides the tavily op, no cwd.
+    expect(callsOf(transport, "tavily", "get")).toEqual([{ ext: "tavily", op: "get" }]);
+  });
+
+  it("writes the tavily key through setTavilySearchConfig, leaving brave alone", async () => {
+    const transport = searchTransport();
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const keyInput = tavilySection(detailEl).querySelector('input[type="password"]');
+    keyInput.dispatchEvent(new Event("input"));
+    keyInput.value = "TVLY-fixture-key"; // gitleaks:allow
+    keyInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(callsOf(transport, "tavily", "set")).toEqual([
+        { ext: "tavily", op: "set", payload: { apiKey: "TVLY-fixture-key" } },
+      ]);
+    });
+    // The tavily edit never touches the brave twin's ops.
+    expect(callsOf(transport, "brave", "set")).toEqual([]);
+  });
+
+  it("writes the tavily count through its own op", async () => {
+    const transport = searchTransport({ set: { tavily: { value: { defaultCount: 11 } } } });
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const countInput = tavilySection(detailEl).querySelector('input[type="number"]');
+    expect(countInput.value).toBe("5");
+    countInput.value = "11";
+    countInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(callsOf(transport, "tavily", "set")).toEqual([
+        { ext: "tavily", op: "set", payload: { defaultCount: 11 } },
+      ]);
+    });
+  });
+
+  it("a rolled-back key clear never turns a later count change into an apiKey delete", async () => {
+    const deferred = () => {
+      let resolve;
+      let reject;
+      const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+    const calls = [];
+    const transport = {
+      getBraveSearchConfig: async () => ({ ...LOADED }),
+      getTavilySearchConfig: async () => ({ ...LOADED }),
+      setBraveSearchConfig: (payload) => {
+        const pending = deferred();
+        calls.push({ payload, ...pending });
+        return pending.promise;
+      },
+      setTavilySearchConfig: async () => ({ ...LOADED }),
+    };
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const section = braveSection(detailEl);
+    const keyInput = section.querySelector('input[type="password"]');
+    const countInput = section.querySelector('input[type="number"]');
+
+    // Save A: paste the key, leaving the write in flight.
+    keyInput.dispatchEvent(new Event("input"));
+    keyInput.value = "BSA-fixture-key"; // gitleaks:allow
+    keyInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => expect(calls.length).toBe(1));
+
+    // Save B: an overlapping count edit while A is still pending.
+    countInput.value = "9";
+    countInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => expect(calls.length).toBe(2));
+
+    // A fails first and rolls the key field back to its untouched empty state.
+    calls[0].reject(new Error("boom"));
+    await vi.waitFor(() => expect(keyInput.value).toBe(""));
+    // Then B lands, recording the stored key while the field stays empty.
+    calls[1].resolve({ ...LOADED, defaultCount: 9 });
+    await vi.waitFor(() => expect(countInput.value).toBe("9"));
+
+    // An unrelated count edit must not resurrect an apiKey clear.
+    countInput.value = "7";
+    countInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => expect(calls.length).toBe(3));
+    expect(calls[2].payload.defaultCount).toBe(7);
+    expect(calls[2].payload.apiKey ?? null).toBeNull();
+    // No write ever asked the host to drop the key.
+    expect(calls.some((call) => call.payload.apiKey === "")).toBe(false);
+  });
+
+  it("an out-of-range count leaves a pasted key untouched", async () => {
+    const transport = searchTransport();
+    const detailEl = await renderDatarx("/x/datarx-essential", transport);
+    const section = braveSection(detailEl);
+    const keyInput = section.querySelector('input[type="password"]');
+    const countInput = section.querySelector('input[type="number"]');
+
+    keyInput.dispatchEvent(new Event("input"));
+    keyInput.value = "BSA-pasted-key"; // gitleaks:allow
+    countInput.value = "25";
+    countInput.dispatchEvent(new Event("change"));
+    await vi.waitFor(() =>
+      expect(section.querySelector(".pkg-ext-notice").textContent).toBe(
+        "Must be an integer between 1 and 20",
+      ),
+    );
+    expect(keyInput.value).toBe("BSA-pasted-key");
+    expect(countInput.value).toBe("5");
+    expect(callsOf(transport, "brave", "set")).toEqual([]);
   });
 });

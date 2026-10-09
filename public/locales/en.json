@@ -786,6 +786,30 @@
       "saved": "Saved.",
       "saveFailed": "Save failed: {message}"
     },
+    "extensionBraveSearch": {
+      "title": "Brave Search",
+      "hint": "Writes BRAVE_SEARCH_API_KEY / BRAVE_SEARCH_RESULT_COUNT to your global ~/.pi/agent/.env. The key only ever shows masked; the current session may still read the old value (process env wins) — a new session always picks the new one up.",
+      "keyLabel": "Brave Search API key",
+      "keyPlaceholder": "paste to set · empty clears",
+      "countLabel": "Results per search",
+      "countError": "Must be an integer between 1 and 20",
+      "saved": "Saved.",
+      "saveFailed": "Save failed: {message}",
+      "notConfigured": "No API key configured yet.",
+      "configuredAt": "Configured in {path} ({mask})"
+    },
+    "extensionTavily": {
+      "title": "Tavily Search",
+      "hint": "Writes TAVILY_API_KEY / TAVILY_RESULT_COUNT to your global ~/.pi/agent/.env. The key only ever shows masked; the current session may still read the old value (process env wins) — a new session always picks the new one up.",
+      "keyLabel": "Tavily API key",
+      "keyPlaceholder": "paste to set · empty clears",
+      "countLabel": "Results per search",
+      "countError": "Must be an integer between 1 and 20",
+      "saved": "Saved.",
+      "saveFailed": "Save failed: {message}",
+      "notConfigured": "No API key configured yet.",
+      "configuredAt": "Configured in {path} ({mask})"
+    },
     "mcp": {
       "title": "MCP",
       "description": "Manage servers for all workspaces or just this one. Their settings are stored on your computer or in this workspace, respectively.",

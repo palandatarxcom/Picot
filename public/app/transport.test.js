@@ -359,4 +359,38 @@ describe("WsTransport", () => {
     expect(transport.sendEphemeral("inst-1", 3, { type: "prompt" })).toBe("ep-9");
     expect(ws.sendEphemeral).toHaveBeenCalledWith("inst-1", 3, { type: "prompt" });
   });
+
+  test("brave-search config ops use the host control plane without a cwd", async () => {
+    const ws = fakeWsClient();
+    const transport = new WsTransport(ws, {});
+
+    await transport.getBraveSearchConfig();
+    await transport.setBraveSearchConfig({ apiKey: "", defaultCount: 9 });
+
+    // Global-only: the get carries no cwd and the set no scope.
+    expect(ws.sendControl).toHaveBeenNthCalledWith(1, "get_brave_search_config", {}, {});
+    expect(ws.sendControl).toHaveBeenNthCalledWith(
+      2,
+      "set_brave_search_config",
+      { apiKey: "", defaultCount: 9 },
+      {},
+    );
+  });
+
+  test("tavily-search config ops use the host control plane without a cwd", async () => {
+    const ws = fakeWsClient();
+    const transport = new WsTransport(ws, {});
+
+    await transport.getTavilySearchConfig();
+    await transport.setTavilySearchConfig({ apiKey: "", defaultCount: 9 });
+
+    // Global-only: the get carries no cwd and the set no scope.
+    expect(ws.sendControl).toHaveBeenNthCalledWith(1, "get_tavily_search_config", {}, {});
+    expect(ws.sendControl).toHaveBeenNthCalledWith(
+      2,
+      "set_tavily_search_config",
+      { apiKey: "", defaultCount: 9 },
+      {},
+    );
+  });
 });

@@ -220,6 +220,18 @@ export class WsTransport {
   setLensConfig(payload) {
     return this._control("set_lens_config", payload);
   }
+  getBraveSearchConfig() {
+    return this._control("get_brave_search_config");
+  }
+  setBraveSearchConfig(payload) {
+    return this._control("set_brave_search_config", payload);
+  }
+  getTavilySearchConfig() {
+    return this._control("get_tavily_search_config");
+  }
+  setTavilySearchConfig(payload) {
+    return this._control("set_tavily_search_config", payload);
+  }
 
   restartRuntime(workspaceId, sessionId) {
     return this._control(

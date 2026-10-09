@@ -786,6 +786,30 @@
       "saved": "已保存。",
       "saveFailed": "保存失败：{message}"
     },
+    "extensionBraveSearch": {
+      "title": "Brave Search",
+      "hint": "将 BRAVE_SEARCH_API_KEY / BRAVE_SEARCH_RESULT_COUNT 写入全局 ~/.pi/agent/.env。密钥始终以掩码显示；当前会话可能仍读旧值（process.env 优先），新会话必生效。",
+      "keyLabel": "Brave Search API Key",
+      "keyPlaceholder": "粘贴即写入 · 留空即清除",
+      "countLabel": "每次搜索条数",
+      "countError": "需为 1 到 20 之间的整数",
+      "saved": "已保存。",
+      "saveFailed": "保存失败：{message}",
+      "notConfigured": "尚未配置 API Key。",
+      "configuredAt": "已在 {path} 配置（{mask}）"
+    },
+    "extensionTavily": {
+      "title": "Tavily Search",
+      "hint": "将 TAVILY_API_KEY / TAVILY_RESULT_COUNT 写入全局 ~/.pi/agent/.env。密钥始终以掩码显示；当前会话可能仍读旧值（process.env 优先），新会话必生效。",
+      "keyLabel": "Tavily Search API Key",
+      "keyPlaceholder": "粘贴即写入 · 留空即清除",
+      "countLabel": "每次搜索条数",
+      "countError": "需为 1 到 20 之间的整数",
+      "saved": "已保存。",
+      "saveFailed": "保存失败：{message}",
+      "notConfigured": "尚未配置 API Key。",
+      "configuredAt": "已在 {path} 配置（{mask}）"
+    },
     "mcp": {
       "title": "MCP",
       "description": "管理供所有工作区或仅供此工作区使用的服务器；设置分别保存在本机和工作区内。",

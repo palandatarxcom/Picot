@@ -85,6 +85,11 @@ const SETTINGS_RENDERERS = new Map([
 /** datarx-safety-guard-pi (git source) reaches `pi list` as a bare ssh URL or
  * the normalized git: form — matched by suffix (2026-09-21 design spec). */
 const SAFETY_GUARD_RENDERER = { dep: "configGateway", render: renderSafetyGuardSettings };
+/** datarx-essential is installed from a local path, so `pi list` reports a
+ * path ending in `datarx-essential` (or `datarx-essential.git`) — matched by
+ * suffix like the safety guard, never by an exact source string. */
+const DATARX_ESSENTIAL_RENDERER = { dep: "transport", render: renderDatarxEssentialSettings };
+const DATARX_ESSENTIAL_SOURCE = /(^|[/\\])datarx-essential(\.git)?$/;
 /** Host control-plane config ops. `transport.<method>()` resolves with the
  * op's payload and rejects on failure, while these renderers check a plain
  * `ok` flag and read the payload's fields at the top level. Translate once
@@ -107,6 +112,10 @@ const HOST_CONFIG_METHODS = [
   "setCacheOptimizerConfig",
   "getLensConfig",
   "setLensConfig",
+  "getBraveSearchConfig",
+  "setBraveSearchConfig",
+  "getTavilySearchConfig",
+  "setTavilySearchConfig",
 ];
 
 function withOkFlag(transport) {
@@ -131,6 +140,7 @@ function withOkFlag(transport) {
 function findSettingsRenderer(source) {
   return (
     SETTINGS_RENDERERS.get(source) ??
+    (DATARX_ESSENTIAL_SOURCE.test(source) ? DATARX_ESSENTIAL_RENDERER : undefined) ??
     (source.endsWith("datarx-safety-guard-pi.git") ? SAFETY_GUARD_RENDERER : undefined)
   );
 }
@@ -1370,6 +1380,203 @@ async function renderLensSettings(detailEl, _pkg, transport) {
   filesRow.className = "settings-row";
   filesRow.append(filesLabel, filesInput);
   section.append(filesRow);
+}
+
+/**
+ * Shared .env editor section for the datarx-essential search extensions
+ * (brave-search and its twin tavily-search). Each reads <NAME>_API_KEY /
+ * <NAME>_RESULT_COUNT from the global Pi agent .env (~/.pi/agent/.env). Host
+ * control ops (transport-only, so landing renders it too). The key is a
+ * write-only surface: the host returns the tail mask, never the plaintext, so
+ * the input starts empty and the status line is the only place a stored key
+ * shows. `localePrefix` picks the locale block and `getConfig` / `setConfig`
+ * the extension's host ops, so both sections share this one builder.
+ */
+async function buildSearchEnvSettingsSection(
+  detailEl,
+  // transport itself is unused: opts injects the extension's get/set methods.
+  _transport,
+  { localePrefix, getConfig, setConfig },
+) {
+  const section = document.createElement("div");
+  section.className = "pkg-ext-settings";
+  const title = document.createElement("h4");
+  title.className = "pkg-ext-title";
+  title.textContent = t(`settings.${localePrefix}.title`);
+  section.appendChild(title);
+  const hint = document.createElement("p");
+  hint.className = "settings-help";
+  hint.textContent = t(`settings.${localePrefix}.hint`);
+  section.appendChild(hint);
+
+  const keyInput = document.createElement("input");
+  keyInput.type = "password";
+  keyInput.spellcheck = false;
+  keyInput.autocomplete = "off";
+  keyInput.placeholder = t(`settings.${localePrefix}.keyPlaceholder`);
+
+  const countInput = document.createElement("input");
+  countInput.type = "number";
+  countInput.min = "1";
+  countInput.max = "20";
+  countInput.placeholder = "5";
+  const countNotice = document.createElement("span");
+  countNotice.className = "pkg-ext-notice";
+
+  const status = document.createElement("div");
+  status.className = "pkg-ext-status";
+  section.append(
+    fieldRow(t(`settings.${localePrefix}.keyLabel`), keyInput),
+    fieldRow(t(`settings.${localePrefix}.countLabel`), countInput, countNotice),
+    status,
+  );
+  detailEl.appendChild(section);
+
+  let current = null;
+  let message = "";
+  function renderStatus() {
+    status.replaceChildren();
+    const rows = [];
+    if (current?.globalKeyMasked) {
+      rows.push(
+        t(`settings.${localePrefix}.configuredAt`, {
+          path: current.globalPath ?? "",
+          mask: current.globalKeyMasked,
+        }),
+      );
+    }
+    if (!rows.length && !message) {
+      status.textContent = t(`settings.${localePrefix}.notConfigured`);
+      return;
+    }
+    for (const line of rows) {
+      const row = document.createElement("div");
+      row.className = "pkg-ext-status-line";
+      row.textContent = line;
+      status.appendChild(row);
+    }
+    if (message) {
+      const row = document.createElement("div");
+      row.className = "pkg-ext-status-message";
+      row.textContent = message;
+      status.appendChild(row);
+    }
+  }
+  function say(text) {
+    message = text;
+    renderStatus();
+  }
+
+  const result = await getConfig().catch((error) => ({
+    ok: false,
+    error: error?.message ?? String(error),
+  }));
+  if (!result.ok) {
+    status.textContent = result.error || "load failed";
+    return;
+  }
+  current = result;
+  // `null` (not "") is "nothing typed this session": "" is a real instruction
+  // to clear the stored line, so the two states must not collapse. The host
+  // never hands back the plaintext, so "did the user touch the field" is the
+  // only signal separating an untouched empty input from a clear.
+  let lastSaved = { key: null, count: result.defaultCount ?? null };
+  let keyTouched = false;
+  countInput.value = lastSaved.count === null ? "" : String(lastSaved.count);
+  renderStatus();
+
+  function rollback() {
+    keyInput.value = lastSaved.key ?? "";
+    keyTouched = false;
+    countInput.value = lastSaved.count === null ? "" : String(lastSaved.count);
+  }
+
+  async function save() {
+    countNotice.textContent = "";
+    const rawCount = countInput.value.trim();
+    let count = null;
+    if (rawCount !== "") {
+      count = Number(rawCount);
+      if (!Number.isInteger(count) || count < 1 || count > 20) {
+        // Client-side ceiling mirrors the host validator — nothing is sent.
+        countNotice.textContent = t(`settings.${localePrefix}.countError`);
+        // Only this field is restored: a key the user pasted but has not
+        // saved must survive (a full rollback would wipe the plaintext).
+        countInput.value = lastSaved.count === null ? "" : String(lastSaved.count);
+        return;
+      }
+    }
+    const typedKey = keyInput.value.trim();
+    // An empty field the user never laid hands on says nothing about the
+    // stored line; a field they emptied is an explicit clear (null = leave
+    // the line alone, "" = remove it).
+    let key = null;
+    if (typedKey !== "") key = typedKey;
+    else if (keyTouched) key = "";
+    const attempted = { key, count };
+    if (attempted.key === lastSaved.key && attempted.count === lastSaved.count) {
+      return;
+    }
+    // Global-only: the payload carries no scope/cwd, just the changed fields.
+    const payload = {};
+    if (attempted.key !== lastSaved.key && attempted.key !== null) payload.apiKey = attempted.key;
+    if (attempted.count !== lastSaved.count) payload.defaultCount = attempted.count;
+    const saved = await setConfig(payload).catch((error) => ({
+      ok: false,
+      error: error?.message ?? String(error),
+    }));
+    if (!saved.ok) {
+      rollback();
+      say(
+        t(`settings.${localePrefix}.saveFailed`, {
+          message: String(saved.error ?? "save failed"),
+        }),
+      );
+      return;
+    }
+    lastSaved = {
+      // A cleared line leaves nothing stored, so the field is back to its
+      // untouched state instead of "an empty value that equals the saved one".
+      key: attempted.key === "" ? null : attempted.key,
+      count: saved.defaultCount ?? null,
+    };
+    keyTouched = false;
+    current = saved;
+    // The input keeps only what the user typed — the stored key is never read
+    // back into the DOM, so no plaintext ever round-trips through the UI.
+    countInput.value = lastSaved.count === null ? "" : String(lastSaved.count);
+    say(t(`settings.${localePrefix}.saved`));
+  }
+
+  for (const control of [keyInput, countInput]) {
+    control.addEventListener("change", () => {
+      countNotice.textContent = "";
+      void save();
+    });
+  }
+  // Typing (or pasting) marks the field as handled; a "change" alone on a
+  // pristine field must not be read as "clear the stored key".
+  keyInput.addEventListener("input", () => {
+    keyTouched = true;
+  });
+}
+
+/**
+ * datarx-essential: the brave-search and tavily-search extensions side by
+ * side. Both are global-.env twins, so they share one section builder; each
+ * calls its own host get/set ops.
+ */
+async function renderDatarxEssentialSettings(detailEl, _pkg, transport) {
+  await buildSearchEnvSettingsSection(detailEl, transport, {
+    localePrefix: "extensionBraveSearch",
+    getConfig: transport.getBraveSearchConfig.bind(transport),
+    setConfig: transport.setBraveSearchConfig.bind(transport),
+  });
+  await buildSearchEnvSettingsSection(detailEl, transport, {
+    localePrefix: "extensionTavily",
+    getConfig: transport.getTavilySearchConfig.bind(transport),
+    setConfig: transport.setTavilySearchConfig.bind(transport),
+  });
 }
 
 /**

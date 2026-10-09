@@ -786,6 +786,30 @@
       "saved": "Guardado.",
       "saveFailed": "Error al guardar: {message}"
     },
+    "extensionBraveSearch": {
+      "title": "Brave Search",
+      "hint": "Escribe BRAVE_SEARCH_API_KEY / BRAVE_SEARCH_RESULT_COUNT en tu ~/.pi/agent/.env global. La clave solo se muestra enmascarada; la sesión actual puede seguir leyendo el valor antiguo (el entorno del proceso tiene prioridad) — una sesión nueva siempre los aplica.",
+      "keyLabel": "Clave de API de Brave Search",
+      "keyPlaceholder": "pega para definir · vacío borra",
+      "countLabel": "Resultados por búsqueda",
+      "countError": "Debe ser un entero entre 1 y 20",
+      "saved": "Guardado.",
+      "saveFailed": "Error al guardar: {message}",
+      "notConfigured": "Aún no hay clave de API configurada.",
+      "configuredAt": "Configurada en {path} ({mask})"
+    },
+    "extensionTavily": {
+      "title": "Tavily Search",
+      "hint": "Escribe TAVILY_API_KEY / TAVILY_RESULT_COUNT en tu ~/.pi/agent/.env global. La clave solo se muestra enmascarada; la sesión actual puede seguir leyendo el valor antiguo (el entorno del proceso tiene prioridad) — una sesión nueva siempre los aplica.",
+      "keyLabel": "Clave de API de Tavily",
+      "keyPlaceholder": "pega para definir · vacío borra",
+      "countLabel": "Resultados por búsqueda",
+      "countError": "Debe ser un entero entre 1 y 20",
+      "saved": "Guardado.",
+      "saveFailed": "Error al guardar: {message}",
+      "notConfigured": "Aún no hay clave de API configurada.",
+      "configuredAt": "Configurada en {path} ({mask})"
+    },
     "mcp": {
       "title": "MCP",
       "description": "Gestiona servidores para todos los espacios de trabajo o solo para este. Sus ajustes se guardan en tu equipo o en este espacio de trabajo, respectivamente.",

@@ -34,6 +34,7 @@ mod officecli_watch;
 mod operation_registry;
 mod package_manager;
 mod paste_offload;
+mod search_env_config;
 // Public API staged for the broker (Task 5) and host lifecycle (Task 7a).
 #[allow(dead_code)]
 mod command_policy;
@@ -3822,6 +3823,28 @@ fn install_control_handler(
                     "set_lens_config" => {
                         require_native_owner(&ctx)?;
                         lens_config::set_config(&args)
+                    }
+                    "get_brave_search_config" => {
+                        // datarx-essential brave-search global .env
+                        // (~/.pi/agent/.env): host plane,
+                        // landing owners included.
+                        require_native_owner(&ctx)?;
+                        search_env_config::get_brave_config(&args)
+                    }
+                    "set_brave_search_config" => {
+                        require_native_owner(&ctx)?;
+                        search_env_config::set_brave_config(&args)
+                    }
+                    "get_tavily_search_config" => {
+                        // datarx-essential tavily-search global .env
+                        // (~/.pi/agent/.env): host plane,
+                        // landing owners included. Brave's twin.
+                        require_native_owner(&ctx)?;
+                        search_env_config::get_tavily_config(&args)
+                    }
+                    "set_tavily_search_config" => {
+                        require_native_owner(&ctx)?;
+                        search_env_config::set_tavily_config(&args)
                     }
                     "set_goal_config" => {
                         require_native_owner(&ctx)?;

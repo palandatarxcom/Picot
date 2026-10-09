@@ -786,6 +786,30 @@
       "saved": "保存しました。",
       "saveFailed": "保存に失敗しました：{message}"
     },
+    "extensionBraveSearch": {
+      "title": "Brave Search",
+      "hint": "グローバルな ~/.pi/agent/.env に BRAVE_SEARCH_API_KEY / BRAVE_SEARCH_RESULT_COUNT を書き込みます。キーは常にマスク表示され、現在のセッションは古い値を読む可能性があります（プロセス環境変数が優先）— 新しいセッションでは必ず反映されます。",
+      "keyLabel": "Brave Search API キー",
+      "keyPlaceholder": "貼り付けて設定 · 空で削除",
+      "countLabel": "検索ごとの件数",
+      "countError": "1〜20 の整数を入力してください",
+      "saved": "保存しました。",
+      "saveFailed": "保存に失敗しました: {message}",
+      "notConfigured": "API キーはまだ設定されていません。",
+      "configuredAt": "{path} に設定済み（{mask}）"
+    },
+    "extensionTavily": {
+      "title": "Tavily Search",
+      "hint": "グローバルな ~/.pi/agent/.env に TAVILY_API_KEY / TAVILY_RESULT_COUNT を書き込みます。キーは常にマスク表示され、現在のセッションは古い値を読む可能性があります（プロセス環境変数が優先）— 新しいセッションでは必ず反映されます。",
+      "keyLabel": "Tavily Search API キー",
+      "keyPlaceholder": "貼り付けて設定 · 空で削除",
+      "countLabel": "検索ごとの件数",
+      "countError": "1〜20 の整数を入力してください",
+      "saved": "保存しました。",
+      "saveFailed": "保存に失敗しました: {message}",
+      "notConfigured": "API キーはまだ設定されていません。",
+      "configuredAt": "{path} に設定済み（{mask}）"
+    },
     "mcp": {
       "title": "MCP",
       "description": "すべてのワークスペース、またはこのワークスペースだけで使うサーバーを管理します。設定はそれぞれ端末とワークスペース内に保存されます。",
