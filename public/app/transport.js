@@ -467,6 +467,18 @@ export class WsTransport {
     return this.wsClient.sendData("session_history", { sessionId, sessionFile });
   }
 
+  /** Disk transcript for history hydration. `target` carries the routing
+   * triple; `sessionFile` is the sidebar's scanned JSONL path when known. The
+   * host validates the path and falls back to its own id lookup, so a stale or
+   * absent hint never fails the read — it only skips a bucket rescan. */
+  readSessionMessages(target, sessionFile = null) {
+    return this.wsClient.sendData("read_session_messages", {
+      workspaceId: target.workspaceId,
+      sessionId: target.sessionId,
+      ...(typeof sessionFile === "string" && sessionFile ? { sessionFile } : {}),
+    });
+  }
+
   sessionRename(filePath, name) {
     return this._control("session_rename", { filePath, name });
   }

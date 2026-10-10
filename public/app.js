@@ -5938,7 +5938,7 @@ async function handleSessionSelectImpl(session, project) {
       // Upstream switch hydration: fetch the session file in parallel with
       // the snapshot; whichever lands first paints, and the snapshot render
       // then chooses between the two sources.
-      void fetchDiskHistory(target);
+      void fetchDiskHistory(target, session.filePath);
     } catch (error) {
       console.error("[Session route] runtime transition failed:", error);
       messageRenderer.renderError(t("errors.failedToSwitchSession", { error }));
@@ -6337,12 +6337,12 @@ function renderTranscriptEntries(entries, { leafId = null } = {}) {
  * lands, and keep it as the per-session source the snapshot render chooses
  * against. Best-effort: a session whose file does not exist yet (brand-new
  * chat) keeps the snapshot as the only source. */
-async function fetchDiskHistory(target) {
+async function fetchDiskHistory(target, sessionFile = null) {
   try {
-    const data = await wsClient.sendData("read_session_messages", {
-      workspaceId: target.workspaceId,
-      sessionId: target.sessionId,
-    });
+    // Pass the sidebar's scanned JSONL path when known so the host skips its
+    // bucket rescan; the host re-validates it and falls back to its own id
+    // lookup, so a stale hint cannot fail the read.
+    const data = await transport.readSessionMessages(target, sessionFile);
     const messages = Array.isArray(data?.messages) ? data.messages : [];
     if (messages.length === 0) {
       sessionDebug.diskFetch = {

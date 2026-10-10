@@ -2341,6 +2341,27 @@ fn read_bounded_utf8(path: &Path) -> Result<String, &'static str> {
     String::from_utf8(bytes).map_err(|_| "config_invalid_encoding")
 }
 
+/// Whether a freshly accepted runtime command needs a follow-up `get_state`
+/// to refresh the retained session file consumed by `runtime_instance_summaries`.
+///
+/// `fork`, `clone`, `switch_session`, and `new_session` all replace the
+/// runtime's active session in place and their responses carry no
+/// `sessionFile`, so the retained file must be re-read. Only a newly
+/// `Accepted` operation earns the extra Pi round-trip:
+/// - `DuplicatePending` replays race the still-in-flight original and a
+///   `get_state` there would read the *old* session file and stamp it back;
+/// - `DuplicateCompleted` replays follow an `Accepted` send that already
+///   refreshed, so re-probing only adds a redundant round-trip.
+fn retained_session_refresh_required(
+    command_type: Option<&str>,
+    acceptance: crate::operation_registry::OperationAcceptance,
+) -> bool {
+    matches!(
+        command_type,
+        Some("fork" | "clone" | "switch_session" | "new_session")
+    ) && acceptance == crate::operation_registry::OperationAcceptance::Accepted
+}
+
 async fn dispatch(
     action: RoutedAction,
     state: &HostState,
@@ -2471,6 +2492,11 @@ async fn dispatch(
                     .and_then(Value::as_str)
                     .filter(|session_file| !session_file.is_empty())
                 {
+                    // Retain the host-validated file so runtime_instance_summaries
+                    // reads it without rescanning the workspace bucket.
+                    if let Some(session_path) = state.data.canonical_session_file(session_file) {
+                        let _ = state.runtimes.note_session_file(&target, session_path);
+                    }
                     match state
                         .data
                         .record_pi_session_bucket(&target.workspace_id, session_file)
@@ -2591,11 +2617,57 @@ async fn dispatch(
                 "idempotency_key_required",
                 "Runtime mutations require idempotencyKey".into(),
             ))?;
+            let command_type = command
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let (operation_id, acceptance, response) = state
                 .runtimes
                 .request_scoped_receipt(&target, scope, command, key, Duration::from_secs(30))
                 .await
                 .map_err(|message| ("runtime_request_failed", message))?;
+            // `fork`/`clone`/`switch_session`/`new_session` replace the
+            // runtime's active session in place and their responses carry no
+            // sessionFile. Re-read the authoritative state so the retained file
+            // used by runtime_instance_summaries follows the new session.
+            // These commands are NOT rejected on this path: `validate_command`
+            // is wired only into the generic `request` adapter, and
+            // `request_scoped_receipt` (this path) never calls it — closing
+            // that pre-existing admission gap is out of scope here. Only a
+            // freshly Accepted send earns the probe (see
+            // `retained_session_refresh_required`).
+            if retained_session_refresh_required(command_type.as_deref(), acceptance) {
+                // The wire target carries only the routing triple; the live
+                // (owner-bearing) target is what the coordinator validates.
+                let live_target = state
+                    .runtimes
+                    .target_for_session_id(&target.session_id)
+                    .unwrap_or_else(|| target.clone());
+                if let Ok(probe) = state
+                    .runtimes
+                    .request(
+                        &live_target,
+                        json!({ "type": "get_state" }),
+                        None,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                {
+                    if let Some(session_file) = probe
+                        .pointer("/data/sessionFile")
+                        .and_then(Value::as_str)
+                        .filter(|session_file| !session_file.is_empty())
+                    {
+                        let _ = state
+                            .data
+                            .record_pi_session_bucket(&live_target.workspace_id, session_file);
+                        if let Some(session_path) = state.data.canonical_session_file(session_file)
+                        {
+                            let _ = state.runtimes.note_session_file(&live_target, session_path);
+                        }
+                    }
+                }
+            }
             let acceptance = match acceptance {
                 crate::operation_registry::OperationAcceptance::Accepted => "accepted_pending",
                 crate::operation_registry::OperationAcceptance::DuplicatePending => {
@@ -3231,9 +3303,14 @@ async fn dispatch(
                         .get("sessionId")
                         .and_then(Value::as_str)
                         .ok_or(("invalid_session", "sessionId is required".into()))?;
+                    // Optional sidebar path hint. Untrusted: the data plane
+                    // canonicalizes it inside the workspace's session bucket
+                    // and matches its header id before use, else falls back to
+                    // the id lookup — authorization is unchanged.
+                    let session_file = frame.get("sessionFile").and_then(Value::as_str);
                     let messages = state
                         .data
-                        .read_session_messages(workspace_id, session_id)
+                        .read_session_messages(workspace_id, session_id, session_file)
                         .map_err(host_data_error)?;
                     Ok(json!({
                         "type": "data_response",
@@ -4234,7 +4311,7 @@ mod tests {
 
     use super::{
         bind_is_loopback, dialog_response_allowed, outbound_message, outbound_payload_kind,
-        read_bounded_utf8, HostServer,
+        read_bounded_utf8, retained_session_refresh_required, HostServer,
     };
     use crate::host_router::HostClientContext;
     use crate::metadata_store::MetadataStore;
@@ -4493,6 +4570,720 @@ mod tests {
         assert_eq!(response["tree"]["leafId"], "a1");
 
         let _ = harness.socket.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    /// The history read consumes the sidebar-supplied `sessionFile` hint
+    /// instead of rescanning the bucket by id. The hint file sits one level
+    /// below the bucket (the id rescan is non-recursive), so a successful
+    /// read proves the host validated and used the forwarded hint.
+    #[tokio::test]
+    async fn read_session_messages_data_op_prefers_verified_session_file_hint() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-msgs-op-{nonce}"));
+        let session_root = temp.join("sessions");
+        let (host, mut harness, harness_temp) =
+            desktop_harness("msgs-op", Some(session_root.clone())).await;
+
+        host.state
+            .data
+            .record_pi_session_bucket(
+                &harness.workspace_id,
+                "/pi/sessions/--msgs-op-bucket--/session.jsonl",
+            )
+            .unwrap();
+        let bucket_dir = host
+            .state
+            .data
+            .session_bucket_for_workspace(&harness.workspace_id)
+            .expect("persisted bucket");
+        let hint_file = bucket_dir.join("nested").join("msgs-op.jsonl");
+        fs::create_dir_all(hint_file.parent().unwrap()).unwrap();
+        let workspace = harness_temp.join("workspace");
+        let cwd = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
+        fs::write(
+            &hint_file,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"msgs-op\",\"cwd\":{cwd}}}\n\
+                 {{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        harness
+            .socket
+            .send(Message::Text(
+                json!({
+                    "type": "data_request", "protocolVersion": 2, "requestId": "msgs-op-1",
+                    "operation": "read_session_messages",
+                    "workspaceId": harness.workspace_id,
+                    "sessionId": "msgs-op",
+                    "sessionFile": hint_file.to_string_lossy(),
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), harness.socket.next())
+            .await
+            .expect("reply within 5s")
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(response.to_text().unwrap()).unwrap();
+        assert_eq!(response["type"], "data_response", "{response}");
+        assert_eq!(response["operation"], "read_session_messages");
+        let messages = response["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1, "{response}");
+        assert_eq!(messages[0]["content"], "hello");
+
+        let _ = harness.socket.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    /// `fork` replaces the runtime's active session in place, and Pi's fork
+    /// response carries no sessionFile. The host must re-read get_state so the
+    /// retained file (runtime_instance_summaries) follows the new session.
+    #[tokio::test]
+    async fn fork_refreshes_retained_session_file_from_get_state() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-fork-retained-{nonce}"));
+        let public = temp.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::write(public.join("index.html"), "Picot").unwrap();
+        let sessions_root = temp.join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        let forked_file = sessions_root.join("forked.jsonl");
+        fs::write(
+            &forked_file,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"session-forked\"}\n\
+             {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let forked_file = forked_file.canonicalize().unwrap();
+
+        let metadata = Arc::new(Mutex::new(
+            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+        ));
+        let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+        let runtimes = NativePiManager::new(8);
+        let registry = Arc::new(crate::window_owner::WindowOwnerRegistry::default());
+        let (owner, capability) = registry
+            .create_owner_with_workspace(
+                "owner".into(),
+                temp.clone(),
+                0,
+                "http://127.0.0.1:1".into(),
+                Some("workspace-fork".into()),
+                crate::window_owner::TemporaryKind::DefaultStartup,
+            )
+            .unwrap();
+        let target = RuntimeTarget::with_owner(
+            "workspace-fork",
+            "session-fork",
+            "instance-fork",
+            owner.as_str(),
+            0,
+        );
+        let mut fake = runtimes.register_in_memory(target.clone()).unwrap();
+        let host = HostServer::start_with_session_root(
+            public,
+            runtimes,
+            auth,
+            metadata,
+            Some(sessions_root.clone()),
+        )
+        .await
+        .unwrap();
+        host.set_owner_registry(registry);
+        let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "hello", "protocolVersion": 2, "clientType": "desktop",
+                    "clientId": "fork-client", "desktopCapability": capability
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_subscribe", "requestId": "sub", "target": target
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket.next().await.unwrap().unwrap();
+
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_request", "requestId": "fork-1",
+                    "idempotencyKey": "fork-key",
+                    "target": {
+                        "workspaceId": "workspace-fork",
+                        "sessionId": "session-fork",
+                        "instanceId": "instance-fork"
+                    },
+                    "command": { "type": "fork", "entryId": "entry-1" }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // Pi's fork reply: success, and (per the RPC contract) no sessionFile.
+        let fork_request = fake.read_request().await.expect("fork dispatched");
+        assert_eq!(fork_request["type"], "fork");
+        let fork_id = fork_request["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": fork_id,
+            "type": "response",
+            "command": "fork",
+            "success": true,
+            "data": { "text": "entry text", "cancelled": false }
+        }))
+        .await
+        .unwrap();
+
+        // The host must now probe get_state for the new active session file.
+        let probe = tokio::time::timeout(Duration::from_secs(5), fake.read_request())
+            .await
+            .expect("get_state probe within 5s")
+            .expect("get_state probe");
+        assert_eq!(probe["type"], "get_state", "{probe}");
+        let probe_id = probe["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": probe_id,
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "sessionFile": forked_file.to_string_lossy(),
+                "sessionId": "session-forked",
+                "isStreaming": false
+            }
+        }))
+        .await
+        .unwrap();
+
+        // Drain the fork response on the socket.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let parsed: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if parsed["requestId"] == "fork-1" {
+                    return parsed;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            host.native_manager().session_file_for(&target),
+            Some(forked_file.clone())
+        );
+
+        let _ = socket.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    /// `fork`/`switch_session`/`new_session` all replace the active session in
+    /// place. Only a freshly Accepted send earns the follow-up `get_state`
+    /// probe; a `DuplicatePending`/`DuplicateCompleted` replay must not.
+    #[test]
+    fn retained_session_refresh_requires_a_freshly_accepted_session_replacer() {
+        use crate::operation_registry::OperationAcceptance::{
+            Accepted, DuplicateCompleted, DuplicatePending,
+        };
+        for command in ["fork", "clone", "switch_session", "new_session"] {
+            assert!(
+                retained_session_refresh_required(Some(command), Accepted),
+                "{command} accepted refreshes"
+            );
+            assert!(
+                !retained_session_refresh_required(Some(command), DuplicatePending),
+                "{command} pending must not probe"
+            );
+            assert!(
+                !retained_session_refresh_required(Some(command), DuplicateCompleted),
+                "{command} completed must not re-probe"
+            );
+        }
+        for command in ["prompt", "abort", "get_state", "clear_queue"] {
+            assert!(
+                !retained_session_refresh_required(Some(command), Accepted),
+                "{command} is not a session replacer"
+            );
+        }
+        assert!(!retained_session_refresh_required(None, Accepted));
+    }
+
+    /// Shared harness for the retained-session refresh tests: a host with a
+    /// hermetic session root, one authenticated desktop socket, and an
+    /// in-memory Pi runtime the test drives frame by frame.
+    #[allow(clippy::type_complexity)]
+    async fn retained_probe_harness(
+        label: &str,
+        session_id: &str,
+    ) -> (
+        HostServer,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        RuntimeTarget,
+        crate::pi_rpc_bridge::InMemoryPiProcess,
+        PathBuf,
+        PathBuf,
+    ) {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-{label}-{nonce}"));
+        let public = temp.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::write(public.join("index.html"), "Picot").unwrap();
+        let sessions_root = temp.join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+
+        let metadata = Arc::new(Mutex::new(
+            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+        ));
+        let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+        let runtimes = NativePiManager::new(8);
+        let registry = Arc::new(crate::window_owner::WindowOwnerRegistry::default());
+        let workspace_id = format!("workspace-{label}");
+        let (owner, capability) = registry
+            .create_owner_with_workspace(
+                format!("{label}-window"),
+                temp.clone(),
+                0,
+                "http://127.0.0.1:1".into(),
+                Some(workspace_id.clone()),
+                crate::window_owner::TemporaryKind::DefaultStartup,
+            )
+            .unwrap();
+        let target = RuntimeTarget::with_owner(
+            &workspace_id,
+            session_id,
+            format!("instance-{label}"),
+            owner.as_str(),
+            0,
+        );
+        let fake = runtimes.register_in_memory(target.clone()).unwrap();
+        let host = HostServer::start_with_session_root(
+            public,
+            runtimes,
+            auth,
+            metadata,
+            Some(sessions_root.clone()),
+        )
+        .await
+        .unwrap();
+        host.set_owner_registry(registry);
+        let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "hello", "protocolVersion": 2, "clientType": "desktop",
+                    "clientId": format!("{label}-client"), "desktopCapability": capability
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_subscribe", "requestId": "sub", "target": target
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket.next().await.unwrap().unwrap();
+        (host, socket, target, fake, temp, sessions_root)
+    }
+
+    /// Read socket frames until the reply for `request_id` arrives (deadline
+    /// guarded so a dropped frame fails here instead of hanging the suite).
+    async fn read_runtime_reply(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        request_id: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let parsed: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if parsed["requestId"] == request_id {
+                    return parsed;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("reply for {request_id} within 5s"))
+    }
+
+    /// A `switch_session` changes the active session in place and its response
+    /// carries no sessionFile. The retained file must follow the new session so
+    /// `runtime_instance_summaries` does not report the old one.
+    #[tokio::test]
+    async fn switch_session_refreshes_retained_session_file_from_get_state() {
+        use tokio_tungstenite::tungstenite::Message;
+        let (host, mut socket, target, mut fake, temp, sessions_root) =
+            retained_probe_harness("switch", "session-switch").await;
+        let switched = sessions_root.join("switched.jsonl");
+        fs::write(
+            &switched,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"switched\"}\n\
+             {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let switched = switched.canonicalize().unwrap();
+
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_request", "requestId": "switch-1",
+                    "idempotencyKey": "switch-key",
+                    "target": {
+                        "workspaceId": target.workspace_id,
+                        "sessionId": target.session_id,
+                        "instanceId": target.instance_id
+                    },
+                    "command": { "type": "switch_session", "sessionPath": "/pi/sessions/--x--/old.jsonl" }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // Pi's switch_session reply carries no sessionFile.
+        let switch_request = fake
+            .read_request()
+            .await
+            .expect("switch_session dispatched");
+        assert_eq!(switch_request["type"], "switch_session", "{switch_request}");
+        let switch_id = switch_request["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": switch_id,
+            "type": "response",
+            "command": "switch_session",
+            "success": true,
+            "data": { "cancelled": false }
+        }))
+        .await
+        .unwrap();
+
+        // The host must probe get_state for the new active session file.
+        let probe = tokio::time::timeout(Duration::from_secs(5), fake.read_request())
+            .await
+            .expect("get_state probe within 5s")
+            .expect("get_state probe");
+        assert_eq!(probe["type"], "get_state", "{probe}");
+        let probe_id = probe["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": probe_id,
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "sessionFile": switched.to_string_lossy(),
+                "sessionId": "switched",
+                "isStreaming": false
+            }
+        }))
+        .await
+        .unwrap();
+
+        let reply = read_runtime_reply(&mut socket, "switch-1").await;
+        assert_eq!(reply["acceptance"], "accepted_pending", "{reply}");
+        assert_eq!(
+            host.native_manager().session_file_for(&target),
+            Some(switched.clone())
+        );
+
+        let _ = socket.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    /// `new_session` behaves like `switch_session`: it replaces the active
+    /// session, so the retained file must be refreshed too.
+    #[tokio::test]
+    async fn new_session_refreshes_retained_session_file_from_get_state() {
+        use tokio_tungstenite::tungstenite::Message;
+        let (host, mut socket, target, mut fake, temp, sessions_root) =
+            retained_probe_harness("new", "session-new").await;
+        let fresh = sessions_root.join("fresh.jsonl");
+        fs::write(
+            &fresh,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"fresh\"}\n\
+             {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let fresh = fresh.canonicalize().unwrap();
+
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_request", "requestId": "new-1",
+                    "idempotencyKey": "new-key",
+                    "target": {
+                        "workspaceId": target.workspace_id,
+                        "sessionId": target.session_id,
+                        "instanceId": target.instance_id
+                    },
+                    "command": { "type": "new_session" }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let new_request = fake.read_request().await.expect("new_session dispatched");
+        assert_eq!(new_request["type"], "new_session", "{new_request}");
+        let new_id = new_request["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": new_id,
+            "type": "response",
+            "command": "new_session",
+            "success": true,
+            "data": { "cancelled": false }
+        }))
+        .await
+        .unwrap();
+
+        let probe = tokio::time::timeout(Duration::from_secs(5), fake.read_request())
+            .await
+            .expect("get_state probe within 5s")
+            .expect("get_state probe");
+        assert_eq!(probe["type"], "get_state", "{probe}");
+        let probe_id = probe["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": probe_id,
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "sessionFile": fresh.to_string_lossy(),
+                "sessionId": "fresh",
+                "isStreaming": false
+            }
+        }))
+        .await
+        .unwrap();
+
+        let reply = read_runtime_reply(&mut socket, "new-1").await;
+        assert_eq!(reply["acceptance"], "accepted_pending", "{reply}");
+        assert_eq!(
+            host.native_manager().session_file_for(&target),
+            Some(fresh.clone())
+        );
+
+        let _ = socket.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    /// A `DuplicatePending` replay must not launch its own `get_state` probe:
+    /// the original fork is still in flight, so a probe there would read the
+    /// old session file and stamp it back.
+    #[tokio::test]
+    async fn duplicate_pending_fork_does_not_probe_or_clobber_retained_file() {
+        use tokio_tungstenite::tungstenite::Message;
+        let (host, mut socket, target, mut fake, temp, sessions_root) =
+            retained_probe_harness("fork-pending", "session-fork-pending").await;
+        let forked = sessions_root.join("forked.jsonl");
+        fs::write(
+            &forked,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"forked\"}\n\
+             {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let forked = forked.canonicalize().unwrap();
+        let fork_frame = |request_id: &str| {
+            Message::Text(
+                json!({
+                    "type": "runtime_request", "requestId": request_id,
+                    "idempotencyKey": "fork-pending-key",
+                    "target": {
+                        "workspaceId": target.workspace_id,
+                        "sessionId": target.session_id,
+                        "instanceId": target.instance_id
+                    },
+                    "command": { "type": "fork", "entryId": "entry-1" }
+                })
+                .to_string(),
+            )
+        };
+
+        // First fork: accepted, Pi has received it but not answered yet.
+        socket.send(fork_frame("fork-1")).await.unwrap();
+        let fork_request = fake.read_request().await.expect("fork dispatched");
+        let fork_id = fork_request["id"].as_str().unwrap().to_owned();
+
+        // Same idempotency key while the first is still pending.
+        socket.send(fork_frame("fork-2")).await.unwrap();
+        let duplicate = read_runtime_reply(&mut socket, "fork-2").await;
+        assert_eq!(duplicate["acceptance"], "duplicate_pending", "{duplicate}");
+        // The pending replay must not have launched a probe.
+        assert!(
+            fake.try_read_request().is_none(),
+            "a duplicate_pending replay must not probe Pi"
+        );
+
+        // The original fork completes; only it earns the refresh probe, which
+        // the host awaits before it answers fork-1.
+        fake.write_frame(json!({
+            "id": fork_id,
+            "type": "response",
+            "command": "fork",
+            "success": true,
+            "data": { "text": "entry text", "cancelled": false }
+        }))
+        .await
+        .unwrap();
+        let probe = tokio::time::timeout(Duration::from_secs(5), fake.read_request())
+            .await
+            .expect("get_state probe within 5s")
+            .expect("get_state probe");
+        assert_eq!(probe["type"], "get_state", "{probe}");
+        let probe_id = probe["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": probe_id,
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "sessionFile": forked.to_string_lossy(),
+                "sessionId": "forked",
+                "isStreaming": false
+            }
+        }))
+        .await
+        .unwrap();
+        let original = read_runtime_reply(&mut socket, "fork-1").await;
+        assert_eq!(original["acceptance"], "accepted_pending", "{original}");
+        assert_eq!(
+            host.native_manager().session_file_for(&target),
+            Some(forked.clone())
+        );
+
+        let _ = socket.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    /// A `DuplicateCompleted` replay follows an `Accepted` send that already
+    /// refreshed the retained file, so it must not add a second Pi round-trip.
+    #[tokio::test]
+    async fn duplicate_completed_fork_does_not_reprobe_retained_file() {
+        use tokio_tungstenite::tungstenite::Message;
+        let (host, mut socket, target, mut fake, temp, sessions_root) =
+            retained_probe_harness("fork-completed", "session-fork-completed").await;
+        let forked = sessions_root.join("forked.jsonl");
+        fs::write(
+            &forked,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"forked\"}\n\
+             {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let forked = forked.canonicalize().unwrap();
+
+        let fork_frame = |request_id: &str| {
+            Message::Text(
+                json!({
+                    "type": "runtime_request", "requestId": request_id,
+                    "idempotencyKey": "fork-completed-key",
+                    "target": {
+                        "workspaceId": target.workspace_id,
+                        "sessionId": target.session_id,
+                        "instanceId": target.instance_id
+                    },
+                    "command": { "type": "fork", "entryId": "entry-1" }
+                })
+                .to_string(),
+            )
+        };
+
+        socket.send(fork_frame("fork-1")).await.unwrap();
+        let fork_request = fake.read_request().await.expect("fork dispatched");
+        let fork_id = fork_request["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": fork_id,
+            "type": "response",
+            "command": "fork",
+            "success": true,
+            "data": { "text": "entry text", "cancelled": false }
+        }))
+        .await
+        .unwrap();
+        let probe = tokio::time::timeout(Duration::from_secs(5), fake.read_request())
+            .await
+            .expect("get_state probe within 5s")
+            .expect("get_state probe");
+        let probe_id = probe["id"].as_str().unwrap().to_owned();
+        fake.write_frame(json!({
+            "id": probe_id,
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "sessionFile": forked.to_string_lossy(),
+                "sessionId": "forked",
+                "isStreaming": false
+            }
+        }))
+        .await
+        .unwrap();
+        let original = read_runtime_reply(&mut socket, "fork-1").await;
+        assert_eq!(original["acceptance"], "accepted_pending", "{original}");
+        assert_eq!(
+            host.native_manager().session_file_for(&target),
+            Some(forked.clone())
+        );
+
+        // Replay the same key: recorded result, no second Pi round-trip.
+        socket.send(fork_frame("fork-2")).await.unwrap();
+        let replay = read_runtime_reply(&mut socket, "fork-2").await;
+        assert_eq!(replay["acceptance"], "duplicate_completed", "{replay}");
+        assert!(
+            fake.try_read_request().is_none(),
+            "a duplicate_completed replay must not re-probe Pi"
+        );
+        assert_eq!(
+            host.native_manager().session_file_for(&target),
+            Some(forked.clone()),
+            "the completed replay must not disturb the retained file"
+        );
+
+        let _ = socket.close(None).await;
         host.stop();
         let _ = fs::remove_dir_all(temp);
     }

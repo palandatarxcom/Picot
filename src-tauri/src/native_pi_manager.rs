@@ -196,6 +196,12 @@ struct ManagedRuntime {
     bridge: PiRpcBridge,
     process: Option<PiRpcProcess>,
     cleanup: NativeCleanupResources,
+    /// Host-validated Pi `sessionFile` last reported by `get_state` for this
+    /// instance. Retained so `runtime_instance_summaries` reads it in O(1)
+    /// instead of rescanning the workspace bucket per runtime. Cleared whenever
+    /// the instance's session identity is rebound (nothing derived may outlive
+    /// its identity).
+    session_file: Arc<Mutex<Option<PathBuf>>>,
 }
 
 struct NativePiManagerInner {
@@ -435,6 +441,7 @@ impl NativePiManager {
                     bridge: bridge.clone(),
                     process: Some(process),
                     cleanup: spec.cleanup,
+                    session_file: Arc::new(Mutex::new(None)),
                 },
             );
         self.start_event_pump(target, bridge, Some(observer));
@@ -478,6 +485,7 @@ impl NativePiManager {
                     bridge: bridge.clone(),
                     process: None,
                     cleanup: NativeCleanupResources::default(),
+                    session_file: Arc::new(Mutex::new(None)),
                 },
             );
         self.start_event_pump(target, bridge, None);
@@ -1583,6 +1591,12 @@ impl NativePiManager {
             .target
             .lock()
             .map_err(|_| "Native runtime target lock poisoned".to_string())? = formal.clone();
+        // The session identity just changed (temporary -> formal); any retained
+        // session file belongs to the old identity and must not answer for the
+        // new one. The next get_state re-populates it.
+        if let Ok(mut session_file) = managed.session_file.lock() {
+            *session_file = None;
+        }
         drop(runtime);
         let _ = self.inner.events.send(NativeRuntimeEvent {
             target: binding_event.target,
@@ -1604,6 +1618,59 @@ impl NativePiManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Retain the host-validated Pi `sessionFile` for a running instance so
+    /// `runtime_instance_summaries` can read it without a bucket rescan. The
+    /// caller owns validation (canonical, inside the session root, `.jsonl`).
+    ///
+    /// Identity guard: an `instance_id` can be reused after the entry it named
+    /// is stopped and rebuilt (restart, re-adoption, a rebuilt entry). A
+    /// detached probe captured its target *before* that replacement, so writing
+    /// by `instance_id` alone could stamp the previous session's file onto the
+    /// new entry. Only write when the live entry still names the same session
+    /// identity (`workspace_id` + `session_id`). The workspace generation is
+    /// deliberately not compared: a normal transition bumps it while the entry
+    /// — and the file it retained — stay valid.
+    pub fn note_session_file(
+        &self,
+        target: &RuntimeTarget,
+        session_file: PathBuf,
+    ) -> Result<(), String> {
+        let runtimes = self
+            .inner
+            .runtimes
+            .lock()
+            .map_err(|_| "Native runtime registry lock poisoned".to_string())?;
+        let managed = runtimes
+            .get(&target.instance_id)
+            .ok_or_else(|| "Native runtime instance is not running".to_string())?;
+        {
+            let current = managed
+                .target
+                .lock()
+                .map_err(|_| "Native runtime target lock poisoned".to_string())?;
+            if current.workspace_id != target.workspace_id
+                || current.session_id != target.session_id
+            {
+                return Err("Native runtime session identity has changed".to_string());
+            }
+        }
+        *managed
+            .session_file
+            .lock()
+            .map_err(|_| "Native session file lock poisoned".to_string())? = Some(session_file);
+        Ok(())
+    }
+
+    /// The retained Pi `sessionFile` for a running instance, when one is known
+    /// and still present on disk. `None` means the caller must fall back to the
+    /// ordinary bucket lookup.
+    pub fn session_file_for(&self, target: &RuntimeTarget) -> Option<PathBuf> {
+        let runtimes = self.inner.runtimes.lock().ok()?;
+        let managed = runtimes.get(&target.instance_id)?;
+        let retained = managed.session_file.lock().ok()?.clone()?;
+        retained.is_file().then_some(retained)
     }
 
     /// Process id of a running native runtime, when present.
@@ -2780,5 +2847,87 @@ mod tests {
         let event = events.recv().await.unwrap();
         assert_eq!(event.target, formal);
         assert_eq!(manager.target_for_session_id("session-a"), Some(formal));
+    }
+
+    #[tokio::test]
+    async fn retained_session_file_reads_back_and_clears_on_session_bind() {
+        let manager = NativePiManager::in_memory(8);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file = std::env::temp_dir().join(format!("picot-retained-{nonce}.jsonl"));
+        std::fs::write(&file, "{\"type\":\"session\",\"id\":\"a\"}\n").unwrap();
+        let canonical = file.canonicalize().unwrap();
+
+        let temporary = RuntimeTarget::new("workspace-a", "temporary-a", "instance-a");
+        let _fake = manager.register_in_memory(temporary.clone()).unwrap();
+        assert_eq!(manager.session_file_for(&temporary), None);
+
+        manager
+            .note_session_file(&temporary, canonical.clone())
+            .unwrap();
+        assert_eq!(
+            manager.session_file_for(&temporary),
+            Some(canonical.clone())
+        );
+
+        // A vanished file drops the retained value so summaries fall back to
+        // the bucket lookup instead of reporting a deleted path.
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(manager.session_file_for(&temporary), None);
+
+        // A rebound session identity must not inherit the previous file.
+        std::fs::write(&file, "{\"type\":\"session\",\"id\":\"b\"}\n").unwrap();
+        manager
+            .note_session_file(&temporary, canonical.clone())
+            .unwrap();
+        let formal = manager.bind_session_id(&temporary, "session-a").unwrap();
+        assert_eq!(manager.session_file_for(&formal), None);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A detached probe captures its target before the entry it names is
+    /// stopped and rebuilt under the same instance id. Its late write-back must
+    /// not stamp the previous session's file onto the replacement entry.
+    #[tokio::test]
+    async fn retained_session_file_guard_rejects_a_stale_probe_after_replacement() {
+        let manager = NativePiManager::in_memory(8);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let old_file = std::env::temp_dir().join(format!("picot-retained-stale-{nonce}.jsonl"));
+        std::fs::write(&old_file, "{\"type\":\"session\",\"id\":\"old\"}\n").unwrap();
+        let canonical_old = old_file.canonicalize().unwrap();
+
+        let old =
+            RuntimeTarget::with_owner("workspace-a", "session-old", "instance-a", "owner-a", 0);
+        manager.register_in_memory(old.clone()).unwrap();
+        manager
+            .note_session_file(&old, canonical_old.clone())
+            .unwrap();
+        assert_eq!(manager.session_file_for(&old), Some(canonical_old.clone()));
+
+        // The entry is rebuilt under the same instance id but a new session
+        // identity, exactly what a restart/re-adoption produces.
+        manager.stop(&old).unwrap();
+        let replacement =
+            RuntimeTarget::with_owner("workspace-a", "session-new", "instance-a", "owner-a", 0);
+        manager.register_in_memory(replacement.clone()).unwrap();
+
+        // The stale probe resolves late and tries to write its file back.
+        assert!(
+            manager
+                .note_session_file(&old, canonical_old.clone())
+                .is_err(),
+            "a stale probe must be rejected"
+        );
+        assert_eq!(
+            manager.session_file_for(&replacement),
+            None,
+            "the replacement entry must not inherit the previous session's file"
+        );
+        let _ = std::fs::remove_file(&old_file);
     }
 }

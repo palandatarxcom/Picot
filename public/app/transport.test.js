@@ -57,6 +57,34 @@ describe("WsTransport", () => {
     });
   });
 
+  test("readSessionMessages carries the sidebar file path hint when known", async () => {
+    const ws = fakeWsClient();
+    const transport = new WsTransport(ws, {});
+
+    await transport.readSessionMessages(
+      { workspaceId: "workspace-1", sessionId: "session-123" },
+      "/sessions/--workspace--/2026-09-03_session-123.jsonl",
+    );
+
+    expect(ws.sendData).toHaveBeenCalledWith("read_session_messages", {
+      workspaceId: "workspace-1",
+      sessionId: "session-123",
+      sessionFile: "/sessions/--workspace--/2026-09-03_session-123.jsonl",
+    });
+  });
+
+  test("readSessionMessages omits an unknown file path hint", async () => {
+    const ws = fakeWsClient();
+    const transport = new WsTransport(ws, {});
+
+    await transport.readSessionMessages({ workspaceId: "workspace-1", sessionId: "session-123" });
+
+    expect(ws.sendData).toHaveBeenCalledWith("read_session_messages", {
+      workspaceId: "workspace-1",
+      sessionId: "session-123",
+    });
+  });
+
   test("mobile entry controls send host control commands", async () => {
     const ws = fakeWsClient();
     const transport = createTransport({ wsClient: ws, env: {} });

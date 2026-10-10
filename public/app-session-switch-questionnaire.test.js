@@ -486,3 +486,24 @@ test("the host state machine keeps the live turn when pi samples idle", async ()
 
   expect(document.querySelector(".turn-status.live")).not.toBeNull();
 });
+
+test("switching sessions sends the sidebar's scanned file path with the history read", async () => {
+  await import("./app.js?switch-history-path");
+  await settle();
+  await switchTo(S2);
+  // The sidebar knows the session's scanned JSONL path; the history read must
+  // carry it so the host can skip its bucket rescan. The host re-validates the
+  // hint, so sending it is a pure optimization, never an authority claim.
+  const read = await vi.waitFor(() => {
+    const frame = wsInstances
+      .at(-1)
+      .sent.find((f) => f.operation === "read_session_messages" && f.sessionId === "s2");
+    expect(frame).toBeTruthy();
+    return frame;
+  });
+  expect(read.sessionFile).toBe(S2);
+  // Drain the switch's async sidebar warm before jsdom tears down: its
+  // deferred render would otherwise fire after the environment is gone and
+  // surface as an unhandled `document is not defined` rejection.
+  await settle(120);
+});

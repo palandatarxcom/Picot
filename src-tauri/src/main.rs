@@ -167,6 +167,11 @@ async fn record_session_bucket_after_spawn(
         .unwrap_or_default()
         .join(".pi/agent/sessions");
     let data = host_data::HostDataPlane::new(metadata).with_session_root(session_root);
+    // Retain the same host-validated file so runtime_instance_summaries reads
+    // it without rescanning the workspace bucket.
+    if let Some(session_path) = data.canonical_session_file(session_file) {
+        let _ = runtimes.note_session_file(&target, session_path);
+    }
     let bucket_resolved = match data.record_pi_session_bucket(&target.workspace_id, session_file) {
         Ok(true) => {
             host_events.broadcast_native_event(serde_json::json!({
@@ -910,7 +915,12 @@ fn runtime_instance_summaries(
             if let Some(root) = session_root {
                 data = data.with_session_root(root.to_path_buf());
             }
-            let session_file = data.session_file_path(&target.workspace_id, &target.session_id)?;
+            // Prefer the file Pi reported for this running runtime (retained at
+            // get_state) so each summary is O(1); only fall back to the bucket
+            // id lookup when no authoritative file is known.
+            let session_file = runtimes
+                .session_file_for(&target)
+                .or_else(|| data.session_file_path(&target.workspace_id, &target.session_id))?;
             Some(serde_json::json!({
                 "workspaceId": target.workspace_id,
                 "sessionId": target.session_id,
@@ -1310,6 +1320,63 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("session-a.jsonl"));
+    }
+
+    #[tokio::test]
+    async fn runtime_instance_summaries_prefers_retained_session_file_without_rescan() {
+        use crate::native_pi_manager::NativePiManager;
+        use crate::runtime_coordinator::RuntimeTarget;
+
+        let manager = NativePiManager::new(8);
+        let (metadata, temp) = shared_test_metadata("instance-retained");
+        let sessions_root = temp.join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        // No workspace session bucket is registered, so the id rescan cannot
+        // resolve any file. A summary that still carries the retained file
+        // therefore proves the per-runtime scan was skipped, not merely that a
+        // scan happened to succeed.
+        let retained = sessions_root.join("retained.jsonl");
+        fs::write(
+            &retained,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"session-retained\"}\n\
+             {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let retained = retained.canonicalize().unwrap();
+        let root = {
+            fs::create_dir_all(temp.join("ws")).unwrap();
+            temp.join("ws").canonicalize().unwrap()
+        };
+        let (row, _) = metadata.lock().unwrap().add_workspace(&root).unwrap();
+
+        let target = RuntimeTarget::with_owner(
+            &row.workspace_id,
+            "session-retained",
+            "instance-retained",
+            "owner-a",
+            1,
+        );
+        manager.register_in_memory(target.clone()).unwrap();
+        manager
+            .note_session_file(&target, retained.clone())
+            .unwrap();
+
+        // Precondition: the bucket lookup alone resolves nothing.
+        let data = crate::host_data::HostDataPlane::new(metadata.clone())
+            .with_session_root(sessions_root.clone());
+        assert!(data
+            .session_file_path(&row.workspace_id, "session-retained")
+            .is_none());
+
+        let summaries = runtime_instance_summaries(&manager, &metadata, Some(&sessions_root));
+        let entry = summaries
+            .iter()
+            .find(|entry| entry["instanceId"] == "instance-retained")
+            .expect("retained runtime is summarized");
+        assert_eq!(
+            entry["sessionFile"],
+            serde_json::json!(retained.to_string_lossy().to_string())
+        );
     }
 
     #[tokio::test]

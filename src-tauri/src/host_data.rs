@@ -365,13 +365,20 @@ impl HostDataPlane {
     /// through parentId links, and returns the chain's user/assistant
     /// messages with `entryId` attached — the stable anchor the frontend
     /// stamps on transcript rows.
+    ///
+    /// `session_path` is an optional caller-supplied hint (the sidebar's
+    /// scanned `filePath`). It stays untrusted: it is used only after
+    /// `session_file_path_by_path` canonicalizes it inside this workspace's
+    /// bucket and matches its header id to `session_id`; any stale or invalid
+    /// hint falls back to the ordinary id lookup. Authorization is unchanged.
     pub fn read_session_messages(
         &self,
         workspace_id: &str,
         session_id: &str,
+        session_path: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, HostDataError> {
         let path = self
-            .session_file_path(workspace_id, session_id)
+            .resolve_session_file(workspace_id, session_id, session_path)
             .ok_or_else(|| HostDataError::Io(format!("session {session_id} not found")))?;
         let file = std::fs::File::open(&path).map_err(|e| HostDataError::Io(e.to_string()))?;
         let lines = parse_session_lines(file);
@@ -449,6 +456,41 @@ impl HostDataPlane {
         }
         let header = parse_session_header(&resolved)?;
         (header.id == session_id).then_some(resolved)
+    }
+
+    /// Resolve a session file, preferring a validated caller-supplied hint
+    /// (the sidebar's scanned `filePath`) over a bucket rescan. `session_path`
+    /// is never trusted on its own: it must pass `session_file_path_by_path`
+    /// (canonical containment under the workspace's bucket + matching header
+    /// id). A missing, stale, or invalid hint falls through to the ordinary
+    /// id lookup, so correctness and authorization are unchanged.
+    pub fn resolve_session_file(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        session_path: Option<&str>,
+    ) -> Option<PathBuf> {
+        session_path
+            .and_then(|hint| self.session_file_path_by_path(workspace_id, session_id, hint))
+            .or_else(|| self.session_file_path(workspace_id, session_id))
+    }
+
+    /// Canonicalize a Pi-reported `sessionFile` path for retention on a running
+    /// runtime. The input is untrusted: it must resolve inside the configured
+    /// session root and be a regular `.jsonl`. The header id is not required —
+    /// a temporary runtime's host id never matches its persisted header, and
+    /// the retained file only feeds display summaries, never authorization.
+    pub fn canonical_session_file(&self, session_path: &str) -> Option<PathBuf> {
+        let session_root = self.session_root.as_ref()?;
+        let canonical_root = session_root.canonicalize().ok()?;
+        let resolved = Path::new(session_path).canonicalize().ok()?;
+        (resolved.strip_prefix(&canonical_root).is_ok()
+            && resolved.is_file()
+            && resolved
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("jsonl"))
+        .then_some(resolved)
     }
 
     fn session_file_path_in_bucket(&self, bucket: &Path, session_id: &str) -> Option<PathBuf> {
@@ -2636,7 +2678,7 @@ mod tests {
         .unwrap();
 
         let messages = data
-            .read_session_messages(&workspace_id, "session-a")
+            .read_session_messages(&workspace_id, "session-a", None)
             .unwrap();
 
         // Full tip chain including the toolResult (rendered as a tool card);
@@ -2691,7 +2733,9 @@ mod tests {
             tree.leaf_id,
             serde_json::to_string(&tree).unwrap_or_default().len()
         );
-        let messages = data.read_session_messages(&ws, &session).expect("messages");
+        let messages = data
+            .read_session_messages(&ws, &session, None)
+            .expect("messages");
         println!(
             "[tree-probe] transcript messages={} bytes={}",
             messages.len(),
@@ -3201,6 +3245,129 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    /// History reads must consume a caller-supplied path hint (the sidebar's
+    /// scanned `filePath`) instead of rescanning the bucket by session id.
+    /// The hint is placed one level below the bucket, which the id scan never
+    /// reads (it is non-recursive): a successful read therefore proves the
+    /// validated hint — not the scan — resolved the file.
+    #[test]
+    fn read_session_messages_prefers_verified_path_hint_over_bucket_rescan() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&workspace).unwrap();
+        let (data, workspace_id) = test_data(&workspace);
+        let root = workspace.canonicalize().unwrap();
+        let bucket = sessions.join("--test-bucket--");
+        let nested = bucket.join("nested").join("saved.jsonl");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(
+            &nested,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"saved\",\"cwd\":{}}}\n{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n",
+                serde_json::to_string(&root.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        let data = data.with_session_root(sessions);
+
+        assert!(
+            data.session_file_path(&workspace_id, "saved").is_none(),
+            "the id rescan must not discover the nested hint file"
+        );
+        let messages = data
+            .read_session_messages(&workspace_id, "saved", Some(&nested.to_string_lossy()))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "hello");
+    }
+
+    /// An untrusted hint (wrong header id, or a path outside the workspace's
+    /// bucket) must never fail the read: the host ignores it and falls back to
+    /// its own id lookup, so authorization and correctness are unchanged.
+    #[test]
+    fn read_session_messages_ignores_untrusted_path_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&workspace).unwrap();
+        let (data, workspace_id) = test_data(&workspace);
+        let root = workspace.canonicalize().unwrap();
+        let bucket = sessions.join("--test-bucket--");
+        fs::create_dir_all(&bucket).unwrap();
+        let cwd = serde_json::to_string(&root.to_string_lossy()).unwrap();
+        fs::write(
+            bucket.join("saved.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"id\":\"saved\",\"cwd\":{cwd}}}\n{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"real\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        // A file with the wrong header id, inside the bucket.
+        fs::write(
+            bucket.join("other.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"id\":\"other\",\"cwd\":{cwd}}}\n{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"decoy\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        // A file outside the bucket that does carry the requested id.
+        let outside = temp.path().join("outside.jsonl");
+        fs::write(
+            &outside,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"saved\",\"cwd\":{cwd}}}\n{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"outside\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let data = data.with_session_root(sessions);
+
+        for hint in [
+            bucket.join("other.jsonl").to_string_lossy().into_owned(),
+            outside.to_string_lossy().into_owned(),
+            "/etc/passwd".to_string(),
+        ] {
+            let messages = data
+                .read_session_messages(&workspace_id, "saved", Some(&hint))
+                .unwrap_or_else(|error| panic!("hint {hint} must fall back: {error:?}"));
+            assert_eq!(messages.len(), 1, "hint {hint}");
+            assert_eq!(messages[0]["content"], "real", "hint {hint}");
+        }
+    }
+
+    /// A retained runtime session file only needs root containment and a
+    /// `.jsonl` shape: temporary runtimes never match a header id, and the
+    /// value feeds display summaries, never authorization.
+    #[test]
+    fn canonical_session_file_requires_root_containment_and_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&workspace).unwrap();
+        let (data, _) = test_data(&workspace);
+        let data = data.with_session_root(sessions.clone());
+        fs::create_dir_all(&sessions).unwrap();
+        let good = sessions.join("ok.jsonl");
+        fs::write(&good, "{\"type\":\"session\",\"id\":\"a\"}\n").unwrap();
+        let not_jsonl = sessions.join("notes.txt");
+        fs::write(&not_jsonl, "x").unwrap();
+        let outside = temp.path().join("outside.jsonl");
+        fs::write(&outside, "{\"type\":\"session\",\"id\":\"a\"}\n").unwrap();
+
+        assert_eq!(
+            data.canonical_session_file(&good.to_string_lossy()),
+            good.canonicalize().ok()
+        );
+        assert!(data
+            .canonical_session_file(&not_jsonl.to_string_lossy())
+            .is_none());
+        assert!(data
+            .canonical_session_file(&outside.to_string_lossy())
+            .is_none());
+        assert!(data.canonical_session_file("/etc/passwd").is_none());
+        assert!(data.canonical_session_file("").is_none());
     }
 
     #[test]
