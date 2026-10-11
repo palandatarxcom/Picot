@@ -14,7 +14,7 @@
 | [`in-progress/`](in-progress/) | 设计已批准实施未完（部分代码已合入或 working tree 有进展） | 2 |
 | [`not-started/`](not-started/) | 设计草案或待评审，未实施 | 6 |
 | [`audits/`](../../audits/) | 审计记录（非设计 spec，不引入实现） | 1 |
-| [`superseded/`](superseded/) | 已被更新的 spec 取代，保留作历史参考 | 5 |
+| [`superseded/`](superseded/) | 已被更新的 spec 取代，保留作历史参考 | 9 |
 | [`process-evidence/`](process-evidence/) | Native Runtime 迁移过程的证据 / CP 评审 / 闭环记录（不是设计规格） | 24 |
 | [`prototypes/`](prototypes/) | 视觉原型（HTML），仅评审用，不进生产 | 3 |
 
@@ -88,7 +88,7 @@
 | ✅ implemented | [2026-09-23-files-tree-and-paseo-icons](implemented/2026-09-23-files-tree-and-paseo-icons-design.md) | file-browser.js 1174 行 + file-tree.js + file-context-menu.js + file-type-icons.js + material-file-theme/，commit `3ab827e` |
 | ✅ implemented | [2026-09-26-local-follow-up-queue](implemented/2026-09-26-local-follow-up-queue-design.md) | public/ui/follow-up-queue.js（125 行），commit `039bd49` |
 | ✅ implemented | [2026-09-30-subagent-settings](implemented/2026-09-30-subagent-settings-design.md) | 候选盘点、只读定义、四字段名字级覆盖与 Skills 同款 UI 已落地；新建仍禁写，live parity 未证实；最终范围与限制见 §0 |
-| 🚧 in-progress | [2026-09-18-subagent-display](in-progress/2026-09-18-subagent-display-design.md) | 设计定案；widget + tool card 未实现 |
+| ⛔ superseded | [2026-09-18-subagent-display](superseded/2026-09-18-subagent-display-design.md) | v2 面向 tintinweb 契约未实现，tintinweb 路线已废弃（2026-10-11）；v1 契约代码已实现并以 0.77.0 复核 |
 | 🚧 in-progress | [2026-09-27-clinical-research-agent-team](in-progress/2026-09-27-clinical-research-agent-team-design.md) | 试用版；六份岗位指令 + Paseo profile 已建，真实团队未验证 |
 | 📋 not-started | [2026-09-18-acp-external-agent-delegation](not-started/2026-09-18-acp-external-agent-delegation-design.md) | 设计草案，Dr. Lin 2026-09：暂时不做 |
 | 📋 not-started | [2026-09-20-persistent-daemon-relay](not-started/2026-09-20-persistent-daemon-relay-design.md) | 持久 daemon + relay 接入；Draft 待拍板 |

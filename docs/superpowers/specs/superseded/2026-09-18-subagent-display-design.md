@@ -1,6 +1,6 @@
 # Subagent 主聊天显示与导航设计
 
-**Status:** v2 设计定案（2026-09-29 按 `@tintinweb/pi-subagents` 契约重写，未实现）。v1（2026-09-18 grilling 定案 Q1–Q6）基于 nicobailon `pi-subagents` 契约，随扩展选型切换作废重写；v1 的四组件结构、只读导航原则、降级思路保留。
+**Status:** 作废（2026-10-11）。v2（2026-09-29）按 `@tintinweb/pi-subagents` 契约重写但未实现，随后 tintinweb 路线整体废弃——选型回到 nicobailon `pi-subagents`，v1 契约代码（widget 快照流等）已实现并以 0.77.0 复核（见 `.memory/notes/batch-20261011-1-subagents-077-impact.md`）。v2 的事实底座（tintinweb 0.14.3 源码核实）随之失效。v1（2026-09-18 grilling 定案 Q1–Q6）基于 nicobailon 契约，曾被作废重写，其四组件结构、只读导航原则、降级思路已由后续实现吸收。
 **Date:** 2026-09-18（v1）/ 2026-09-29（v2）
 **Provenance:** v2 事实底座来自 `@tintinweb/pi-subagents@0.14.3`（已装于 `~/.pi/agent/npm/node_modules/@tintinweb/pi-subagents/`）源码核实：`src/index.ts`（工具注册、通知、AgentDetails）、`src/agent-runner.ts`（child 会话创建与命名）、`src/output-file.ts`（.output transcript）、`src/ui/fleet-list.ts`（setWidget 为 TUI 回调渲染）。runtime 字段终值由实施 Task 0 实测钉死。参照 upstream `picot-public-v3.3` ACP 卡片（`f207db0`）仅取形态。
 

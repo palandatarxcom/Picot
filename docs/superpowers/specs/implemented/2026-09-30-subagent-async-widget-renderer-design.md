@@ -2,7 +2,7 @@
 
 **状态：** 已评审修订（军师评审 + Dr. Lin 拍板），待实施；Plan 见 `docs/superpowers/plans/2026-09-30-subagent-async-widget-renderer.md`。
 **日期：** 2026-09-30
-**适用契约：** Nico Bailon `pi-subagents` v0.73.1 的 RPC snapshot；不适用于 `@tintinweb/pi-subagents`。现有 `2026-09-18-subagent-display-design.md` v2 面向 tintinweb 的 `.output` 数据面，不应把两者接在同一个 renderer 上（`docs/superpowers/specs/in-progress/2026-09-18-subagent-display-design.md:1-4,31-33`）。
+**适用契约：** Nico Bailon `pi-subagents` v0.73.1 的 RPC snapshot；不适用于 `@tintinweb/pi-subagents`。已作废的 `2026-09-18-subagent-display-design.md` v2 曾面向 tintinweb 的 `.output` 数据面，不应把两者接在同一个 renderer 上（`docs/superpowers/specs/superseded/2026-09-18-subagent-display-design.md`）。
 
 ## 目标与边界
 
