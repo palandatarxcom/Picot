@@ -327,6 +327,19 @@ export class WsTransport {
     return this._control("session_export", { sessionId });
   }
 
+  // The host grants a one-shot export URL. Rust fetches it and writes the file
+  // to the path the native save dialog returns, so the HTML never crosses the
+  // host_request size limit. Resolves to the saved path, or null when cancelled.
+  async saveSessionExport(sessionId, initialDir) {
+    const { exportUrl } = await this.exportSession(sessionId);
+    if (!exportUrl) throw new Error("Session export returned no URL");
+    return this._control(
+      "save_session_export",
+      { exportUrl, fileName: `${sessionId}.html`, initialDir: initialDir || null },
+      { timeoutMs: NO_TIMEOUT },
+    );
+  }
+
   // Turn files card (2026-09-19 spec): per-file working-tree stats, frozen
   // at turn end. Non-git workspaces reject → caller degrades to a plain list.
   gitTurnStats(paths) {

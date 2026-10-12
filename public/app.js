@@ -4921,19 +4921,13 @@ async function rpcCommand(cmd, statusMsg, silent = false) {
 async function rpcExportHtml() {
   try {
     statusText.textContent = t("status.exporting");
-    // pi's export_html RPC writes the file itself (rpc.md) — by default into
-    // the workspace cwd — and returns its path. Opening happens in Picot's
-    // own HTML preview: the system opener on a file:// URL would use the
-    // .html default HANDLER (an editor on dev machines), not the browser.
-    const result = await rpcCommand({ type: "export_html" }, null, true);
-    const exportedPath = result?.success ? result.data?.path : null;
-    if (!exportedPath) throw new Error(result?.error || "Session export returned no path");
-    statusText.textContent = t("status.done");
-    const opened = await filePreviewFollow.openPath(exportedPath).catch(() => null);
-    if (!opened) {
-      // Preview unavailable: surface where the file landed instead.
-      messageRenderer.renderSystemMessage(exportedPath);
-    }
+    // export_html has no native runtime route; the host session_export grant
+    // supplies the HTML, which the native save dialog writes to the user's pick.
+    const savedPath = await transport.saveSessionExport(
+      wsClient.sessionId,
+      getCurrentWorkspacePath(),
+    );
+    if (savedPath) statusText.textContent = t("status.done");
   } catch (error) {
     console.error("session export failed:", error);
     statusText.textContent = t("status.failed");

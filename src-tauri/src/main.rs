@@ -246,6 +246,79 @@ fn run_bundled_pi_command(
 }
 
 /// Native folder picker dialog
+/// Rebuilds the local URL for a host-granted session export. Only the one-shot
+/// token path that `session_export` returns is accepted, so the WebView cannot
+/// point the host at another origin or route.
+fn session_export_fetch_url(host_origin: &str, export_url: &str) -> Result<String, String> {
+    const PREFIX: &str = "/v2/session-export/";
+    let token = export_url
+        .strip_prefix(PREFIX)
+        .filter(|token| token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| "Invalid session export URL".to_string())?;
+    Ok(format!("{host_origin}{PREFIX}{token}"))
+}
+
+/// Fetches the granted export inside the host process, then shows the native
+/// save dialog. Bytes never cross the WebSocket. Returns `Ok(None)` on cancel.
+async fn save_session_export_core(
+    app: &AppHandle,
+    host_origin: &str,
+    export_url: &str,
+    file_name: &str,
+    initial_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    let fetch_url = session_export_fetch_url(host_origin, export_url)?;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("Cannot create export client: {error}"))?
+        .get(&fetch_url)
+        .send()
+        .await
+        .map_err(|error| format!("Session export fetch failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Session export fetch failed: HTTP {}",
+            response.status()
+        ));
+    }
+    let contents = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Session export read failed: {error}"))?;
+
+    let mut dialog = app
+        .dialog()
+        .file()
+        .add_filter("HTML", &["html"])
+        .set_file_name(file_name);
+
+    if let Some(dir) = initial_dir.as_deref() {
+        let p = std::path::Path::new(dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(p);
+        }
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.save_file(move |path| {
+        let _ = tx.send(path);
+    });
+    let Some(file_path) = rx.await.ok().flatten() else {
+        return Ok(None);
+    };
+
+    let path = match file_path {
+        tauri_plugin_fs::FilePath::Path(pb) => pb,
+        tauri_plugin_fs::FilePath::Url(url) => url
+            .to_file_path()
+            .map_err(|_| "Only local paths can be saved to".to_string())?,
+    };
+    std::fs::write(&path, &contents)
+        .map_err(|error| format!("Cannot write {}: {error}", path.display()))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 async fn pick_folder_core(app: &AppHandle) -> Option<String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |path| {
@@ -970,11 +1043,43 @@ fn find_static_dir(app: &tauri::App) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_export_fetch_url_rebuilds_local_url_from_token_only() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            session_export_fetch_url(
+                "http://127.0.0.1:47821",
+                &format!("/v2/session-export/{token}")
+            ),
+            Ok(format!("http://127.0.0.1:47821/v2/session-export/{token}"))
+        );
+    }
+
+    #[test]
+    fn session_export_fetch_url_rejects_anything_but_an_export_token_path() {
+        let origin = "http://127.0.0.1:47821";
+        for export_url in [
+            "http://evil.example/v2/session-export/0123456789abcdef0123456789abcdef",
+            "//evil.example/v2/session-export/0123456789abcdef0123456789abcdef",
+            "/v2/session-export/0123456789abcdef0123456789abcde",
+            "/v2/session-export/0123456789abcdef0123456789abcdeg",
+            "/v2/session-export/0123456789abcdef0123456789abcdef/extra",
+            "/v2/session-export/../../etc/passwd",
+            "/v2/files/raw?path=secret",
+            "",
+        ] {
+            assert!(
+                session_export_fetch_url(origin, export_url).is_err(),
+                "accepted {export_url:?}"
+            );
+        }
+    }
+
     use super::{
         cancel_should_stop_target, clamp_window_geometry, filter_session_delete_paths,
         find_existing_runtime_for_prepare, image_mime_from_path, new_session_menu_enabled,
         persisted_session_id_for_workspace, quick_chat_snapshot, resolve_static_dir,
-        runtime_instance_summaries, runtime_started_event,
+        runtime_instance_summaries, runtime_started_event, session_export_fetch_url,
         should_stop_owner_runtimes_on_transition, side_chat_startup_rpc_commands,
         skill_scope_context, target_for_owner_in_workspace, touch_registered_workspace,
         workspace_snapshot_for,
@@ -3312,6 +3417,22 @@ fn install_control_handler(
                         let initial_dir = arg_str("initialDir");
                         match pick_image_files_core(&app, initial_dir).await? {
                             Some(files) => Ok(serde_json::to_value(files).unwrap_or(Value::Null)),
+                            None => Ok(Value::Null),
+                        }
+                    }
+                    "save_session_export" => {
+                        let export_url = arg_str("exportUrl").ok_or("exportUrl is required")?;
+                        let file_name = arg_str("fileName").ok_or("fileName is required")?;
+                        match save_session_export_core(
+                            &app,
+                            &host_origin,
+                            &export_url,
+                            &file_name,
+                            arg_str("initialDir"),
+                        )
+                        .await?
+                        {
+                            Some(path) => Ok(Value::from(path)),
                             None => Ok(Value::Null),
                         }
                     }

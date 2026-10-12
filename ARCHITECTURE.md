@@ -66,6 +66,8 @@ fn native_runtime_enabled(app) -> bool {
 | `/v2/mobile/status` | HTTP GET | device token（Bearer） | 配对设备只读状态（v1 仅 liveness） |
 | `/pair.html` | HTTP GET | 无（pairing 前唯一 surface） | 手机配对页 |
 
+会话 HTML 导出：`session_export` 经 `host_request` 签发一次性令牌（只返回 URL）；`save_session_export` 由 Rust 在宿主进程内用 `host_origin` + 严格校验的 32 位 hex 令牌拉取字节，再弹出原生另存为对话框（默认目录为工作区根）。取消则不写文件。字节不经 WebSocket 与 `host_request`（256 KiB 上限），因此导出体积不受该上限限制。
+
 ### 兼容路由的唯一实现规则
 
 `/api/*` 兼容条目是**冻结集合**：只允许继续服务已在 host 内实现的路由，不再新增 handler。

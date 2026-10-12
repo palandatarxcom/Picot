@@ -33,6 +33,45 @@ describe("WsTransport", () => {
     expect(ws.sendControl).toHaveBeenCalledWith("session_export", { sessionId: "session-123" }, {});
   });
 
+  test("saveSessionExport asks the host to fetch the granted export and save it, returning the path", async () => {
+    const ws = fakeWsClient();
+    ws.sendControl = vi.fn((command) =>
+      Promise.resolve(
+        command === "session_export"
+          ? { exportUrl: "/v2/session-export/0123456789abcdef0123456789abcdef", expiresInSecs: 60 }
+          : "/tmp/workspace/session-123.html",
+      ),
+    );
+    const transport = createTransport({ wsClient: ws, env: {} });
+
+    const savedPath = await transport.saveSessionExport("session-123", "/tmp/workspace");
+
+    expect(ws.sendControl).toHaveBeenLastCalledWith(
+      "save_session_export",
+      {
+        exportUrl: "/v2/session-export/0123456789abcdef0123456789abcdef",
+        fileName: "session-123.html",
+        initialDir: "/tmp/workspace",
+      },
+      { timeoutMs: 0 },
+    );
+    expect(savedPath).toBe("/tmp/workspace/session-123.html");
+  });
+
+  test("saveSessionExport returns null when the user cancels the save dialog", async () => {
+    const ws = fakeWsClient();
+    ws.sendControl = vi.fn((command) =>
+      Promise.resolve(
+        command === "session_export"
+          ? { exportUrl: "/v2/session-export/0123456789abcdef0123456789abcdef" }
+          : null,
+      ),
+    );
+    const transport = createTransport({ wsClient: ws, env: {} });
+
+    await expect(transport.saveSessionExport("session-123", "/tmp/workspace")).resolves.toBeNull();
+  });
+
   test("fileMentions sends a file_mentions data request", async () => {
     const ws = fakeWsClient();
     const transport = createTransport({ wsClient: ws, env: {} });
