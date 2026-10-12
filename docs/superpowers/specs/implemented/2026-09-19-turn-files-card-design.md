@@ -255,3 +255,17 @@ Windows 路径分隔符与大小写不敏感行为未验证；`git diff` 在超�
 - `public/ui/turn-files-card.js` 新增 `mountTurnFilesCard(messageEl, card)`；`public/app.js` 的 live（`appendTurnFilesCard`）与历史两处挂载点改走它。
 - `public/style.css` 的 `.turn-files-card.expanded .turn-files-body` 加 `max-height: 260px`、`overflow-y: auto`、`overscroll-behavior: contain` 与 4px 滚条（同 `.tool-output`）。
 - 验证：`turn-files-card.test.js` 10 passed；`bun run vitest run public/ui/` 219 passed；`bun run check` 0 error 且 design check passed。
+
+### 路径来源补充：子代理结构化收据（2026-10-12）
+
+卡片路径清单原只来自 write 家族工具（含行式 `edit` 的 `details.files`）。子代理 fan-out 的写入
+只在结构化收据里，故补一处来源，实时与历史共用同一提取器（`public/file-preview-follow.js` 的
+`subagentChangedFiles`）：
+
+- 仅消费**成功**子代理结果的三段结构 `details.results[].acceptance.childReport.changedFiles`
+  （`exitCode === 0`）；外层失败、子结果失败、空报告与非字符串路径不纳入；跨结果按入参顺序去重。
+- **不解析**自然语言正文、`mission` 重复摘要或 `toolCalls` 文本，**不扫描/加载**子 JSONL。
+- 子代理在自己的 cwd 下执行：`args.cwd` 与主 workspace 不一致时其**相对**路径不得归属本工作区，
+  整段丢弃；绝对路径仍交既有 containment 判定。策略沿用上文越界路径第 4 条语义：路径照常出现在
+  卡片里，判定/包含由既有边界处理。
+- 不打开预览：fan-out 无唯一目标，只记账。该收据是**子代理自述**，非宿主独立核验的文件写入审计。

@@ -39,7 +39,13 @@ import { setupComposerImageAttachments } from "./composer-image-attachments.js";
 import { setupComposerPasteOffload } from "./composer-paste-offload.js";
 import { EphemeralChatView } from "./ephemeral-chat-view.js";
 import { setupExtensionUpdateIndicator } from "./extension-update-indicator.js";
-import { createFilePreviewFollow, isWriteTool, pathFromToolArgs } from "./file-preview-follow.js";
+import {
+  createFilePreviewFollow,
+  isSubagentTool,
+  isWriteTool,
+  subagentChangedFiles,
+  writePathsFromToolCall,
+} from "./file-preview-follow.js";
 import { FilePreviewPanel } from "./file-preview-panel.js";
 import { GitClient } from "./git-client.js";
 import { GitPanel } from "./git-panel.js";
@@ -6407,24 +6413,35 @@ function updateMirrorInputState() {
  * targetContainer they land inside the turn's "Process details" group body
  * instead of the main messages flow. Returns the number of cards created.
  */
-function historyTurnWrites(messages, start, end, toolResults) {
+function historyTurnWrites(messages, start, end, toolResults, workspaceRoot) {
   // Mirror the live path: successful write-tool paths for the turn, in
-  // first-write order, deduplicated. Tool args carry raw paths (often
-  // workspace-relative); chips route through openPath which resolves them
-  // the same way the live onWriteApplied path does.
+  // first-write order, deduplicated. A line-based multi-file edit reports its
+  // files on the tool result instead of its args, and a successful subagent
+  // fan-out reports its files in the structured acceptance receipt, so all
+  // three share one extractor per source. Paths are raw (often
+  // workspace-relative); chips route through openPath which resolves them the
+  // same way the live onWriteApplied path does.
   const writes = [];
   const seen = new Set();
   for (let i = start; i < end; i++) {
     const msg = messages[i];
     if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
     for (const block of msg.content) {
-      if (block?.type !== "toolCall" || !isWriteTool(block.name)) continue;
+      if (block?.type !== "toolCall") continue;
       const result = toolResults.get(block.id);
-      if (result?.isError) continue;
-      const path = pathFromToolArgs(block.arguments ?? {});
-      if (!path || seen.has(path)) continue;
-      seen.add(path);
-      writes.push({ filePath: path });
+      let paths;
+      if (isSubagentTool(block.name)) {
+        paths = subagentChangedFiles(result, block.arguments?.cwd, workspaceRoot);
+      } else if (isWriteTool(block.name)) {
+        paths = writePathsFromToolCall(block.arguments ?? {}, result);
+      } else {
+        continue;
+      }
+      for (const path of paths) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        writes.push({ filePath: path });
+      }
     }
   }
   return writes;
@@ -6707,7 +6724,13 @@ function renderSessionHistory(entries, { searchQuery = "", leafId = null } = {})
             if (answerEntryId) finalEl.dataset.entryId = answerEntryId;
             // Rebuild the turn's written-file chips from history so returning to
             // a session shows the same affordance the live turn had.
-            const writes = historyTurnWrites(messages, bodyStart, end, toolResults);
+            const writes = historyTurnWrites(
+              messages,
+              bodyStart,
+              end,
+              toolResults,
+              getCurrentWorkspacePath(),
+            );
             // History cards list files only — frozen stats are never
             // persisted (spec Q3-A).
             const row = renderTurnFilesCard({

@@ -9,6 +9,8 @@ import { initI18n } from "./i18n.js";
 const enMessages = JSON.parse(readFileSync(join(process.cwd(), "public/locales/en.json"), "utf8"));
 
 const wsInstances = [];
+// Paths handed to the host by the turn-files card's one frozen stats query.
+const gitTurnStatsRequests = [];
 
 class FakeWebSocket extends EventTarget {
   static CONNECTING = 0;
@@ -33,6 +35,7 @@ class FakeWebSocket extends EventTarget {
     // a scripted turn settles without waiting on a transport timeout.
     if (envelope.type === "host_request" && envelope.operation === "git_turn_stats") {
       const paths = envelope.args?.paths ?? [];
+      gitTurnStatsRequests.push(paths);
       setTimeout(() => {
         this.onmessage?.({
           data: JSON.stringify({
@@ -67,6 +70,7 @@ class FakeWebSocket extends EventTarget {
 
 beforeEach(async () => {
   wsInstances.length = 0;
+  gitTurnStatsRequests.length = 0;
   document.documentElement.innerHTML = readFileSync(
     join(process.cwd(), "public/index.html"),
     "utf8",
@@ -328,4 +332,145 @@ test("a live turn's write tool settles a turn-files card under the answer", asyn
   );
   expect(card).not.toBeNull();
   expect(card.textContent).toContain("style.css");
+});
+
+test("a live line-based multi-file edit settles a 4-row card and one 4-path stats query", async () => {
+  // Real shape (session 2026-10-03T10-21-58, edit call_7ae0f14f): args carry
+  // only the line-editing script; the four written files exist solely on
+  // result.details.files. Both the card and the single frozen git query must
+  // see all four.
+  await import("./app.js?turn-live-files-card-multi");
+
+  const ws = wsInstances.at(-1);
+  let sequence = 0;
+  const target = { workspaceId: "w1", sessionId: "s1", instanceId: "primary" };
+  const send = (event) =>
+    ws.onmessage({
+      data: JSON.stringify({
+        type: "runtime_event",
+        protocolVersion: 2,
+        sequence: ++sequence,
+        target,
+        event,
+      }),
+    });
+
+  const assistantMessage = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
+  const files = [
+    "agents/research/clinical-medical-manager.md",
+    "agents/research/clinical-medical-writer.md",
+    "AGENTS.md",
+    "README.md",
+  ];
+
+  send({ type: "agent_start" });
+  send({ type: "message_start", message: { role: "assistant", content: [] } });
+  send({
+    type: "message_update",
+    message: assistantMessage("editing"),
+    assistantMessageEvent: { type: "text_delta", delta: "editing" },
+  });
+  send({ type: "message_end", message: assistantMessage("editing"), entryId: "m1" });
+  send({
+    type: "tool_execution_start",
+    toolCallId: "e1",
+    toolName: "edit",
+    args: { text: "[AGENTS.md]\n@REPLACE\n-x\n+y" },
+  });
+  send({
+    type: "tool_execution_end",
+    toolCallId: "e1",
+    result: { isError: false, details: { files: files.map((path) => ({ path, kind: "update" })) } },
+    isError: false,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  send({ type: "message_start", message: { role: "assistant", content: [] } });
+  send({
+    type: "message_update",
+    message: assistantMessage("Done"),
+    assistantMessageEvent: { type: "text_delta", delta: "Done" },
+  });
+  send({ type: "message_end", message: assistantMessage("Done"), entryId: "m2" });
+  send({ type: "agent_end" });
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const messages = document.getElementById("messages");
+  const rows = [...messages.querySelectorAll(".turn-files-row")];
+  expect(gitTurnStatsRequests).toEqual([files]);
+  expect(rows.map((row) => row.dataset.path)).toEqual(files);
+});
+
+test("a live successful subagent fan-out lists its changedFiles and queries their stats", async () => {
+  // Real shape (session 2026-10-12T02-36-47, subagent call_88dc84bdf): the
+  // nine written files exist only on details.results[0].acceptance.childReport.
+  // changedFiles. The card and the single frozen git query must both see them.
+  await import("./app.js?turn-live-subagent-files");
+
+  const ws = wsInstances.at(-1);
+  let sequence = 0;
+  const target = { workspaceId: "w1", sessionId: "s1", instanceId: "primary" };
+  const send = (event) =>
+    ws.onmessage({
+      data: JSON.stringify({
+        type: "runtime_event",
+        protocolVersion: 2,
+        sequence: ++sequence,
+        target,
+        event,
+      }),
+    });
+
+  const assistantMessage = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
+  const files = [
+    "tmp/fddw_rwe_proposal/D2-研究提案客户沟通版-v0.2.pptx",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/deck.json",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/check_deck.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/check_report.json",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/build_pptx.sh",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/gen_notes.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/qa_corr.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/qa_spill.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/corr_report.json",
+  ];
+
+  send({ type: "agent_start" });
+  send({ type: "message_start", message: { role: "assistant", content: [] } });
+  send({
+    type: "message_update",
+    message: assistantMessage("delegating"),
+    assistantMessageEvent: { type: "text_delta", delta: "delegating" },
+  });
+  send({ type: "message_end", message: assistantMessage("delegating"), entryId: "s1" });
+  send({
+    type: "tool_execution_start",
+    toolCallId: "sub1",
+    toolName: "subagent",
+    args: { agent: "PPTX助手", async: false, cwd: "/Users/linyong/tmp/datarx-picot-ext" },
+  });
+  send({
+    type: "tool_execution_end",
+    toolCallId: "sub1",
+    toolName: "subagent",
+    result: {
+      isError: false,
+      details: { results: [{ exitCode: 0, acceptance: { childReport: { changedFiles: files } } }] },
+    },
+    isError: false,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  send({ type: "message_start", message: { role: "assistant", content: [] } });
+  send({
+    type: "message_update",
+    message: assistantMessage("Done"),
+    assistantMessageEvent: { type: "text_delta", delta: "Done" },
+  });
+  send({ type: "message_end", message: assistantMessage("Done"), entryId: "s2" });
+  send({ type: "agent_end" });
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const rows = [...document.getElementById("messages").querySelectorAll(".turn-files-row")];
+  expect(gitTurnStatsRequests).toEqual([files]);
+  expect(rows.map((row) => row.dataset.path)).toEqual(files);
 });

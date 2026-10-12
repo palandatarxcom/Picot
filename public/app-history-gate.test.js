@@ -751,3 +751,196 @@ test("a revealed batch compensates the scroll so the reading position holds", as
   messages.dispatchEvent(new Event("scroll"));
   expect([...messages.querySelectorAll(".message.user")]).toHaveLength(6);
 });
+
+// ── History turn-files card: the written-path list rebuilt from the log ─────
+// (Drives the same renderSessionHistory pass as the gate tests above.)
+
+function historyTurn(source, toolCalls, answerText) {
+  const entries = [
+    {
+      id: `${source}-u`,
+      parentId: null,
+      type: "message",
+      message: { role: "user", content: `${source} prompt` },
+    },
+  ];
+  for (const call of toolCalls) {
+    entries.push({
+      id: `${source}-${call.id}-call`,
+      parentId: entries.at(-1).id,
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: call.id, name: call.name, arguments: call.arguments }],
+      },
+    });
+    entries.push({
+      id: `${source}-${call.id}-result`,
+      parentId: entries.at(-1).id,
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: call.id,
+        toolName: call.name,
+        content: [{ type: "text", text: call.isError ? "failed" : "ok" }],
+        details: call.details,
+        isError: call.isError === true,
+      },
+    });
+  }
+  entries.push({
+    id: `${source}-a`,
+    parentId: entries.at(-1).id,
+    type: "message",
+    message: { role: "assistant", content: [{ type: "text", text: answerText }] },
+  });
+  return entries;
+}
+
+async function renderHistoryEntries(entries, sessionFile) {
+  const ws = wsInstances.at(-1);
+  ws.onmessage({
+    data: JSON.stringify({
+      type: "runtime_snapshot",
+      protocolVersion: 2,
+      sequence: 1,
+      target,
+      state: {
+        pi: { sessionFile: `/pi/sessions/${sessionFile}.jsonl`, isStreaming: false },
+        messages: entries.map((entry) => entry.message),
+      },
+    }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+}
+
+test("a line-based multi-file edit lists all four files in history", async () => {
+  await import("./app.js?history-files-multi");
+  const files = [
+    "agents/research/clinical-medical-manager.md",
+    "agents/research/clinical-medical-writer.md",
+    "AGENTS.md",
+    "README.md",
+  ];
+  await renderHistoryEntries(
+    historyTurn(
+      "multi",
+      [
+        {
+          id: "t1",
+          name: "edit",
+          arguments: { text: "[AGENTS.md]\n@REPLACE\n-x\n+y" },
+          details: { files: files.map((path) => ({ path, kind: "update" })) },
+        },
+      ],
+      "four files updated",
+    ),
+    "history-files-multi",
+  );
+
+  const card = document.getElementById("messages").querySelector(".turn-files-card");
+  expect(card).not.toBeNull();
+  const rows = [...card.querySelectorAll(".turn-files-row")];
+  expect(rows.map((row) => row.dataset.path)).toEqual(files);
+  // History cards carry no frozen stats (spec Q3) and no degradation note.
+  expect(card.querySelector(".turn-files-note")).toBeNull();
+  expect(card.querySelector(".turn-files-badge--modified")).toBeNull();
+});
+
+test("history keeps first-write order, dedupes repeats, and drops failed edits", async () => {
+  await import("./app.js?history-files-order");
+  await renderHistoryEntries(
+    historyTurn(
+      "order",
+      [
+        {
+          id: "t1",
+          name: "edit",
+          arguments: { text: "[docs/a.md]" },
+          details: { files: [{ path: "docs/a.md" }, { path: "docs/b.md" }] },
+        },
+        { id: "t2", name: "write", arguments: { path: "docs/b.md" }, details: {} },
+        {
+          id: "t3",
+          name: "edit",
+          arguments: { text: "[docs/c.md]" },
+          details: { files: [{ path: "docs/c.md" }] },
+          isError: true,
+        },
+      ],
+      "done",
+    ),
+    "history-files-order",
+  );
+
+  const rows = [...document.querySelectorAll(".turn-files-row")];
+  expect(rows.map((row) => row.dataset.path)).toEqual(["docs/a.md", "docs/b.md"]);
+});
+
+test("a successful subagent fan-out lists its changedFiles in history", async () => {
+  await import("./app.js?history-files-subagent");
+  const files = [
+    "tmp/fddw_rwe_proposal/D2-研究提案客户沟通版-v0.2.pptx",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/deck.json",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/check_deck.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/check_report.json",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/build_pptx.sh",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/gen_notes.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/qa_corr.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/qa_spill.py",
+    "tmp/fddw_rwe_proposal/deck-客户版-v0.2/tools/corr_report.json",
+  ];
+  await renderHistoryEntries(
+    historyTurn(
+      "subagent",
+      [
+        {
+          id: "sub1",
+          name: "subagent",
+          arguments: {
+            agent: "PPTX助手",
+            async: false,
+            cwd: "/Users/linyong/tmp/datarx-picot-ext",
+            task: "续做客户沟通版 v0.2",
+          },
+          details: {
+            results: [{ exitCode: 0, acceptance: { childReport: { changedFiles: files } } }],
+          },
+        },
+      ],
+      "fan-out done",
+    ),
+    "history-files-subagent",
+  );
+
+  const card = document.getElementById("messages").querySelector(".turn-files-card");
+  expect(card).not.toBeNull();
+  const rows = [...card.querySelectorAll(".turn-files-row")];
+  expect(rows.map((row) => row.dataset.path)).toEqual(files);
+  // History cards carry no frozen stats (spec Q3) and no degradation note.
+  expect(card.querySelector(".turn-files-note")).toBeNull();
+});
+
+test("history ignores a failed subagent fan-out", async () => {
+  await import("./app.js?history-files-subagent-failed");
+  await renderHistoryEntries(
+    historyTurn(
+      "subagent-failed",
+      [
+        {
+          id: "sub2",
+          name: "subagent",
+          arguments: { agent: "PPTX助手", cwd: "/ws" },
+          details: {
+            results: [{ exitCode: 1, acceptance: { childReport: { changedFiles: ["tmp/x.md"] } } }],
+          },
+          isError: true,
+        },
+      ],
+      "failed",
+    ),
+    "history-files-subagent-failed",
+  );
+
+  expect(document.getElementById("messages").querySelector(".turn-files-card")).toBeNull();
+});
