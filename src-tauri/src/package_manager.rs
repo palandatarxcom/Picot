@@ -19,7 +19,6 @@ use tokio::time::{timeout, Duration};
 const MAX_RESOURCE_FILES: usize = 10_000;
 const UPDATE_CHECK_CONCURRENCY: usize = 4;
 const UPDATE_CHECK_TIMEOUT_SECS: u64 = 10;
-const UPDATE_CHECK_AGGREGATE_TIMEOUT_SECS: u64 = 15;
 
 const RESOURCE_KINDS: [(&str, &str); 4] = [
     ("extensions", "extension"),
@@ -142,29 +141,24 @@ pub(crate) async fn check_available_updates(
 ) -> Vec<PiPackageUpdate> {
     let records = records.to_vec();
     let locations = locations.clone();
-    let result = timeout(
-        Duration::from_secs(UPDATE_CHECK_AGGREGATE_TIMEOUT_SECS),
-        stream::iter(records.into_iter().map(move |record| {
-            let locations = locations.clone();
-            async move {
-                let available = check_package_update(&record, &locations).await;
-                PiPackageUpdate {
-                    source: record.source,
-                    scope: record.scope,
-                    available,
-                }
+    // No aggregate timeout: one slow source (e.g. intranet git remotes) used to
+    // discard every finished result via an all-or-nothing batch timeout. Each
+    // check is already bounded by UPDATE_CHECK_TIMEOUT_SECS with kill_on_drop.
+    stream::iter(records.into_iter().map(move |record| {
+        let locations = locations.clone();
+        async move {
+            let available = check_package_update(&record, &locations).await;
+            PiPackageUpdate {
+                source: record.source,
+                scope: record.scope,
+                available,
             }
-        }))
-        .buffer_unordered(UPDATE_CHECK_CONCURRENCY)
-        .filter(|update| std::future::ready(update.available))
-        .collect(),
-    )
-    .await;
-    // Bound the whole batch even when many subprocesses stall: buffer_unordered caps
-    // per-subprocess time at UPDATE_CHECK_TIMEOUT_SECS, but with N packages the control
-    // would otherwise run for ceil(N/4)*10s, so a blackholed network could hang the
-    // update control well past its PACKAGE_TIMEOUT_MS. Degrade gracefully to no updates.
-    result.unwrap_or_default()
+        }
+    }))
+    .buffer_unordered(UPDATE_CHECK_CONCURRENCY)
+    .filter(|update| std::future::ready(update.available))
+    .collect()
+    .await
 }
 
 async fn check_package_update(record: &PiPackageRecord, locations: &PackageLocations) -> bool {
@@ -211,9 +205,13 @@ async fn check_package_update(record: &PiPackageRecord, locations: &PackageLocat
                 "version".to_string(),
                 "--json".to_string(),
             ]);
-            let Some(cwd) = locations.project_root.as_deref() else {
-                return false;
-            };
+            // `npm view` needs only a valid working directory; landing (no
+            // workspace binding) has no project root, so fall back to the
+            // global agent dir instead of skipping the check entirely.
+            let cwd = locations
+                .project_root
+                .as_deref()
+                .unwrap_or(locations.global_agent_dir.as_path());
             let Ok(output) = run_update_command(&executable, &args, cwd).await else {
                 return false;
             };
@@ -1342,9 +1340,10 @@ fn atomic_write_settings(path: &Path, settings: &Map<String, Value>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_package_update, inspect_configured_packages, inspect_pi_list_output,
-        latest_npm_version, npm_package_spec, parse_ls_remote_reference, set_package_disabled,
-        PackageLocations, PiPackageCounts, PiPackageRecord, PiPackageResourceKind, PiPackageScope,
+        check_available_updates, check_package_update, inspect_configured_packages,
+        inspect_pi_list_output, latest_npm_version, npm_package_spec, parse_ls_remote_reference,
+        set_package_disabled, PackageLocations, PiPackageCounts, PiPackageRecord,
+        PiPackageResourceKind, PiPackageScope,
     };
     use serde_json::json;
     use std::fs;
@@ -2051,6 +2050,82 @@ mod tests {
         assert!(!runtime.block_on(check_package_update(&record, &paths)));
     }
 
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git should launch");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn check_available_updates_reports_git_package_behind_upstream() {
+        let root = tempdir().unwrap();
+        let seed = root.path().join("seed");
+        let bare = root.path().join("origin.git");
+        let installed = root.path().join("installed");
+
+        run_git(
+            root.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        run_git(root.path(), &["init", "-b", "main", seed.to_str().unwrap()]);
+        fs::write(seed.join("README.md"), "one").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(
+            &seed,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "one",
+            ],
+        );
+        run_git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run_git(&seed, &["push", "origin", "main"]);
+        run_git(
+            root.path(),
+            &["clone", bare.to_str().unwrap(), installed.to_str().unwrap()],
+        );
+
+        // A second upstream commit leaves the installed clone behind.
+        fs::write(seed.join("README.md"), "two").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(
+            &seed,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "two",
+            ],
+        );
+        run_git(&seed, &["push", "origin", "main"]);
+
+        let paths = locations(root.path());
+        let record = npm_record(
+            "git:ssh://git@example.test/palan/test-repo.git",
+            Some(installed.to_str().unwrap()),
+            None,
+        );
+        let updates = check_available_updates(&[record], &paths).await;
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].available);
+    }
+
     #[test]
     fn parse_ls_remote_selects_only_matching_reference_heads() {
         let sha = "0123456789abcdef0123456789abcdef01234567"; // 40 hex chars
@@ -2072,5 +2147,31 @@ mod tests {
             Some(sha.to_string())
         );
         assert_eq!(parse_ls_remote_reference(""), None);
+    }
+
+    // Landing has no workspace binding, so locations carry no project root;
+    // the npm update check must still run against the global agent dir.
+    // Probes the real registry; skipped when the suite runs PI_OFFLINE.
+    #[tokio::test]
+    async fn check_available_updates_checks_npm_without_project_root() {
+        if std::env::var("PI_OFFLINE").is_ok() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let paths = PackageLocations {
+            global_settings: root.path().join("agent/settings.json"),
+            project_settings: None,
+            global_agent_dir: root.path().join("agent"),
+            project_root: None,
+        };
+        fs::create_dir_all(&paths.global_agent_dir).unwrap();
+        // installed_path is only consulted by the git branch; the npm branch
+        // compares record.version against the registry.
+        let record = npm_record("npm:pi-lens", Some("/tmp"), Some("0.0.1"));
+        let available = check_package_update(&record, &paths).await;
+        assert!(
+            available,
+            "npm update check must run without a project root"
+        );
     }
 }

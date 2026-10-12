@@ -313,6 +313,11 @@ wsClient.addEventListener("hostCapabilities", () => {
   // that capabilities are real — same fix class as loadLandingPiVersion,
   // and the same shape app.js already uses for its own updater init.
   void updater.initUpdaterUI();
+  // The extension update pill never ran at landing: nothing called refresh()
+  // after the handshake, so the sidebar button stayed hidden until the user
+  // manually opened Settings > Extensions. Same shape as app.js's startup
+  // check, which gates on native capability and throttles rechecks.
+  void extensionUpdateIndicator?.refresh();
 });
 // App-global registry changed in another window — stay in sync. The
 // initiating window is already navigating when it launched the change.
@@ -1192,7 +1197,7 @@ setupExtensionsTabShell({
   },
 });
 
-setupExtensionUpdateIndicator({
+const extensionUpdateIndicator = setupExtensionUpdateIndicator({
   transport,
   nativeAvailable: () => transport.capabilities.native,
   t,
