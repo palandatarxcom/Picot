@@ -66,8 +66,6 @@ fn native_runtime_enabled(app) -> bool {
 | `/v2/mobile/status` | HTTP GET | device token（Bearer） | 配对设备只读状态（v1 仅 liveness） |
 | `/pair.html` | HTTP GET | 无（pairing 前唯一 surface） | 手机配对页 |
 
-会话 HTML 导出：`session_export` 经 `host_request` 签发一次性令牌（只返回 URL）；`save_session_export` 由 Rust 在宿主进程内用 `host_origin` + 严格校验的 32 位 hex 令牌拉取字节，再弹出原生另存为对话框（默认目录为工作区根）。取消则不写文件。字节不经 WebSocket 与 `host_request`（256 KiB 上限），因此导出体积不受该上限限制。
-
 ### 兼容路由的唯一实现规则
 
 `/api/*` 兼容条目是**冻结集合**：只允许继续服务已在 host 内实现的路由，不再新增 handler。
@@ -470,6 +468,23 @@ agent 的 exit code 与自然语言都不是成功依据：进程退出后 host 
 - **入口分工**：office 文件点击 → anydoc markdown 预览（快、零依赖）→「内置浏览器打开」按钮 → `officecli_watch_start` → browser tab（保真 + 标注 + agent 闭环）。无 officecli 时按钮报 `officecli_missing` toast。
 - **不做（一期）**：元素截图、普通网页徽标 overlay、历史/书签、agent 反向自动化（Paseo 22 命令，三期）。
 
+## 会话 HTML 导出
+
+composer 工具箱「导出 HTML」的数据流：
+
+1. WebView `transport.saveSessionExport` 经 `host_request` 调 `session_export`，宿主为当前会话签发一次性令牌并只返回 `exportUrl`（`/v2/session-export/{token}`）。
+2. WebView 再经 `host_request` 调 `save_session_export`，参数仅含 `exportUrl`、`fileName`、`initialDir`，不含文件内容。
+3. Rust（`main.rs`）用 `session_export_fetch_url` 严格校验：只接受该路径前缀加 32 位 hex 令牌，并在宿主自身的 `host_origin` 上重建 URL，拒绝其他 origin、路径与查询串。
+4. Rust 经 `reqwest`（`no_proxy`）GET 该 URL 取得字节，令牌在此一次性兑换。
+5. Rust 弹出原生「另存为」对话框，默认目录为工作区根，文件名 `<sessionId>.html`，写入用户选择的路径并返回路径。取消则返回 `null`，不写文件。
+
+约束：
+
+- 字节只在宿主进程内流动，不经 WebSocket 与 `host_request`（`HOST_REQUEST_BYTES` 为 256 KiB，典型会话 HTML 远超此值）。
+- 令牌在拉取时已兑换；对话框取消后令牌已失效，需重新导出。
+- 令牌受 generation 失效约束（见安全边界第 4 条）。
+- 写入路径由用户在原生对话框中选定，不受注册根约束（见安全边界第 3 条的例外）。
+
 ## 兼容路由（P8 删除候选）
 
 `/api/*` compatibility routes maintain existing shell behavior on host origin. Each route uses owner capability authorization. Runtime traffic must use `/v2/*` and `/v2/ws`; retained HTTP routes are explicit compatibility or retirement responses, never Pi-origin forwarding.
@@ -482,7 +497,7 @@ agent 的 exit code 与自然语言都不是成功依据：进程退出后 host 
 
 1. **Loopback 默认**：HostServer 默认只绑 loopback；`mobile.lanAccessEnabled` 显式开启后才绑全部网卡（D4 移动接入；缺省一律 loopback，配对 token 仅桌面端可铸造）
 2. **Owner capability**：每个桌面窗口持唯一 32 字节随机 capability
-3. **Workspace containment**：所有文件读写限制在注册根目录内；`file_create`/`file_rename`/`file_delete` 同样只在注册根内生效，且受 owner+workspace+generation 门禁；`file_mentions` 的列举按上表根分级可越出（仅 desktop，读写不受影响）
+3. **Workspace containment**：所有文件读写限制在注册根目录内（会话 HTML 导出例外：写入路径由用户在原生另存为对话框中选定，见「会话 HTML 导出」）；`file_create`/`file_rename`/`file_delete` 同样只在注册根内生效，且受 owner+workspace+generation 门禁；`file_mentions` 的列举按上表根分级可越出（仅 desktop，读写不受影响）
 4. **Generation 失效**：workspace transition 使旧代授权、操作与导出令牌全部失效；旧代 runtime 进程保留存活但不可达（授权闸门拒收），至窗口销毁/owner 撤销/app 退出、显式 restart（`restart_runtime` 控制面命令，Registered owner 经 Settings 触发）或返回 rebind
 5. **跨 workspace 事件可见性**（2026-09-20 拍板）：持有 desktop capability 的本机窗口可订阅任意 live runtime 的全部非阻塞事件（消息正文、tool 输出、widget、notify）；阻塞式 `extension_ui_request`（select/confirm/input/editor）仍只投 `authorize_target` 通过的订阅者。desktop capability 只由原生窗口 owner registry 铸发，LAN 配对设备（Browser 类客户端）拿不到。
 6. **匿名遥测**：仅 allowlisted 粗粒度字段，无 per-user/per-token 维度
