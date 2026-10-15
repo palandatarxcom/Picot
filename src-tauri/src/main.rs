@@ -20,17 +20,12 @@ use daemon_client::navigation_mirror::NavigationMirror;
 use daemon_client::surface_ops::ForwardedSurfaceOps;
 use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::daemon::DaemonState;
-use picot_host::{child_supervision, git_service, officecli_watch, window_owner};
+use picot_host::{child_supervision, officecli_watch, window_owner};
 
-use picot_host::ephemeral_registry::EphemeralRegistry;
 use picot_host::host_control::ProgressSink;
 use picot_host::host_server::HostServer;
 use picot_host::native_pi_manager::NativePiManager;
 use picot_host::runtime_coordinator::RuntimeTarget;
-use picot_host::skill_source_registry::SkillSourceRegistry;
-use picot_host::temp_resources::{canonical_temp_root, cleanup_quick_chat_dir};
-use picot_host::terminal_manager::TerminalManager;
-use picot_host::window_owner::WindowOwnerRegistry;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -43,12 +38,6 @@ use tauri_plugin_window_state::StateFlags;
 
 type HostServerState = Arc<HostServer>;
 type NativePiManagerState = NativePiManager;
-#[allow(dead_code)]
-type OwnerRegistryState = Arc<WindowOwnerRegistry>;
-type SkillSourceRegistryState = Arc<SkillSourceRegistry>;
-type TerminalManagerState = Arc<TerminalManager>;
-#[allow(dead_code)]
-type EphemeralRegistryState = Arc<EphemeralRegistry>;
 
 // ─── Tauri Commands ───────────────────────────────────────────────────────────
 
@@ -512,12 +501,14 @@ mod tests {
     // The host-side helpers moved into `picot-host` with the dispatcher
     // (Task 2 Step 2); their tests stayed here.
     use picot_host::host_control_dispatch::{
-        cancel_should_stop_target, filter_session_delete_paths, find_existing_runtime_for_prepare,
-        persisted_session_id_for_workspace, quick_chat_snapshot, runtime_instance_summaries,
-        runtime_started_event, should_stop_owner_runtimes_on_transition, skill_scope_context,
+        cancel_should_stop_target, filter_session_delete_paths, persisted_session_id_for_workspace,
+        plan_prepare_reuse, quick_chat_snapshot, runtime_instance_summaries, runtime_started_event,
+        should_stop_owner_runtimes_on_transition, skill_scope_context,
         target_for_owner_in_workspace, touch_registered_workspace, workspace_snapshot_for,
+        PrepareReuse,
     };
     use picot_host::metadata_store::{MetadataStore, SharedMetadataStore};
+    use picot_host::window_owner::WindowOwnerRegistry;
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -693,6 +684,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_reuses_live_runtime_for_matching_persisted_session() {
         let manager = picot_host::native_pi_manager::NativePiManager::new(8);
+        let registry = WindowOwnerRegistry::default();
         let target = picot_host::runtime_coordinator::RuntimeTarget::with_owner(
             "workspace-a",
             "saved",
@@ -703,23 +695,27 @@ mod tests {
         manager.register_in_memory(target.clone()).unwrap();
 
         assert_eq!(
-            find_existing_runtime_for_prepare(
+            plan_prepare_reuse(
                 &manager,
+                &registry,
                 "workspace-a",
                 "owner-a",
                 Some("saved"),
                 false,
             ),
-            Some(target),
+            PrepareReuse::Rebind(target),
         );
-        assert!(find_existing_runtime_for_prepare(
-            &manager,
-            "workspace-a",
-            "owner-a",
-            Some("saved"),
-            true,
-        )
-        .is_none());
+        assert_eq!(
+            plan_prepare_reuse(
+                &manager,
+                &registry,
+                "workspace-a",
+                "owner-a",
+                Some("saved"),
+                true,
+            ),
+            PrepareReuse::Spawn,
+        );
     }
 
     #[test]
@@ -1144,14 +1140,15 @@ mod tests {
         // A cross-workspace commit must not stop A. While B is current,
         // authorize_target denies this old target; returning to A adopts it.
         assert_eq!(
-            find_existing_runtime_for_prepare(
+            plan_prepare_reuse(
                 &manager,
+                &WindowOwnerRegistry::default(),
                 "workspace-a",
                 "owner-a",
                 Some("saved-session"),
                 false,
             ),
-            Some(prior.clone()),
+            PrepareReuse::Rebind(prior.clone()),
         );
         assert!(manager.rebind_owner_generation("owner-a", "saved-session", 3));
         assert_eq!(
@@ -1687,13 +1684,6 @@ async fn start_embedded_daemon(
 /// reaches them there through `DaemonState`.
 fn register_embedded_state(app: &tauri::App, state: &Arc<DaemonState>) {
     let host = state.host.clone();
-    app.manage(state.skill_sources.clone());
-    app.manage(state.git.clone());
-    app.manage(state.terminals.clone());
-    // No `EnvironmentInstaller` registration: its only reader was the app's exit
-    // path, and the embedded daemon's drain now stops the installer itself
-    // (`DaemonState::drain_runtimes`). A managed copy with no reader is exactly
-    // the dead state this move is supposed to delete.
     // Browser panes (spec 2026-09-22): child webviews keyed by tab id. The
     // runtime needs the app handle, so it is constructed here and registered
     // with the host through the `PaneSurface` slot (plan D1/Step-3 exceptions).
@@ -1706,10 +1696,13 @@ fn register_embedded_state(app: &tauri::App, state: &Arc<DaemonState>) {
     app.manage(officecli_watch::OfficecliWatchState(
         state.officecli_watches.clone(),
     ));
+    // Window-destroyed teardown no longer reads host state through the app
+    // handle (T7): the window sends one `owner.detach` over the admin channel,
+    // so the owner registry, the runtimes, the ephemeral registry, the
+    // terminals, git and the skill sources have exactly one reader — the
+    // daemon. The runtime manager stays managed for the signal teardown below.
     app.manage(state.runtimes.clone());
     app.manage(host);
-    app.manage(state.owner_registry.clone());
-    app.manage(state.ephemeral_registry.clone());
 }
 
 /// Boot the app around its daemon (plan Task 5 Step 3).
@@ -2027,56 +2020,51 @@ fn handle_close_requested(window: &tauri::Window, api: &tauri::CloseRequestApi) 
         });
 }
 
-/// Final idempotent cleanup when a native window is destroyed: kill the
-/// owner's runtime, run generation-checked ephemeral cleanup, drop any pending
-/// close, and revoke the owner. Keyed on the owner registry record — never the
-/// window label — so a landing window that transitioned into a workspace gets
-/// the same cleanup as a workspace window despite its immutable label.
+/// Final idempotent cleanup when a native window is destroyed: drop the
+/// app-local pane state for the label, then ask the daemon to **detach** the
+/// window's owner (plan D6/T7).
+///
+/// Detach is not a teardown of the Pi runtimes: the daemon revokes the owner's
+/// capability (freeing the label), stops its owner-scoped ephemeral processes
+/// for real, and releases its terminals/git/skills — while every resident
+/// workspace/session runtime keeps running, so a reopened window (or a relaunch)
+/// reattaches to the same Pi process.
+///
+/// The op travels the admin channel in **both** modes: closed windows are not
+/// an in-process shortcut (plan D2), and the app must not reach into host state
+/// it no longer owns (T7 removed those managed copies).
 fn handle_window_destroyed(window: &tauri::Window) {
     let label = window.label();
     // Browser panes die with their window; drop the manager's stale entries
-    // so labels can be reused without collisions.
+    // so labels can be reused without collisions. App-local by construction
+    // (D1/Step-3 exceptions).
     if let Some(panes) = window.try_state::<browser_pane::BrowserPaneState>() {
         panes.0.destroy_all_for_window(label);
     }
-    let Some(registry) = window.try_state::<OwnerRegistryState>() else {
+    let Some(link) = window.app_handle().try_state::<DaemonLink>() else {
         return;
     };
-    let registry = registry.inner().clone();
-    let Some(owner) = registry.owner_for_label(label) else {
+    // The daemon owns the label↔owner registry; the app's copy is the
+    // daemon-fed mirror (D4), so a label with no owner is simply nothing to do.
+    let Some(owner) = link.mirror.owner_for_label(label) else {
         return;
     };
-    if let Some(manager) = window.try_state::<NativePiManagerState>() {
-        // Unconditional: a no-op when no runtime was ever spawned (landing
-        // pre-transition), and what kills the Pi subprocess of a landing
-        // window that already transitioned into a workspace.
-        manager.stop_for_owner(owner.as_str());
-        if let Some(workspace_id) = registry.owner_current_workspace(&owner).workspace_id() {
-            let workspace_id = workspace_id.clone();
-            manager.stop_for_window_destroy(&workspace_id);
+    // The pending-close map is app-local (D4): drop it here, or a destroyed
+    // window's entry outlives its window forever.
+    let owner_id = window_owner::OwnerId::from_string(owner.clone());
+    close_approvals().lock().unwrap().remove(&owner_id);
+    let client = Arc::clone(&link.client);
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = client
+            .request("owner.detach", serde_json::json!({ "owner": owner }))
+            .await
+        {
+            // A dropped admin channel (daemon gone) is the one case the
+            // dead-attachment cleanup already covers; anything else is worth
+            // a log line because it would leak a capability until restart.
+            log::warn!("[picot] window detach failed for owner {owner}: {error}");
         }
-    }
-    if let Some(ephemeral) = window.try_state::<EphemeralRegistryState>() {
-        for lease in ephemeral.owner_cleanup(&owner) {
-            // Native ephemeral runtimes were already stopped by the native
-            // branch's stop_for_owner.
-            if let Some((path, token)) = &lease.temporary_directory {
-                let _ = cleanup_quick_chat_dir(&canonical_temp_root(), path, token);
-            }
-            ephemeral.finish_cleanup(&lease);
-        }
-    }
-    if let Some(terminal_manager) = window.try_state::<TerminalManagerState>() {
-        terminal_manager.kill_owner(&owner);
-    }
-    if let Some(git_service) = window.try_state::<Arc<git_service::GitService>>() {
-        git_service.inner().clear_owner(owner.as_str());
-    }
-    close_approvals().lock().unwrap().remove(&owner);
-    if let Some(skill_sources) = window.try_state::<SkillSourceRegistryState>() {
-        skill_sources.revoke_owner(&owner);
-    }
-    registry.revoke_owner(&owner);
+    });
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -2436,6 +2424,7 @@ fn install_termination_handlers(_app_handle: tauri::AppHandle) {}
 mod skill_source_scope_tests {
     use super::*;
     use picot_host::host_control_dispatch::skill_source_scope;
+    use picot_host::window_owner::WindowOwnerRegistry;
 
     fn owner_registry() -> (WindowOwnerRegistry, PathBuf) {
         let home = std::env::temp_dir().join(format!(

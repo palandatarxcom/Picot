@@ -350,6 +350,26 @@ impl RuntimeCoordinator {
         Ok(record.target.clone())
     }
 
+    /// Re-stamp one registered runtime's owner **and** workspace generation
+    /// (plan D11/B1 reattach): a resident runtime whose previous owner the app
+    /// relinquished (a destroyed window, or a dead attachment) is handed to the
+    /// owner reattaching to it. Same dual bookkeeping as
+    /// [`Self::rebind_generation`] — the coordinator record is the truth and the
+    /// runtimes map is mirrored from it — so an interrupted rebind can never
+    /// leave the two disagreeing.
+    pub fn rebind_owner(
+        &mut self,
+        target: &RuntimeTarget,
+        owner_id: &str,
+        generation: u64,
+    ) -> Result<RuntimeTarget, CoordinatorError> {
+        self.validate(target)?;
+        let record = self.instances.get_mut(&target.instance_id).unwrap();
+        record.target.owner_id = Some(owner_id.to_string());
+        record.target.workspace_generation = generation;
+        Ok(record.target.clone())
+    }
+
     pub fn unregister(&mut self, target: &RuntimeTarget) -> Result<(), CoordinatorError> {
         self.validate(target)?;
         self.instances.remove(&target.instance_id);

@@ -957,7 +957,7 @@ impl AdminInner {
                 state.owner_registry.set_attachment_epoch(0);
                 let owners = state.owner_registry.revoke_attachment(epoch);
                 for owner in &owners {
-                    state.detach_owner_scoped_cleanup(owner);
+                    state.release_owner_scoped_state(owner);
                 }
                 owners
             }
@@ -1096,11 +1096,12 @@ async fn run_op_inner(
         "owner.detach" => {
             require_lease(inner, conn_id)?;
             let owner = OwnerId::from_string(arg_str(&args, "owner")?);
-            state.owner_registry.revoke_owner(&owner);
-            // Owner-scoped cleanup only: resident workspace runtimes stay
-            // resident (plan D6/D11). T7 completes the detach path (temp dirs,
-            // close approvals, ephemeral *process* stop).
-            state.detach_owner_scoped_cleanup(&owner);
+            // One owner-scoped teardown path (plan D6/D11/R5): capability and
+            // record revoked, owner-scoped ephemeral processes stopped for real,
+            // terminals/git/skills released — and **no** resident
+            // workspace/session runtime stopped, so a reopened window can
+            // reattach to it (T7).
+            state.detach_owner(&owner);
             Ok(json!({ "detached": owner.as_str() }))
         }
         other => Err(format!("unknown admin op {other}")),

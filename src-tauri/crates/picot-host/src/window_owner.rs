@@ -36,6 +36,20 @@ pub enum TemporaryKind {
     Landing,
 }
 
+/// Why an owner record is gone (plan D11/T7). Retained after revocation —
+/// together with the fact that the owner is no longer live — so the
+/// session-prepare path can decide *atomically* whether a resident runtime may
+/// be reattached to a new owner: a runtime claimed by a live attachment is
+/// never stolen, while a runtime whose owner the app's own lifecycle
+/// relinquished (a destroyed window, or a dead app attachment) may be.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerRevocation {
+    /// `owner.detach`: the window was destroyed while its app stayed alive.
+    Detached,
+    /// The manager attachment died (app quit, crash, SIGKILL).
+    AttachmentDead,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum OwnerWorkspaceSnapshot {
@@ -158,6 +172,14 @@ struct RegistryState {
     attachment_epoch: u64,
     /// Owner-mirror event sink, when a manager is attached.
     mirror_sink: Option<OwnerMirrorSink>,
+    /// Lifecycle reason for every revoked owner (plan D11/T7). The record
+    /// itself is deleted on revoke — the capability index and the label must
+    /// die with it — so this is the only surviving evidence that an owner
+    /// *existed* and how it went away. Bounded by the number of window/owner
+    /// terminations in one daemon lifetime (one small entry each); pruning it
+    /// would make an old runtime unreachable-but-unrebindable, which is the
+    /// failure mode this map exists to prevent.
+    revoked: HashMap<OwnerId, OwnerRevocation>,
 }
 
 struct OwnerRecord {
@@ -810,6 +832,9 @@ impl WindowOwnerRegistry {
             .collect();
         let mut events = Vec::new();
         for owner in &revoked {
+            state
+                .revoked
+                .insert(owner.clone(), OwnerRevocation::AttachmentDead);
             if let Some(record) = state.owners.remove(owner) {
                 state.capability_index.remove(&record.capability_bytes);
                 if let Some(pending) = record.pending {
@@ -866,8 +891,35 @@ impl WindowOwnerRegistry {
         })
     }
 
+    /// Revoke one owner because its window was destroyed while the app stayed
+    /// alive (the `owner.detach` op, plan D6). Removes the record (capability
+    /// and label die with it) and *remembers* the owner as deliberately
+    /// detached, so a later session-prepare may reattach its resident runtime.
+    pub fn detach_owner(&self, owner: &OwnerId) {
+        self.revoke_owner_with_reason(owner, OwnerRevocation::Detached);
+    }
+
+    /// Whether `owner` may be reattached: it is no longer live (its record and
+    /// capability are gone) and it went away through the app's own lifecycle.
+    /// A live owner is never reattachable (plan D11).
+    pub fn owner_is_reattachable(&self, owner: &OwnerId) -> bool {
+        let state = self.inner.lock().expect("owner registry lock poisoned");
+        !state.owners.contains_key(owner) && state.revoked.contains_key(owner)
+    }
+
+    /// Retained revocation reason, for diagnostics and tests.
+    pub fn revocation_of(&self, owner: &OwnerId) -> Option<OwnerRevocation> {
+        let state = self.inner.lock().expect("owner registry lock poisoned");
+        state.revoked.get(owner).copied()
+    }
+
     pub fn revoke_owner(&self, owner: &OwnerId) {
+        self.revoke_owner_with_reason(owner, OwnerRevocation::Detached);
+    }
+
+    fn revoke_owner_with_reason(&self, owner: &OwnerId, reason: OwnerRevocation) {
         let mut state = self.inner.lock().expect("owner registry lock poisoned");
+        state.revoked.entry(owner.clone()).or_insert(reason);
         let mut events = Vec::new();
         if let Some(record) = state.owners.remove(owner) {
             state.capability_index.remove(&record.capability_bytes);

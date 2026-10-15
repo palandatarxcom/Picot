@@ -246,10 +246,9 @@ impl DaemonState {
         let runtimes = NativePiManager::new(256);
         let remote_auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&shared_metadata))));
         let ephemeral_registry = Arc::new(EphemeralRegistry::default());
-        runtimes.set_ephemeral_registry(ephemeral_registry.clone());
-        // Keep one native host-control authority. Host-origin v2 dispatch
-        // invokes this same handler; it must not grow a parallel OS-control
-        // implementation.
+        runtimes.set_ephemeral_registry(ephemeral_registry.clone()); // Keep one native host-control authority. Host-origin v2 dispatch
+                                                                     // invokes this same handler; it must not grow a parallel OS-control
+                                                                     // implementation.
         let skill_sources = Arc::new(SkillSourceRegistry::new());
         let git = Arc::new(GitService::new());
         let terminals = Arc::new(TerminalManager::new(
@@ -278,6 +277,10 @@ impl DaemonState {
         host.set_git_service(git.clone());
         let owner_registry = Arc::new(WindowOwnerRegistry::default());
         host.set_owner_registry(owner_registry.clone());
+        // The reattach decision (plan D11/T7) belongs to the owner registry; the
+        // runtime manager asks it rather than keeping a second copy of "is this
+        // owner live?".
+        runtimes.set_owner_registry(owner_registry.clone());
         // The officecli watch subprocess pool the browser panes render from
         // (the panes themselves are the app's; see the Step-3 exception list).
         let officecli_watches = Arc::new(OfficecliWatchRuntime::new());
@@ -437,15 +440,25 @@ impl DaemonState {
         }
     }
 
-    /// Owner-scoped detach cleanup (plan D6/D11): capabilities are already
-    /// revoked by the registry, and **no resident workspace runtime is
-    /// stopped** — only owner-scoped process/state is released.
+    /// Detach one owner (plan D6/D11): its capability and owner record are
+    /// revoked, its owner-scoped ephemeral runtimes are **stopped for real**
+    /// (R5 — process group killed and reaped, then lease and temporary
+    /// directory finalized), and its remaining owner-scoped state is released.
     ///
-    /// T7 completes this path: temp-dir cleanup, close-approval drops and the
-    /// ephemeral *process* stop (R5) arrive with `detach_owner`; the app-side
-    /// approval map is unreachable from here by design (D4).
-    pub fn detach_owner_scoped_cleanup(&self, owner: &OwnerId) {
-        let _ = self.ephemeral_registry.owner_cleanup(owner);
+    /// **No resident workspace/session runtime is stopped**: that is the whole
+    /// point of the window-close semantics — a closed window leaves its Pi
+    /// running so a later prepare can reattach to it. Stopping a workspace on
+    /// purpose is the separate `workspace_close` op.
+    pub fn detach_owner(&self, owner: &OwnerId) {
+        self.owner_registry.detach_owner(owner);
+        self.release_owner_scoped_state(owner);
+    }
+
+    /// The owner-scoped half of a detach, for callers whose registry revocation
+    /// happened as a set ([`WindowOwnerRegistry::revoke_attachment`] for a dead
+    /// attachment): ephemeral processes, terminals, git state, skills.
+    pub fn release_owner_scoped_state(&self, owner: &OwnerId) {
+        self.runtimes.stop_owner_ephemeral(owner.as_str());
         self.terminals.kill_owner(owner);
         self.git.clear_owner(owner.as_str());
         self.skill_sources.revoke_owner(owner);

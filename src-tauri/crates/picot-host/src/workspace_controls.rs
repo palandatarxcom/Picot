@@ -5,6 +5,7 @@
 
 use crate::host_control::{ClientClass, VerifiedClientContext};
 use crate::metadata_store::SharedMetadataStore;
+use crate::native_pi_manager::NativePiManager;
 use serde_json::{json, Value};
 
 /// Stable rejection text for Remote/unauthenticated callers. The frontend
@@ -150,6 +151,36 @@ pub fn handle_control(
         }
         other => Err(format!("Unknown control command: {other}")),
     }
+}
+
+/// `workspace_close {workspaceId}` (plan T7, Dr. Lin decision 2): stop one
+/// workspace's runtime on purpose. Gated like `workspace.remove` — a verified
+/// native owner, and a *registered* workspace id (an unknown id must not become
+/// a way to stop a runtime the caller cannot name).
+///
+/// Deliberately separate from [`handle_control`]: stopping a workspace needs the
+/// runtime manager, while the registry/preference commands are metadata-only.
+/// The registry row survives — on purpose. Un-registering is `workspace.remove`,
+/// which keeps its list-removal-only semantics (row gone, agent keeps running).
+pub fn handle_workspace_close(
+    args: &Value,
+    metadata: &SharedMetadataStore,
+    runtimes: &NativePiManager,
+) -> Result<Value, String> {
+    let workspace_id = arg_str(args, "workspaceId")?;
+    let registered = metadata
+        .lock()
+        .map_err(|_| "Picot metadata lock poisoned".to_string())?
+        .get_workspace(&workspace_id)?
+        .is_some();
+    if !registered {
+        return Err("workspace_not_found".to_string());
+    }
+    // The stop itself reaps each child and drops its child-registry entry
+    // (`NativePiManager::stop` → `child_supervision::forget_runtime`), so no
+    // separate bookkeeping is left behind here.
+    runtimes.stop_workspace(&workspace_id);
+    Ok(json!({ "stopped": true, "workspaceId": workspace_id }))
 }
 
 #[cfg(test)]

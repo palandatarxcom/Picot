@@ -224,6 +224,9 @@ struct NativePiManagerInner {
     cleanup_trace: Mutex<Vec<(String, NativeCleanupStage)>>,
     revoked_owners: Mutex<HashMap<String, u64>>,
     ephemeral_registry: Mutex<Option<Arc<EphemeralRegistry>>>,
+    /// Owner lifecycle authority for reattach decisions (plan D11/T7). Set at
+    /// boot like the ephemeral registry; a rebind without it fails closed.
+    owner_registry: Mutex<Option<Arc<crate::window_owner::WindowOwnerRegistry>>>,
     owners: Mutex<std::collections::HashSet<String>>,
     secret_generations: Mutex<HashMap<String, u64>>,
 }
@@ -357,6 +360,7 @@ impl NativePiManager {
                 cleanup_trace: Mutex::new(Vec::new()),
                 revoked_owners: Mutex::new(HashMap::new()),
                 ephemeral_registry: Mutex::new(None),
+                owner_registry: Mutex::new(None),
                 owners: Mutex::new(std::collections::HashSet::new()),
                 secret_generations: Mutex::new(HashMap::new()),
             }),
@@ -1191,6 +1195,17 @@ impl NativePiManager {
         }
     }
 
+    /// The owner registry this manager asks whether a runtime's current owner
+    /// may be reattached (plan D11/T7). Installed once at boot, like the
+    /// ephemeral registry: "is this owner still live?" is the registry's
+    /// question, and a second copy of the answer here is exactly the drift the
+    /// plan forbids.
+    pub fn set_owner_registry(&self, registry: Arc<crate::window_owner::WindowOwnerRegistry>) {
+        if let Ok(mut current) = self.inner.owner_registry.lock() {
+            *current = Some(registry);
+        }
+    }
+
     /// Create a native ephemeral chat (Side/Quick) through the shared
     /// `EphemeralRegistry` — the single lifecycle authority (decision:
     /// reuse, Dr. Lin 2026-08-30). The registry mints instance identity and
@@ -1350,10 +1365,104 @@ impl NativePiManager {
         if let Ok(mut secrets) = self.inner.secret_generations.lock() {
             secrets.remove(owner_id);
         }
-        self.cleanup_ephemeral_owner(owner_id);
+        self.stop_owner_ephemeral(owner_id);
     }
 
-    fn cleanup_ephemeral_owner(&self, owner_id: &str) {
+    /// Rebind one resident runtime to a new owner and generation (plan D11/B1).
+    ///
+    /// This is the reattach counterpart of [`Self::rebind_owner_generation`]:
+    /// the app reclaimed the runtime after its previous owner was relinquished
+    /// (a destroyed window, or a dead attachment), so both the owner stamp and
+    /// the generation move — atomically, with the coordinator record as the
+    /// truth and the runtimes map mirrored from it.
+    ///
+    /// Refuses unless the runtime is currently owned by `from_owner` **and**
+    /// that owner is reattachable per the owner registry: a live attachment's
+    /// runtime is never stolen. The registry decides, so this check cannot
+    /// drift from the capability/label truth; with no registry installed the
+    /// refusal is total (fail closed).
+    pub fn rebind_runtime_owner(
+        &self,
+        from_owner: &str,
+        to_owner: &str,
+        workspace_id: &str,
+        session_id: &str,
+        generation: u64,
+    ) -> bool {
+        let Some(registry) = self
+            .inner
+            .owner_registry
+            .lock()
+            .ok()
+            .and_then(|registry| registry.clone())
+        else {
+            return false;
+        };
+        if !registry.owner_is_reattachable(&crate::window_owner::OwnerId::from_string(
+            from_owner.to_string(),
+        )) {
+            return false;
+        }
+        let current = {
+            let Ok(runtimes) = self.inner.runtimes.lock() else {
+                return false;
+            };
+            let Some(found) = runtimes.values().find(|runtime| {
+                let Ok(target) = runtime.target.lock() else {
+                    return false;
+                };
+                target.workspace_id == workspace_id
+                    && target.session_id == session_id
+                    && target.owner_id.as_deref() == Some(from_owner)
+            }) else {
+                return false;
+            };
+            let Ok(target) = found.target.lock() else {
+                return false;
+            };
+            target.clone()
+        };
+        // Coordinator record first (identity-validated), then mirror into the
+        // runtimes map — the same dual bookkeeping as bind_session_id.
+        let formal = {
+            let Ok(mut coordinator) = self.inner.coordinator.lock() else {
+                return false;
+            };
+            match coordinator.rebind_owner(&current, to_owner, generation) {
+                Ok(formal) => formal,
+                Err(_) => return false,
+            }
+        };
+        let Ok(mut runtimes) = self.inner.runtimes.lock() else {
+            return false;
+        };
+        if let Some(runtime) = runtimes.get_mut(&current.instance_id) {
+            if let Ok(mut target) = runtime.target.lock() {
+                *target = formal.clone();
+            }
+        }
+        // The reattaching owner now holds this runtime's secret generation,
+        // exactly as a spawn would have recorded it.
+        if let Ok(mut secrets) = self.inner.secret_generations.lock() {
+            secrets.insert(to_owner.to_string(), generation);
+        }
+        if let Ok(mut owners) = self.inner.owners.lock() {
+            owners.insert(to_owner.to_string());
+        }
+        true
+    }
+
+    /// Owner-scoped ephemeral teardown (plan T7/R5): every ephemeral runtime
+    /// this owner still holds is **stopped for real** (process group killed and
+    /// reaped) before its lease is finalized and its temporary directory is
+    /// cleaned up.
+    ///
+    /// Resident workspace/session runtimes are deliberately left alone: this is
+    /// the process half of `detach_owner`, not a window-destroy sweep. Leases
+    /// that name no live runtime (already stopped, or a request-only record)
+    /// still get their lease and temp dir finalized, which is why the stop
+    /// outcome is not a precondition for the cleanup below.
+    pub fn stop_owner_ephemeral(&self, owner_id: &str) {
         let Some(registry) = self
             .inner
             .ephemeral_registry
@@ -1364,7 +1473,11 @@ impl NativePiManager {
             return;
         };
         let owner = crate::window_owner::OwnerId::from_string(owner_id.to_string());
-        for lease in registry.owner_cleanup(&owner) {
+        let leases = registry.owner_cleanup(&owner);
+        for lease in leases {
+            if let Some(target) = self.target_for_instance_id(&lease.instance_id) {
+                let _ = self.stop(&target);
+            }
             if let Some((path, token)) = lease.temporary_directory.as_ref() {
                 let _ = cleanup_quick_chat_dir(&canonical_temp_root(), path, token);
             }
@@ -1483,7 +1596,7 @@ impl NativePiManager {
             .map(|owners| owners.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         for owner in owners {
-            self.cleanup_ephemeral_owner(&owner);
+            self.stop_owner_ephemeral(&owner);
         }
     }
 
@@ -1552,6 +1665,17 @@ impl NativePiManager {
                     .lock()
                     .is_ok_and(|target| target.session_id == session_id)
             })
+            .and_then(|runtime| runtime.target.lock().ok().map(|target| target.clone()))
+    }
+
+    /// The runtime registered under one instance id (ephemeral leases carry the
+    /// instance id, not the session id).
+    pub fn target_for_instance_id(&self, instance_id: &str) -> Option<RuntimeTarget> {
+        self.inner
+            .runtimes
+            .lock()
+            .ok()?
+            .get(instance_id)
             .and_then(|runtime| runtime.target.lock().ok().map(|target| target.clone()))
     }
 

@@ -170,6 +170,14 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                     return result;
                 }
 
+                // Workspace stop (plan T7): the one user path that stops a
+                // workspace's runtime. Same authorization as `workspace.remove`
+                // (verified native owner), but it reaches the runtime manager.
+                if command == "workspace_close" {
+                    workspace_controls::require_native_owner(&ctx)?;
+                    return workspace_controls::handle_workspace_close(&args, &metadata, &runtimes);
+                }
+
                 // App-global registry and preferences: strictly Native desktop
                 // owners; every successful mutation broadcasts to ALL native
                 // clients so other windows stay in sync.
@@ -1360,13 +1368,26 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         // its exact live runtime when present; spawning another
                         // target with that ID violates coordinator uniqueness.
                         // Explicit new-session requests always get a new runtime.
-                        let existing = find_existing_runtime_for_prepare(
+                        // A runtime whose owner the app relinquished (destroyed
+                        // window, dead attachment) is reattached to this owner
+                        // below; a *live* owner's runtime is refused instead of
+                        // stealing it (plan D11/T7).
+                        let existing = match plan_prepare_reuse(
                             &runtimes,
+                            &owner_registry,
                             &workspace_id,
                             owner.as_str(),
                             persisted_session_id.as_deref(),
                             force_new_session,
-                        );
+                        ) {
+                            PrepareReuse::Spawn => None,
+                            PrepareReuse::Rebind(target) => Some(target),
+                            PrepareReuse::Blocked(_) => {
+                                return Err(
+                                    "this session is already open in another window".to_string()
+                                )
+                            }
+                        };
 
                         // Registry transition FIRST: the commit sweep stops
                         // every runtime with `generation < transition`, so the
@@ -1384,6 +1405,7 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                     "{}/workspaces/{}/sessions/{}",
                                     host_origin, existing.workspace_id, existing.session_id
                                 );
+                                let previous_owner = existing.owner_id.clone();
                                 let generation = if same_cwd {
                                     owner_registry.prepare_navigation(
                                         &owner,
@@ -1407,11 +1429,33 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                     )?;
                                     gen
                                 };
-                                runtimes.rebind_owner_generation(
-                                    owner.as_str(),
-                                    &existing.session_id,
-                                    generation,
-                                );
+                                // Reattach (T7): the runtime the app reclaimed
+                                // changes hands — owner *and* generation move
+                                // together, or the reused runtime would be
+                                // rejected by the commit sweep below.
+                                match previous_owner.as_deref() {
+                                    Some(from) if from != owner.as_str() => {
+                                        if !runtimes.rebind_runtime_owner(
+                                            from,
+                                            owner.as_str(),
+                                            &existing.workspace_id,
+                                            &existing.session_id,
+                                            generation,
+                                        ) {
+                                            return Err(
+                                                "the reclaimed session runtime could not be reattached"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        runtimes.rebind_owner_generation(
+                                            owner.as_str(),
+                                            &existing.session_id,
+                                            generation,
+                                        );
+                                    }
+                                }
                                 (existing, generation)
                             }
                             None => {
@@ -2009,21 +2053,74 @@ pub fn cancel_should_stop_target(created_instance: Option<&str>, target: &Runtim
     created_instance.is_some_and(|instance| instance == target.instance_id)
 }
 
-pub fn find_existing_runtime_for_prepare(
+/// The prepare path's reuse decision (plan T7/D11).
+///
+/// The match is by workspace+session **regardless of owner**, because a resident
+/// runtime must survive its window: the three outcomes are the whole contract.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrepareReuse {
+    /// No runtime to reuse: spawn a fresh one.
+    Spawn,
+    /// Reuse this runtime, rebinding it to the requesting owner first when the
+    /// current owner is not the requester.
+    Rebind(RuntimeTarget),
+    /// Another owner holds this session and is still live: a second writable
+    /// binding is refused (the app's existing-window path).
+    Blocked(RuntimeTarget),
+}
+
+/// Decide what a session-prepare does with an already-running runtime
+/// (successor of the owner-filtered `find_existing_runtime_for_prepare`).
+///
+/// - same owner: reuse, exactly as before;
+/// - a *previously detached* owner (window destroyed) or a *dead attachment's*
+///   owner: reuse and rebind — this is B1/D11, the runtime the app reclaimed;
+/// - a live attachment's runtime: refuse (never a second writable binding).
+///
+/// An explicit-new-session request never reuses anything. When no persisted
+/// session is named ("open workspace", no session selected) the match stays
+/// owner-scoped as it always was: that request is not asking for someone
+/// else's running session, it just wants this owner's runtime for the
+/// workspace if there is one.
+pub fn plan_prepare_reuse(
     runtimes: &NativePiManager,
+    owner_registry: &WindowOwnerRegistry,
     workspace_id: &str,
     owner_id: &str,
     persisted_session_id: Option<&str>,
     force_new_session: bool,
-) -> Option<RuntimeTarget> {
+) -> PrepareReuse {
     if force_new_session {
-        return None;
+        return PrepareReuse::Spawn;
     }
-    runtimes.running_targets().into_iter().find(|target| {
-        target.workspace_id == workspace_id
-            && target.owner_id.as_deref() == Some(owner_id)
-            && persisted_session_id.is_none_or(|session_id| target.session_id == session_id)
-    })
+    let Some(session_id) = persisted_session_id else {
+        return runtimes
+            .running_targets()
+            .into_iter()
+            .find(|target| {
+                target.workspace_id == workspace_id && target.owner_id.as_deref() == Some(owner_id)
+            })
+            .map(PrepareReuse::Rebind)
+            .unwrap_or(PrepareReuse::Spawn);
+    };
+    let Some(target) = runtimes
+        .running_targets()
+        .into_iter()
+        .find(|target| target.workspace_id == workspace_id && target.session_id == session_id)
+    else {
+        return PrepareReuse::Spawn;
+    };
+    match target.owner_id.as_deref() {
+        Some(current) if current == owner_id => PrepareReuse::Rebind(target),
+        Some(current)
+            if owner_registry.owner_is_reattachable(
+                &crate::window_owner::OwnerId::from_string(current.to_string()),
+            ) =>
+        {
+            PrepareReuse::Rebind(target)
+        }
+        _ => PrepareReuse::Blocked(target),
+    }
 }
 
 /// The foreground runtime of the owner's CURRENT workspace: what a manual
