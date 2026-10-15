@@ -627,10 +627,13 @@ async fn read_welcome(stream: &mut AdminStream) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon_client::surface_ops::ForwardedSurfaceOps;
     use picot_host::daemon::admin::{AdminConfig, AdminServer};
-    use picot_host::daemon::app_surface::AppSurface;
+    use picot_host::daemon::app_surface::{AppSurface, PaneOp, SurfaceProgress};
     use picot_host::daemon::surface_forward::{wire, AdminForwardingSurface};
     use picot_host::daemon::{DaemonConfig, DaemonState};
+    use picot_host::host_server::PaneRect;
+    use picot_host::runtime_coordinator::RuntimeTarget;
     use picot_host::window_owner::{OwnerId, OwnerMirrorEvent, TemporaryKind};
     use std::path::PathBuf;
 
@@ -674,6 +677,10 @@ mod tests {
         .expect("the admin listener binds");
         state.install_admin(admin.clone());
         surface.attach(admin.clone());
+        // The data plane's dispatcher (and, with it, the review-B1 pane
+        // forwarder) is installed exactly as the daemon binary installs it, so
+        // a data-plane op in these tests travels the production path.
+        state.install_control_handler();
         Fixture {
             _temp: temp,
             state,
@@ -1210,6 +1217,387 @@ mod tests {
             !fixture.admin.has_manager()
         })
         .await;
+        fixture.state.shutdown_graceful("test").await;
+    }
+
+    // ---- Review B1: the browser-pane data-plane ops must reach the app ----
+
+    /// The app-side half of the pane path: records what the forwarded `pane`
+    /// op decoded to and answers a recognizable value per op. It is the only
+    /// stand-in in these tests — a real `AppHandle` + `BrowserPaneRuntime`
+    /// cannot be constructed headless, but every hop up to this surface is the
+    /// production one.
+    #[derive(Default)]
+    struct RecordingPaneSurface {
+        panes: Mutex<Vec<PaneOp>>,
+    }
+
+    impl RecordingPaneSurface {
+        fn panes(&self) -> Vec<PaneOp> {
+            self.panes.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AppSurface for RecordingPaneSurface {
+        async fn open_workspace_window(
+            &self,
+            _host_origin: &str,
+            _target: &RuntimeTarget,
+            _owner: &str,
+            _capability: &str,
+        ) -> Result<(), String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn open_devtools(&self, _label: &str) -> Result<(), String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn close_window(&self, _label: &str, _request_id: &str) -> Result<(), String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn cancel_window_close(&self, _label: &str, _request_id: &str) -> Result<(), String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn menu_state_changed(&self) -> Result<(), String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn relaunch_app(&self) -> Result<(), String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn pane(&self, op: PaneOp) -> Result<Value, String> {
+            self.panes.lock().unwrap().push(op.clone());
+            Ok(match op {
+                PaneOp::EvalJson { .. } => Value::String("42".to_string()),
+                PaneOp::Url { .. } => Value::String("https://example.com/".to_string()),
+                _ => Value::Null,
+            })
+        }
+
+        async fn pick_folder(&self) -> Result<Option<String>, String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn pick_image_files(&self, _initial_dir: Option<String>) -> Result<Value, String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn save_session_export(
+            &self,
+            _host_origin: &str,
+            _export_url: &str,
+            _file_name: &str,
+            _initial_dir: Option<String>,
+        ) -> Result<Value, String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn check_for_update(&self) -> Result<Value, String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
+        async fn download_and_install_update(
+            &self,
+            _progress: SurfaceProgress,
+        ) -> Result<Value, String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+    }
+
+    type HostClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn next_json(socket: &mut HostClient) -> Value {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(15), socket.next())
+                .await
+                .expect("a frame within the deadline")
+                .expect("the socket is open")
+                .expect("a valid frame");
+            match message {
+                WsMessage::Text(text) => return serde_json::from_str(&text).expect("JSON frame"),
+                WsMessage::Close(frame) => panic!("the host socket closed: {frame:?}"),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Read until the frame that carries `request_id` arrives; the host greets
+    /// a desktop client with a bootstrap frame first, which this skips.
+    async fn frame_for(socket: &mut HostClient, request_id: &str) -> Value {
+        for _ in 0..32 {
+            let frame = next_json(socket).await;
+            if frame.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return frame;
+            }
+        }
+        panic!("no frame for {request_id} on the data plane");
+    }
+
+    /// Attach a real desktop data-plane socket to the live host: the frontend's
+    /// own half of the chain (owner capability, `hello`, `/v2/ws`).
+    async fn attach_desktop(fixture: &Fixture, label: &str) -> HostClient {
+        let (_owner, capability) = fixture
+            .state
+            .owner_registry
+            .create_owner(
+                label.to_string(),
+                PathBuf::from("/workspace"),
+                5007,
+                "http://127.0.0.1:5007".to_string(),
+            )
+            .expect("owner");
+        let ws_url = fixture.state.origin().replace("http://", "ws://") + "/v2/ws";
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url)
+            .await
+            .expect("a real desktop socket connects");
+        socket
+            .send(WsMessage::Text(
+                json!({
+                    "type": "hello",
+                    "protocolVersion": 2,
+                    "clientType": "desktop",
+                    "clientId": format!("pane-client-{label}"),
+                    "desktopCapability": capability,
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("hello sent");
+        let ack = next_json(&mut socket).await;
+        assert_eq!(ack["type"], "hello_ack");
+        socket
+    }
+
+    /// Review B1, end to end over real sockets: a frontend
+    /// `browser_pane_create` on the host data plane must reach the app as the
+    /// forwarded `pane` op and come back as that op's answer. Before the fix the
+    /// daemon answered `unavailable` here — nothing ever installed the host's
+    /// pane slot and the browser pane tabs were a dead end in external mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_pane_op_reaches_the_app_and_its_answer_comes_back() {
+        let fixture = boot().await;
+        // App side: the production pump decode (`ForwardedSurfaceOps`) behind
+        // the production `AdminClient` on a real admin socket.
+        let recording = Arc::new(RecordingPaneSurface::default());
+        let (_client, _mirror) = attach(
+            &fixture,
+            Arc::new(ForwardedSurfaceOps::new(recording.clone())),
+        )
+        .await;
+
+        // Frontend side: a real desktop data-plane socket on the host.
+        let mut socket = attach_desktop(&fixture, "native-pane").await;
+        socket
+            .send(WsMessage::Text(
+                json!({
+                    "type": "data_request",
+                    "protocolVersion": 2,
+                    "requestId": "pane-create-1",
+                    "operation": "browser_pane_create",
+                    "paneId": "native-pane:tab-1",
+                    "windowLabel": "native-pane",
+                    "url": "https://example.com/",
+                    "x": 1.0,
+                    "y": 2.0,
+                    "width": 3.0,
+                    "height": 4.0,
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("pane create sent");
+
+        let response = frame_for(&mut socket, "pane-create-1").await;
+        assert_eq!(response["type"], "data_response", "{response}");
+        assert_eq!(response["operation"], "browser_pane_create");
+        assert!(
+            response.get("error").is_none(),
+            "the create must not fail: {response}"
+        );
+
+        // The app received exactly the op the data frame described.
+        assert_eq!(
+            recording.panes(),
+            vec![PaneOp::Create {
+                pane_id: "native-pane:tab-1".to_string(),
+                window_label: "native-pane".to_string(),
+                url: "https://example.com/".to_string(),
+                rect: PaneRect {
+                    x: 1.0,
+                    y: 2.0,
+                    width: 3.0,
+                    height: 4.0,
+                },
+            }],
+            "the create must survive the round trip with its exact shape"
+        );
+
+        // The answer travels back too: eval carries the app surface's value.
+        socket
+            .send(WsMessage::Text(
+                json!({
+                    "type": "data_request",
+                    "protocolVersion": 2,
+                    "requestId": "pane-eval-1",
+                    "operation": "browser_pane_eval",
+                    "paneId": "native-pane:tab-1",
+                    "js": "document.title",
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("pane eval sent");
+        let eval = frame_for(&mut socket, "pane-eval-1").await;
+        assert_eq!(eval["type"], "data_response", "{eval}");
+        assert_eq!(eval["operation"], "browser_pane_eval");
+        assert_eq!(
+            eval["result"], "42",
+            "the app's value must come back: {eval}"
+        );
+
+        fixture.state.shutdown_graceful("test").await;
+    }
+
+    /// A recording in-process [`picot_host::host_server::PaneSurface`]: the
+    /// host's own WebView runtime (the app package's `BrowserPaneRuntime`),
+    /// which keeps precedence over forwarding whenever it is installed.
+    #[derive(Default)]
+    struct RecordingLocalPane {
+        creates: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl picot_host::host_server::PaneSurface for RecordingLocalPane {
+        fn create(
+            &self,
+            pane_id: &str,
+            _window_label: &str,
+            _url: &str,
+            _rect: PaneRect,
+        ) -> Result<(), String> {
+            self.creates.lock().unwrap().push(pane_id.to_string());
+            Ok(())
+        }
+
+        fn set_rect(&self, _pane_id: &str, _rect: PaneRect) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn set_visible(&self, _pane_id: &str, _visible: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn eval_json(&self, _pane_id: &str, _expression: &str) -> Result<String, String> {
+            Ok("local".to_string())
+        }
+
+        fn navigate(&self, _pane_id: &str, _url: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn url(&self, _pane_id: &str) -> Result<String, String> {
+            Ok("https://local/".to_string())
+        }
+
+        fn destroy(&self, _pane_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The review-B1 fallback is a fallback: a host that owns an in-process pane
+    /// runtime keeps serving the op itself and never asks the app.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_process_pane_runtime_wins_over_forwarding() {
+        let fixture = boot().await;
+        let recording = Arc::new(RecordingPaneSurface::default());
+        let (_client, _mirror) = attach(
+            &fixture,
+            Arc::new(ForwardedSurfaceOps::new(recording.clone())),
+        )
+        .await;
+        let local = Arc::new(RecordingLocalPane::default());
+        fixture.state.host.set_browser_panes(local.clone());
+
+        let mut socket = attach_desktop(&fixture, "native-pane-local").await;
+        socket
+            .send(WsMessage::Text(
+                json!({
+                    "type": "data_request",
+                    "protocolVersion": 2,
+                    "requestId": "pane-create-local",
+                    "operation": "browser_pane_create",
+                    "paneId": "native-pane-local:tab-1",
+                    "windowLabel": "native-pane-local",
+                    "url": "https://example.com/",
+                    "x": 1.0,
+                    "y": 2.0,
+                    "width": 3.0,
+                    "height": 4.0,
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("pane create sent");
+
+        let response = frame_for(&mut socket, "pane-create-local").await;
+        assert_eq!(response["type"], "data_response", "{response}");
+        assert_eq!(
+            local.creates.lock().unwrap().as_slice(),
+            ["native-pane-local:tab-1"],
+            "the in-process runtime must serve the op"
+        );
+        assert!(
+            recording.panes().is_empty(),
+            "an in-process runtime means the app is never asked: {:?}",
+            recording.panes()
+        );
+        fixture.state.shutdown_graceful("test").await;
+    }
+
+    /// The fail-closed edge of the same wiring: with no app attached the
+    /// forwarded op cannot be served, and the data plane must say so from the
+    /// typed forwarding error instead of hanging or pretending success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_pane_op_with_no_app_attached_fails_closed() {
+        let fixture = boot().await;
+        let mut socket = attach_desktop(&fixture, "native-pane").await;
+        socket
+            .send(WsMessage::Text(
+                json!({
+                    "type": "data_request",
+                    "protocolVersion": 2,
+                    "requestId": "pane-create-no-app",
+                    "operation": "browser_pane_create",
+                    "paneId": "native-pane:tab-1",
+                    "windowLabel": "native-pane",
+                    "url": "https://example.com/",
+                    "x": 1.0,
+                    "y": 2.0,
+                    "width": 3.0,
+                    "height": 4.0,
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("pane create sent");
+
+        let response = frame_for(&mut socket, "pane-create-no-app").await;
+        assert_eq!(response["type"], "error", "{response}");
+        assert_eq!(response["error"]["code"], "browser_pane_failed");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("app_surface_unavailable"),
+            "the typed forwarding failure must reach the requester: {response}"
+        );
         fixture.state.shutdown_graceful("test").await;
     }
 }

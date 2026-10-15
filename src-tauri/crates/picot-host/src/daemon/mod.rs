@@ -185,13 +185,13 @@ impl DaemonState {
     /// the host server (which binds its loopback listener here), the owner
     /// registry, the ephemeral hub and the installer resolver.
     ///
-    /// This is the app's old in-process host construction minus the three things
-    /// that are the app's by the Step-3 exception list: the browser panes (constructed
-    /// app-side, registered afterwards through
-    /// `host.set_browser_panes`), the landing owner + window, and the
-    /// `app.manage` of app-only state. Nothing here touches the app surface —
-    /// [`AppSurface`] is required by the control dispatcher, never by
-    /// construction (pinned by `tests/daemon_boot.rs`).
+    /// This is the app's old in-process host construction minus the things
+    /// that are the app's by the Step-3 exception list: the child webviews
+    /// (constructed app-side; the daemon reaches them through the pane
+    /// forwarding installed by [`Self::install_control_handler`]), the landing
+    /// owner + window, and the `app.manage` of app-only state. Nothing here
+    /// touches the app surface — [`AppSurface`] is required by the control
+    /// dispatcher, never by construction (pinned by `tests/daemon_boot.rs`).
     pub async fn start(
         cfg: DaemonConfig,
         app_surface: Arc<dyn AppSurface>,
@@ -508,6 +508,16 @@ impl DaemonState {
             .set_control_handler(crate::host_control_dispatch::host_control_dispatch(
                 Arc::clone(self),
             ));
+        // Review B1: the data plane's `browser_pane_*` ops need a child-webview
+        // owner in every mode. This host process owns none (the app owns them),
+        // so the same app surface that serves every other forwarded row serves
+        // these too — installed with the handler, so any host that can dispatch
+        // these ops can also serve them.
+        self.host.set_pane_forwarder(Arc::new(
+            crate::daemon::surface_forward::AppSurfacePaneForwarder::new(Arc::clone(
+                &self.app_surface,
+            )),
+        ));
     }
 
     /// The host origin every op resolves against (`http://127.0.0.1:<port>`).

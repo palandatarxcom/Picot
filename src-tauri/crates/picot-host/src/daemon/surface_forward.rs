@@ -256,6 +256,32 @@ impl AppSurface for AdminForwardingSurface {
     }
 }
 
+/// The daemon's [`crate::host_server::PaneForwarder`]: the same forwarding
+/// realization, one `AppSurface::pane` call per `browser_pane_*` op.
+///
+/// Review B1: before this existed the daemon's data plane answered every
+/// `browser_pane_*` op with `unavailable`, because nothing ever installed the
+/// host's in-process pane runtime — the app owns the child webviews, so the op
+/// has to travel. It travels as the same `app_surface_request { op: "pane" }`
+/// frame every other forwarded row uses; a host with no manager attached fails
+/// closed with the typed `app_surface_unavailable` error.
+pub struct AppSurfacePaneForwarder {
+    surface: Arc<dyn AppSurface>,
+}
+
+impl AppSurfacePaneForwarder {
+    pub fn new(surface: Arc<dyn AppSurface>) -> Self {
+        Self { surface }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::host_server::PaneForwarder for AppSurfacePaneForwarder {
+    async fn forward_pane(&self, op: PaneOp) -> Result<Value, String> {
+        self.surface.pane(op).await
+    }
+}
+
 /// The forwarding surface as the daemon's shared surface, late-bound to its
 /// admin channel. Both the daemon binary and the app's embedded form boot this
 /// way (plan D2: one protocol for both modes).

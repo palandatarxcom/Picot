@@ -202,7 +202,7 @@ T12 框架重跑（节选，全部 23 行见 §5 的行 1-3 指针）：
 
 **T12 待审查三条（本轮复核，全部仍然成立）**
 
-1. **browser pane 转发缺口**：`PaneOp` 经 admin 频道转发的行未覆盖 browser pane 的既有 op 面（T2 清单只标了已在用的行）；Phase 1 的 UI 路径未见回归，但这是转发面的已知缺口，Phase 2 起要用 pane 前必须先补。
+1. **browser pane 数据面死路（已修，见本轮 commit）**：更正 T12 本轮之前的措辞。原写「`PaneOp` 经 admin 频道转发的行未覆盖 browser pane 的既有 op 面……Phase 1 的 UI 路径未见回归」，实际是**死路而非缺口**：T12 删除 embedded 模式时删掉了 `host.set_browser_panes` 的唯一调用方，而 external 模式下没有别的东西装这个槽位，于是数据面七个 `browser_pane_*` op（create/set_rect/set_visible/eval/navigate/url/destroy）全部命中 `state.browser_panes == None` 并回答 `unavailable`——转发通道（`PaneOp` ↔ `app_surface_request{op:"pane"}` ↔ app 侧 `ForwardedSurfaceOps`）早已铺好，只是没有任何调用方把它接到 host 的 pane 槽位。前端活跃消费链 `file-preview-panel.js → browser-pane-manager.js → transport.js` 的 browser tab 因此一点即死（非「未见回归」）。**修复**：`HostServer` 新增 `PaneForwarder` 槽位，七个分支在 `browser_panes` 为 None 时改走它 → `AdminForwardingSurface` → `AppSurface::pane(PaneOp)`，注入点与 `install_control_handler` 同一处（`DaemonState::install_control_handler`）。端到端证据：`src-tauri/src/daemon_client/admin_client.rs::a_browser_pane_op_reaches_the_app_and_its_answer_comes_back`（真 `AdminServer` + 真 `AdminClient` pump + 真 host 数据面 socket，`browser_pane_create` 红测前置为 `{"error":{"code":"unavailable","message":"browser panes are not initialized"}}`）、`::a_browser_pane_op_with_no_app_attached_fails_closed`、`::an_in_process_pane_runtime_wins_over_forwarding`。
 2. **close-confirm 链退化**：app 侧 close-approve 链在解绑/重连后只保证「不误关」，跨 attachment 的批准上下文不迁移；关窗确认对话框在 daemon 重启期间可能需重试一次。
 3. **`mcp_login` 测试抖动**：`mcp_login` 相关测试偶发不稳定（与本任务无关，`bun run test` 本轮 2914 项全绿，但抖动未消除）。
 
