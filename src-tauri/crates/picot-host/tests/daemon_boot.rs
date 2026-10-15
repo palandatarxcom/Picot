@@ -1,5 +1,5 @@
 // ABOUTME: Boot test for DaemonState::start — a headless daemon with no Tauri objects.
-// ABOUTME: Task 2 Step 1's red test; green since Step 3 moved setup_native_runtime's construction in.
+// ABOUTME: Task 2 Step 1's red test; green since Step 3 moved the app's host construction in.
 // ABOUTME: Task 6 adds the loopback-only regression: a persisted LAN preference cannot widen either listener.
 
 //! The daemon must be able to run the whole host stack with **no app process

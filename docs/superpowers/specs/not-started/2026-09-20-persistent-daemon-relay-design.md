@@ -1,6 +1,7 @@
 # 持久 daemon 与 relay 接入设计
 
 **状态：** Revised — daemon 形态已拍板（§3.6：独立进程）；生命周期对齐 Paseo 已核实的 quit 行为（§3.2/§3.5/§6，关窗现状 = 退出 app）；设置页 daemon 段定稿（§3.2.2：无 CLI、三控件、无 Shutdown 按钮）；Gate B 已修订为权限跟 principal 走（§4.4）；新增 Phase 2.5 桌面多 host 客户端（§4.6）；公司 relay 已上线（paseo.021521.xyz，v0.5.0，2026-10-15 探测确认），§5.3 剩余运维项后补；同日评审二修（WebView 静态资源随迁、capability/owner 边界、admin RPC 与实例文件握手、信号分档、sidecar 打包；§3.1-§3.5、§4.4、§8）
+**实施状态：** Phase 1（§3）代码已交付（T1-T12：daemon 独立进程 + admin 通道 + 生命周期/退出策略 + macOS sidecar 打包；开发期的 `PICOT_DAEMON=embedded` 进程内模式已在 T12 删除，无双轨）；最终验收矩阵（T13）是 Phase 1 的验收闸门。Phase 2、Phase 2.5、Phase 3 未启动。
 **日期：** 2026-09-20（修订 2026-10-15）
 **演化关系：** 建立在 `2026-09-20-session-resident-views-design.md` 已核实的 runtime 常驻现状之上（同 workspace 切 session / 跨 workspace 均不停、切回复用）。移动端 app/PWA/推送**不在本 spec**，另行立项；本 spec 只交付通道与配对。
 **参照：** Paseo relay 全链路（`packages/relay/`、`packages/server/src/server/relay-transport.ts` 553 行、`pairing-offer.ts`、`public-docs/security.md`、`connectivity.md`）；官方 relay 服务端 getpaseo/paseo-relay（Elixir，fly.io）与社区 Go 实现（zenghongtu/paseo-relay）。

@@ -2,7 +2,7 @@
 
 > 本文档描述 native runtime 迁移完成后的架构。
 > 迁移历史与决策记录见 `docs/superpowers/specs/2026-08-27-native-runtime-migration-design.md`。
-> Phase 1（daemon 化）实施中：目标态见「进程模型」章节的 banner 与 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`。
+> Phase 1（daemon 化）已落地：**daemon 独立进程是唯一运行形态**（开发期的进程内模式及其环境开关已在 T12 删除，无双轨）。设计来源见 `docs/superpowers/specs/not-started/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4，实施记录见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`。
 
 ## 一句话概览
 
@@ -10,7 +10,7 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 
 ## 进程模型
 
-> **Phase 1 target（实施中；embedded 模式为开发期过渡；macOS-first）** —— 本章是 Phase 1 的目标态契约，后续任务以此对照；实施计划见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`，设计来源见 `docs/superpowers/specs/not-started/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4。T12 删除 embedded 路径后撤掉本 banner。
+> **Phase 1（macOS-first，已落地）** —— 本章是**现行实现契约**（不是目标态）：宿主栈只存在于 `picot-daemon` 进程，app 进程内没有 host 状态，也没有可切的进程内模式（T12 删除了 embedded 路径与环境开关）。实施计划见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`，设计来源见 `docs/superpowers/specs/not-started/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4。
 
 ```text
 ┌───────────────────────────────────────────────────────┐
@@ -77,8 +77,8 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 - **单实例**：`<data_dir>/picot-daemon.lock` 文件锁；重复启动立即退出并复用现有实例。已有存活 manager 时第二个 app 收 `BlockedByOtherApp` 并退出，**绝不踢掉在位 manager**。
 - **端口与 origin**：数据面与 admin 均临时分配（bind 0），daemon ready 后把两个 origin 写入实例文件；app 读到 origin 才造窗与连接。
 - **退出与信号**：daemon 自身安装 SIGTERM/SIGINT/SIGHUP 处理，5s 宽限；超时不清理子进程注册表，交给下一次 daemon 的 `sweep_orphans` 收拾。app 侧同样捕获 SIGTERM/SIGINT/SIGHUP（SIGKILL 不可捕获），三条信号与 ⌘Q 走**同一条**退出流程（见下）：`=false` 停 daemon 并确认进程真的退出，`=true` 只断连接；信号路径的宽限是 20s（覆盖 waiter 的 10s 判定 + 两次 2s 升级），超时仍退出且保留子进程注册表。
-- **`PICOT_DAEMON` 开发开关**（T5 已接线）：`external` 由 app 探测 / spawn / attach 独立进程；`embedded` 在 app 进程内起同一个 `DaemonState`、开同一个 admin listener，app 仍经**同一条** admin 协议与同一个 `AdminClient` 连它——两种模式无直连内进程调用，差异只有进程边界。**过渡默认值**：debug 默认 `external`（M3 开发环走真实进程边界），release 默认 `embedded` 直到 T12 删除 embedded 路径。T11 之后 sidecar 已随 .app 打包（`Contents/MacOS/picot-daemon`），release 版可用 `PICOT_DAEMON=external` 走真实进程边界——T11 Step 4 的 DMG 冒烟就是这条；默认值的切换/分支删除属于 T12。取值非法（非 `embedded`/`external`）时启动报错退出。dev 链路：`bun run dev` 与 `tauri.conf.json` 的 `beforeDevCommand` 都会先 `bun run build:daemon`（两处重复是有意的：Tauri 只在直接 CLI 调用时跑 hook，见 `scripts/build.sh` 的 `run_prebuild` 说明）。
-- **退出策略（T8 已落地）**：`keepRunningAfterQuit` 存在 app 私有文件 `app_config_dir/picot-daemon-settings.json`（0600、原子写；缺失或损坏 → warn + false，不阻塞启动），app 进程独占读写，daemon 不感知；改值只写文件，不触发 daemon 任何动作（spec §3.2.2）。退出流程由 `RunEvent::ExitRequested`、`RunEvent::Exit` 与 SIGTERM/SIGINT/SIGHUP 三个入口驱动，**同一份流程且幂等**（进程级状态机，重复触发只 drain 一次）：external + `false` → `daemon.stop`（**accepted**）→ 等 `ExitWaiter` 按 pid + 进程启动时间**确认**退出（10s 判定，超时 SIGTERM→SIGKILL，RPC 断连不算完成）→ 未确认时保留孤儿证据（app 绝不删 instance file，日志给出 daemon 日志路径）；external + `true` → 只断 admin 连接，daemon 与 agent 存活；embedded → 就地 `shutdown_graceful`。
+- **daemon 二进制与开发链**：sidecar 随 .app 打包（`Contents/MacOS/picot-daemon`，详见「macOS-first」）。dev 链路：`bun run dev` 与 `tauri.conf.json` 的 `beforeDevCommand` 都会先 `bun run build:daemon`（两处重复是有意的：Tauri 只在直接 CLI 调用时跑 hook，见 `scripts/build.sh` 的 `run_prebuild` 说明）。启动路径只有一条：app 经 `DaemonManager::ensure()`（探测 / 版本与 buildId 比对 / detached spawn / attach）拿到 daemon——开发期曾存在的进程内模式（及其环境开关）已在 T12 删除，启动路径不存在第二条。
+- **退出策略（T8 已落地）**：`keepRunningAfterQuit` 存在 app 私有文件 `app_config_dir/picot-daemon-settings.json`（0600、原子写；缺失或损坏 → warn + false，不阻塞启动），app 进程独占读写，daemon 不感知；改值只写文件，不触发 daemon 任何动作（spec §3.2.2）。退出流程由 `RunEvent::ExitRequested`、`RunEvent::Exit` 与 SIGTERM/SIGINT/SIGHUP 三个入口驱动，**同一份流程且幂等**（进程级状态机，重复触发只 drain 一次）：`keepRunningAfterQuit=false`（默认）→ `daemon.stop`（**accepted**）→ 等 `ExitWaiter` 按 pid + 进程启动时间**确认**退出（10s 判定，超时 SIGTERM→SIGKILL，RPC 断连不算完成）→ 未确认时保留孤儿证据（app 绝不删 instance file，日志给出 daemon 日志路径）；`true` → 只断 admin 连接，daemon 与 agent 存活。
 - **「正在停止」splash 的可达性（T8 实测事实）**：`RunEvent::ExitRequested` 只在「全部窗口关闭」或显式 `app.exit()` 时到达，splash 只在这条路径可见。macOS 的 ⌘Q 是 muda 预置 Quit 项的 nil-target `terminate:` 选择器 → AppKit 直接终止 app，tauri 只收到 `RunEvent::Exit`（tao `applicationWillTerminate` → `LoopDestroyed`），因此 ⌘Q 路径**无法**先画 splash；两条路径跑的是同一份退出流程，行为一致，只是 ⌘Q 没有视觉反馈（T13 手工矩阵据此断言）。
 - **macOS-first**：Phase 1 的 sidecar 打包、签名与验证只覆盖 macOS（arm64/x64 DMG）；host 依赖在 `Cargo.toml` 里仍按 `target_os = "macos"` 门控，解门控 + Windows 验证是单独跟踪的后续任务。**daemon sidecar（T11）**：`bundle.externalBin` 写在 `src-tauri/tauri.macos.conf.json`（平台子配置，仅 macOS 构建会 merge），因为 Windows/Linux 的 bundler 会按各自的 target-triple 找同名文件，写进基础 `tauri.conf.json` 会直接让它们构建失败；三元组文件 `src-tauri/binaries/picot-daemon-<triple>`（已 gitignore）由 `scripts/build-daemon-sidecar.sh` / `./scripts/build.sh mac-*` / `beforeBuildCommand` 产出，bundler 复制进 `Picot.app/Contents/MacOS/` 时去掉三元组后缀——正是 app release 分支 `resolve_daemon_binary` 解析的路径。该文件也是 app 包 `build.rs` 每次 cargo 调用的前置条件（缺失即报 `resource path ... doesn't exist`），与 `resources/pi` 同类。
 
@@ -91,15 +91,14 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 ## 启动流程（native runtime）
 
 ```rust
-// main.rs: setup_native_runtime
-fn native_runtime_enabled(app) -> bool {
-    cfg!(debug_assertions) && env::var("PICOT_RUNTIME").is_ok_and(|v| v == "native")
-}
+// main.rs: setup_daemon_runtime
+// daemon 是唯一宿主：app 经 DaemonManager::ensure() 得到进程，
+// 连它的 admin listener，再无进程内分支。
 ```
 
-1. 检查 `PICOT_RUNTIME=native`（debug 构建限定）
+1. 启动恒进 native 路径（历史上的 `PICOT_RUNTIME=native` 构建门禁已不存在）；app 先确保 daemon 存在，再打开 landing 窗口
 2. **冷启动进 landing**：不注册默认工作区、不预创建 session、不派生 Pi 进程，registry 在启动期零改动（2026-09-03「冷启动一律以 ~/.pi/tmp 为 workspace」决策已废弃）。冷启动仍零派生；landing 配置面（Models/MCP/高级配置/软件包技能/advisor）按需懒派生 bridge 服务 runtime（`NativeRuntimeType::Config`：sessionless+toolless，cwd `~/.pi/tmp`，不注册工作区，global-only，经 `ephemeral_command` 通道定址，transition commit sweep 一并回收——见 `2026-09-18-landing-bridge-runtime-design.md` v2）。owner 以 `TemporaryKind::Landing` 创建（label `native-landing`；canonical home 仅作 owner 记录占位，永不为 workspace 身份、scope 或授权输入）
-3. 创建 `NativePiManager` + `HostServer`（loopback:0 绑定）——Phase 1 起这两个对象与 host 栈其余状态全部在 `picot-daemon` 内构造（`DaemonState::start`），app 只做探测 / spawn / attach
+3. `NativePiManager` + `HostServer`（loopback:0 绑定）与 host 栈其余状态全部在 `picot-daemon` 内构造（`DaemonState::start`），app 只做探测 / spawn / attach
 4. 打开 landing 窗口加载 `{origin}/`；WebView 在 bootstrap 期分叉加载 `landing.js`（仅构造 transport、sidebar 四 seam、transition controller、landing notice 与 landing 版 Quick Chat，不建任何 chat-lifecycle 对象）。首次进入工作区必为跨工作区原地切换（prepare → commit → navigate，overlay 换屏）；workspace 的 `same`/`cross` 分类按 owner 的 Registered 绑定派生，Landing owner 永不 same（即使占位 home 本身是已注册工作区）
 5. landing owner 首次 commit 后重绑为 Registered owner；窗口销毁清理、New Session 菜单状态与 Cmd+N 派发一律按 owner 注册表记录判定，不按 label 前缀（label 终身不变，非状态信号）
 6. workspace 权威性为 Registered-only：Git、terminal、文件/数据 scope、项目级 config/skills 与 Side Chat 拒绝 Landing/Temporary owner；Quick Chat 是唯一 landing 例外（自带一次性 temp cwd，显式准入路径单独测试）

@@ -18,8 +18,10 @@
 //! | `surface_progress` | logged: progress originates **app-side** in this phase (the app runs the updater), so the daemon→app direction has no producer yet |
 //! | socket close / error | the mirror is **cleared** (fail-closed) and every pending request fails |
 //!
-//! Both modes use this client: the embedded mode points it at the in-process
-//! daemon's own admin listener, so the wire path is identical (plan D2).
+//! Both attach paths use this client: the app points it at the daemon's own
+//! admin listener over loopback, so the wire path is the only path (plan D2).
+//! T12 deleted the in-process mode that used to point it at an in-process
+//! listener.
 //!
 //! ## Failure shapes (implementation-time decisions, recorded)
 //!
@@ -1129,7 +1131,7 @@ mod tests {
         let (client, _mirror) =
             attach(&fixture, Arc::clone(&executor) as Arc<dyn SurfaceExecutor>).await;
 
-        // The daemon forwards through the same surface the embedded mode uses.
+        // The daemon forwards the op; the app executes it on this surface.
         let picked = fixture
             .surface
             .pick_folder()

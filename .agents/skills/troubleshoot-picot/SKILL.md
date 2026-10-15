@@ -75,7 +75,7 @@ Picot 用 `tauri-plugin-log`（见 `src-tauri/src/main.rs`），默认双路输�
 
 - **前端 JS 报错** — 打包后的 WebView 不带开发者工具；本地开发可在 Tauri 窗口右键「检查元素」看浏览器 Console，或让用户提供 `bun run dev` 终端里 `[picot-native]` 之后的堆栈。
 
-- **启动失败弹窗**：`main.rs` 的 `setup_native_runtime` 出错时会弹原生对话框「Picot could not start the embedded pi runtime」——出现这个说明内嵌 pi 二进制缺失/损坏，先查 `bun run fetch:pi` 是否成功、`src-tauri/resources/pi/` 是否存在对应平台二进制。
+- **启动失败**：`main.rs` 的 `setup_daemon_runtime` 起不来/连不上 daemon 时启动失败，错误文本带 daemon 日志路径（`<app data>/picot-daemon.log`）；若是 daemon 起来了但 pi 不能用，先查 `bun run fetch:pi` 是否成功、`src-tauri/resources/pi/` 是否存在对应平台二进制。
 
 ## Step 3: 查看内存 / 进程状态
 

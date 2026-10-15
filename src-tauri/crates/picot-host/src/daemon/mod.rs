@@ -1,10 +1,9 @@
 // ABOUTME: Daemon-side state ownership: DaemonState::start, the app-surface seam, and (T3+) admin/instance.
-// ABOUTME: Step 3 of plan Task 2 moved `setup_native_runtime`'s construction in here; the app keeps only app-only state.
+// ABOUTME: Step 3 of plan Task 2 moved the app's old `setup_*` host construction in here; the app keeps only app-only state.
 
 //! Phase 1 (2026-10-15) moves the whole host stack out of the Tauri main
-//! process (plan D1/D2). This module owns what `setup_native_runtime`
-//! (main.rs, pre-T2) built in the app process and what the control dispatcher
-//! needs to reach.
+//! process (plan D1/D2). This module owns what the app process used to build
+//! itself before T2 and what the control dispatcher needs to reach.
 //!
 //! Landed so far:
 //!
@@ -186,8 +185,8 @@ impl DaemonState {
     /// the host server (which binds its loopback listener here), the owner
     /// registry, the ephemeral hub and the installer resolver.
     ///
-    /// This is `setup_native_runtime` minus the three things that are the
-    /// app's by the Step-3 exception list: the browser panes (constructed
+    /// This is the app's old in-process host construction minus the three things
+    /// that are the app's by the Step-3 exception list: the browser panes (constructed
     /// app-side, registered afterwards through
     /// `host.set_browser_panes`), the landing owner + window, and the
     /// `app.manage` of app-only state. Nothing here touches the app surface —

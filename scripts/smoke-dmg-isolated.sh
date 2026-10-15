@@ -13,7 +13,10 @@
 # `$HOME/Library/Application Support/com.palandata.picot` (the real app data
 # dir), `~/.pi` (real agent state) and `/Applications/Picot.app` are never
 # written to; the script asserts the real data dir's mtime and sqlite hash are
-# unchanged before it reports success. It refuses to run outside /tmp.
+# unchanged before it reports success. The isolation root must be a **new**
+# directory with no symlink components (see caveat 1 at the end of this file:
+# `/tmp` is a symlink on macOS and the packaged app then cannot resolve its
+# resource dir); it defaults to `$HOME/tmp/picot-dmg-smoke-XXXXXX`.
 #
 # Usage:
 #   scripts/smoke-dmg-isolated.sh [--dmg PATH] [--iso ROOT] [--keep]
@@ -22,10 +25,10 @@
 #
 # Two environment facts this scripts around, both verified the hard way:
 #
-#   1. `PICOT_DAEMON=external` is forced. A release build still *defaults* to
-#      embedded (transitional, plan T12 deletes that path); the sidecar spawn
-#      only happens in external mode, so a default-mode smoke would silently
-#      test nothing.
+#   1. The release build drives the sidecar by itself (T12 deleted the
+#      development-only in-process daemon mode and its environment switch):
+#      there is no variable to set, so the smoke asserts the path every build
+#      takes.
 #   2. `-ApplePersistenceIgnoreState YES` is passed in argv. After any crash of
 #      the app, macOS writes `~/Library/Application Support/CrashReporter/
 #      picot_*.plist` and the next launch blocks forever on an AppKit
@@ -40,6 +43,7 @@ REPO="$(dirname "$SCRIPT_DIR")"
 
 DMG=""
 ISO=""
+ISO_GIVEN=0
 KEEP=0
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
 		;;
 	--iso)
 		ISO="$2"
+		ISO_GIVEN=1
 		shift 2
 		;;
 	--keep)
@@ -74,15 +79,23 @@ if [ -z "$DMG" ] || [ ! -f "$DMG" ]; then
 	exit 2
 fi
 if [ -z "$ISO" ]; then
-	ISO=$(mktemp -d /tmp/picot-dmg-smoke-XXXXXX)
+	ISO=$(mktemp -d "${PICOT_SMOKE_HOME:-$HOME/tmp}/picot-dmg-smoke-XXXXXX")
 fi
-case "$ISO" in
-/tmp/*) ;;
-*)
-	echo "error: the isolation root must live under /tmp (got $ISO)" >&2
+# The root must not pre-exist: a name the developer actually uses (an app data
+# dir, a checkout) is never touched by accident. The default above is the one
+# directory this script creates itself.
+if [ "$ISO_GIVEN" = 1 ] && [ -e "$ISO" ]; then
+	echo "error: the isolation root must not exist yet (got $ISO)" >&2
 	exit 2
-	;;
-esac
+fi
+# A symlinked component anywhere in the path breaks the packaged app's
+# resource-dir resolution (`/tmp` -> `/private/tmp` on macOS): the daemon then
+# gets a CWD-relative static dir. Refuse up front instead of mis-testing.
+ISO_REAL=$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$ISO")
+if [ "$ISO_REAL" != "$ISO" ]; then
+	echo "error: the isolation root must contain no symlink components (got $ISO -> $ISO_REAL)" >&2
+	exit 2
+fi
 
 APP="$ISO/app/Picot.app"
 EHOME="$ISO/home"
@@ -124,7 +137,7 @@ kill_app() { # pid [signal]
 	kill "-${2:-9}" "$1" 2>/dev/null
 }
 launch_app() { # logfile -> LAST_PID (APP is the bundle path, never the pid)
-	HOME="$EHOME" PICOT_DAEMON=external "$APP_BIN" \
+	HOME="$EHOME" "$APP_BIN" \
 		-ApplePersistenceIgnoreState YES >>"$1" 2>&1 &
 	LAST_PID=$!
 }
@@ -166,7 +179,7 @@ rmdir "$MOUNT"
 say "copied Picot.app out of the DMG"
 ls -la "$APP/Contents/MacOS/" | tail -n +2
 
-step "1. launch 1 (isolated HOME, external mode)"
+step "1. launch 1 (isolated HOME)"
 ALOG1="$EVIDENCE/app-run1.log"
 launch_app "$ALOG1"
 APP1=$LAST_PID
@@ -177,8 +190,8 @@ else
 	say "TIMEOUT: no landing ready (dumping log tail)"
 	tail -30 "$ALOG1"
 fi
-grep -E "\[picot\] (daemon mode|started picot-daemon|external daemon|landing ready)" "$ALOG1" | sed 's/^/    /'
-check "app reached landing-ready (external mode)" "$(grep -q "\[picot\] landing ready" "$ALOG1" && echo 0 || echo 1)"
+grep -E "\[picot\] (started picot-daemon|external daemon|landing ready)" "$ALOG1" | sed 's/^/    /'
+check "app reached landing-ready" "$(grep -q "\[picot\] landing ready" "$ALOG1" && echo 0 || echo 1)"
 
 step "2. the sidecar: process, path, isolation"
 DAEMON=$(inst_field pid)
@@ -257,7 +270,12 @@ psrow "$DAEMON" | sed 's/^/    /'
 grep -E "\[picot\] .*(quit|stopping|daemon)" "$ALOG2" | tail -5 | sed 's/^/    /'
 tail -4 "$DLOG" | sed 's/^/    /'
 check "daemon stopped by the quit policy" "$(kill -0 "${DAEMON:-0}" 2>/dev/null && echo 1 || echo 0)"
-check "daemon logged a graceful shutdown" "$(grep -q "graceful shutdown" "$DLOG" && echo 0 || echo 1)"
+# `daemon.stop` drains through `DaemonState::drain` (the reply is "accepted",
+# then the drain runs), so the process's own `exit code 0 (daemon.stop)` line is
+# the graceful-exit evidence on this path; `shutdown_graceful`'s "graceful
+# shutdown" line belongs to the signal path only (picot-daemon/src/main.rs).
+check "daemon drained and exited cleanly on daemon.stop" \
+	"$(grep -q "\[picot-daemon\] exit code 0 (daemon.stop)" "$DLOG" && echo 0 || echo 1)"
 check "instance file removed" "$([ ! -f "$INST" ] && echo 0 || echo 1)"
 check "lock file removed" "$([ ! -f "$DATA/picot-daemon.lock" ] && echo 0 || echo 1)"
 
@@ -284,10 +302,11 @@ exit "$FAILS"
 # Known launch-context caveats (2026-10-16, from the T11 smoke session):
 # 1. Copy the .app to a path with NO symlink components (/tmp is a symlink on
 #    macOS and tauri's StartingBinary rejects symlinked exe paths, which makes
-#    resource_dir() fail -> static bundle resolution dies). Use a real dir.
+#    resource_dir() fail -> static bundle resolution dies, and the daemon is
+#    handed a CWD-relative `public`). The script now refuses such a root.
 # 2. Repeated SIGKILL of the app writes crash reports; macOS may gate startup
 #    behind an invisible persistent-state restore prompt when the app is
 #    launched outside LaunchServices. Clean DiagnosticReports/picot-*.ips
 #    between kill-matrix runs, or drive the final matrix via Finder/`open`.
-# 3. Release defaults to embedded (PICOT_DAEMON switch, T5); export
-#    PICOT_DAEMON=external to exercise the sidecar path before T12 lands.
+# 3. There is no mode switch to set any more: the app always attaches to the
+#    sidecar (T12).

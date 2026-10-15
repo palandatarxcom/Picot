@@ -34,9 +34,11 @@
 //!
 //! ## Wiring status
 //!
-//! Wired (T5): `main.rs::setup_native_runtime` boots either mode, attaches
-//! through [`admin_client::AdminClient`], mints the landing owner over the admin
-//! channel and opens the landing window against the daemon's host origin.
+//! Wired (T5): `main.rs::setup_daemon_runtime` boots the daemon as its own
+//! process (`DaemonManager::ensure`), attaches through
+//! [`admin_client::AdminClient`], mints the landing owner over the admin channel
+//! and opens the landing window against the daemon's host origin. T12 deleted
+//! the in-process mode: the external daemon is the only runtime.
 //! Wired (T8): app exit runs [`quit_policy`]'s transaction from
 //! `RunEvent::ExitRequested`, `RunEvent::Exit` and the SIGTERM/SIGINT/SIGHUP
 //! handlers. Wired (T9): [`restart`]'s transaction behind the `daemon_restart`

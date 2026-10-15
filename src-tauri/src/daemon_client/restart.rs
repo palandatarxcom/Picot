@@ -199,8 +199,10 @@ pub struct RestartReport {
     pub build_id: String,
     pub epoch: u64,
     /// How the captured instance went away (confirmed, or only after a signal).
-    /// `None` in embedded mode: the daemon is this process, and the drain the
-    /// stop request performs *is* the confirmation.
+    /// `None` when the daemon's process identity was never captured: the stop
+    /// request's own return is then the only evidence, and nothing is waited on
+    /// or signalled (the app always captures one — T12 deleted the in-process
+    /// daemon, whose `None` arm this used to be).
     pub old_exit: Option<ExitOutcome>,
     pub old_pid: Option<u32>,
     pub views: Vec<ViewMigration>,
@@ -309,8 +311,9 @@ impl ReplacementSpawner for ManagerSpawner {
 /// Everything the transaction needs that is not a seam.
 pub struct RestartConfig {
     /// The identity of the daemon being replaced (captured at attach).
-    /// `None` in embedded mode: there is no second process to confirm or
-    /// signal, and the in-process drain is the whole transition (plan D2/T9).
+    /// `None` when no verified identity was captured: there is then nothing to
+    /// confirm or signal, and the stop request's return is the whole
+    /// transition (plan D12). The app refuses to restart in that case.
     pub identity: Option<ProcessIdentity>,
     /// The child handle when this app spawned it (reaping beats polling).
     pub child: Option<Child>,
@@ -453,9 +456,9 @@ impl RestartCoordinator {
                 }
                 Some(outcome)
             }
-            // Embedded: the daemon is this process. The stop request *is* the
-            // drain, and it returns only once the drain is finished, so the
-            // confirmed-exit discipline has nothing to add (plan D2/T9).
+            // No verified process identity: the stop request's return is the
+            // only evidence available, and the confirmed-exit discipline
+            // (plan D12) has nothing to wait on or signal.
             None => None,
         };
 
@@ -514,7 +517,7 @@ impl RestartCoordinator {
                 .identity
                 .as_ref()
                 .map(|identity| identity.pid.to_string())
-                .unwrap_or_else(|| "embedded".to_string()),
+                .unwrap_or_else(|| "unverified".to_string()),
             target.pid,
             target.host_origin,
             rows.len()
@@ -1182,13 +1185,14 @@ mod tests {
         );
     }
 
-    // ── Embedded mode: the in-process drain is the transition ───────────────
+    // ── An identity-less daemon: no process to confirm ─────────────────────
 
-    /// Embedded has no second process: the stop request drains the in-process
-    /// daemon (and returns once it has), and there is nothing to confirm or
-    /// signal. The rest of the transaction is the same path (plan D2).
+    /// Without a captured identity the stop request's return is the whole
+    /// transition: there is nothing to confirm or signal. The app never builds
+    /// this shape (run_restart refuses it), but the transaction must not pretend
+    /// to confirm a process it never met.
     #[test]
-    fn embedded_restart_orders_the_drain_before_the_in_process_reboot() {
+    fn an_identity_less_daemon_is_drained_before_the_replacement_boots() {
         let journal = Arc::new(Journal::default());
         let handle = FakeHandle::gone(Arc::clone(&journal));
         let spawner = FakeSpawner::new(Arc::clone(&journal));
@@ -1199,8 +1203,8 @@ mod tests {
             RestartConfig {
                 identity: None,
                 child: None,
-                instance_path: PathBuf::from("/tmp/embedded.json"),
-                log_path: PathBuf::from("/tmp/embedded.log"),
+                instance_path: PathBuf::from("/tmp/identity-less.json"),
+                log_path: PathBuf::from("/tmp/identity-less.log"),
                 config_dir: PathBuf::from("/tmp/never-read-config"),
                 confirm_deadline: Duration::from_millis(40),
             },
@@ -1213,7 +1217,7 @@ mod tests {
 
         let outcome = runtime().block_on(coordinator.run(views()));
 
-        let report = outcome.report().expect("embedded restart");
+        let report = outcome.report().expect("restart without an identity");
         assert_eq!(report.old_exit, None);
         assert_eq!(report.old_pid, None);
         assert_eq!(
@@ -1226,7 +1230,7 @@ mod tests {
                 "owner:native-landing".to_string(),
                 "migrate:2".to_string(),
             ],
-            "the drain precedes the in-process reboot, and nothing probes a process"
+            "the stop request precedes the replacement boot, and nothing probes a process"
         );
     }
 

@@ -21,14 +21,13 @@ use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
 use daemon_client::navigation_mirror::NavigationMirror;
 use daemon_client::quit_policy::{self, QuitOutcome};
 use daemon_client::restart::{
-    CapturedView, ManagerSpawner, OwnerBinding, ReplacementSpawner, RestartConfig,
-    RestartCoordinator, RestartLink, RestartReport, RestartTarget, ViewMigration,
+    CapturedView, ManagerSpawner, OwnerBinding, RestartConfig, RestartCoordinator, RestartLink,
+    RestartReport, RestartTarget, ViewMigration,
 };
 use daemon_client::surface_ops::ForwardedSurfaceOps;
 use daemon_client::window_ledger::{route_for_url, LedgerRow, WindowLedger};
 use picot_host::daemon::admin::ManagerIdentity;
-use picot_host::daemon::DaemonState;
-use picot_host::{child_supervision, officecli_watch, window_owner};
+use picot_host::{child_supervision, window_owner};
 
 use picot_host::host_control::ProgressSink;
 use picot_host::host_server::HostServer;
@@ -1505,10 +1504,10 @@ fn canonical_home_dir() -> Result<PathBuf, String> {
 
 /// The app's live daemon attachment (plan Task 5/T9).
 ///
-/// One mode-independent shape for both process layouts: the admin client, the
-/// navigation mirror it feeds, and the mode-specific handles (`embedded` holds
-/// the in-process daemon state; `external` holds the manager whose spawn and
-/// child handle the quit path (T8) and the restart transaction (T9) reuse).
+/// The app's side of the process boundary: the admin client, the navigation
+/// mirror it feeds, and the manager whose spawn and child handle the quit path
+/// (T8) and the restart transaction (T9) reuse. The daemon is always its own
+/// process (T12 deleted the in-process mode) — this struct holds no host state.
 ///
 /// The **session** is swappable: a restart replaces the daemon, so the admin
 /// client, the origin the WebViews load from and the process identity all
@@ -1520,26 +1519,23 @@ fn canonical_home_dir() -> Result<PathBuf, String> {
 /// app's command surface to the three daemon commands, T10).
 pub struct DaemonSession {
     pub client: Arc<AdminClient>,
-    /// The daemon's HTTP origin (the WebView's page origin in both modes).
+    /// The daemon's HTTP origin (the WebView's page origin).
     pub host_origin: String,
-    /// The daemon process identity captured at attach (external mode):
-    /// pid + process start time, the only thing a stop/restart is allowed to
-    /// signal (plan D12). `None` in embedded mode — there is no other process.
+    /// The daemon process identity captured at attach: pid + process start
+    /// time, the only thing a stop/restart is allowed to signal (plan D12).
+    /// `None` only when no verified identity could be captured — the quit path
+    /// then never waits on or signals anything (defensive: attach publishes
+    /// one, plan D12).
     pub daemon: Option<ProcessIdentity>,
 }
 
 pub struct DaemonLink {
-    pub mode: DaemonMode,
     session: RwLock<DaemonSession>,
     pub mirror: Arc<NavigationMirror>,
-    /// `Some` in embedded mode only: the in-process daemon this app runs. Also
-    /// swappable — an embedded restart reboots it in place (T9).
-    embedded: RwLock<Option<Arc<DaemonState>>>,
-    /// `Some` in external mode only: how this app started/adopted the daemon.
+    /// `Some` once the daemon was started/adopted by this app (plan D4/T4):
+    /// its config/identity, the spawn path the restart transaction reuses
+    /// (T9) and the child handle the quit flow reaps (T8).
     pub manager: Option<Arc<DaemonManager>>,
-    /// The WebView bundle the embedded daemon serves; an embedded restart boots
-    /// its replacement from the same directory (plan D2/T9).
-    pub static_dir: PathBuf,
     /// The daemon's private data directory: `instance_path`/`log_path` below
     /// are derived from it (the quit flow names both).
     pub data_dir: PathBuf,
@@ -1553,42 +1549,21 @@ pub struct DaemonLink {
 }
 
 impl DaemonLink {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mode: DaemonMode,
         session: DaemonSession,
         mirror: Arc<NavigationMirror>,
-        embedded: Option<Arc<DaemonState>>,
         manager: Option<Arc<DaemonManager>>,
         data_dir: PathBuf,
         config_dir: PathBuf,
-        static_dir: PathBuf,
     ) -> Self {
         Self {
-            mode,
             session: RwLock::new(session),
             mirror,
-            embedded: RwLock::new(embedded),
             manager,
             data_dir,
             config_dir,
-            static_dir,
             migrating: Mutex::new(std::collections::HashSet::new()),
         }
-    }
-
-    /// The in-process daemon (embedded mode), if any.
-    pub fn embedded(&self) -> Option<Arc<DaemonState>> {
-        self.embedded
-            .read()
-            .expect("embedded daemon lock")
-            .as_ref()
-            .map(Arc::clone)
-    }
-
-    /// Install the replacement in-process daemon (embedded restart, T9).
-    pub fn set_embedded(&self, state: Arc<DaemonState>) {
-        *self.embedded.write().expect("embedded daemon lock") = Some(state);
     }
 
     /// The live admin client (a restart swaps it).
@@ -1605,7 +1580,7 @@ impl DaemonLink {
             .clone()
     }
 
-    /// The verified daemon identity, if this app has one (external mode).
+    /// The verified daemon identity, if this app captured one at attach.
     pub fn daemon(&self) -> Option<ProcessIdentity> {
         self.session
             .read()
@@ -1663,33 +1638,19 @@ impl DaemonLink {
 
     /// The app-process half of app exit (plan Task 8 Step 2 / D12).
     ///
-    /// External: `keepRunningAfterQuit=true` releases the admin channel only —
-    /// dropping the socket is what triggers the daemon's dead-attachment
-    /// cleanup, and the daemon plus its resident runtimes keep running. With the
-    /// default `false`, the daemon is stopped and the app waits for a
-    /// **confirmed** death (pid + start time; SIGTERM → SIGKILL on the ladder)
-    /// before it lets the process go.
-    ///
-    /// Embedded: the daemon *is* this process, so it drains here through the
-    /// same `shutdown_graceful` the standalone binary's signal path uses.
+    /// `keepRunningAfterQuit=true` releases the admin channel only — dropping
+    /// the socket is what triggers the daemon's dead-attachment cleanup, and the
+    /// daemon plus its resident runtimes keep running. With the default `false`,
+    /// the daemon is stopped and the app waits for a **confirmed** death
+    /// (pid + start time; SIGTERM → SIGKILL on the ladder) before it lets the
+    /// process go.
     fn shutdown(&self) -> QuitOutcome {
         let action = quit_policy::quit_action(
             // Read *at exit* (spec §3.2.2): a toggle flipped during the session
             // applies to the next quit, never to the daemon's current life.
             quit_policy::keep_running_after_quit(&self.config_dir),
-            self.mode == DaemonMode::Embedded,
         );
         match action {
-            quit_policy::QuitAction::EmbeddedDrain => {
-                if let Some(state) = self.embedded() {
-                    // The exit path runs on the main thread; the drain is async
-                    // (runtimes, terminals, watches, the child registry, the
-                    // host listener), so it is driven to completion here exactly
-                    // as startup drives the async boot.
-                    tauri::async_runtime::block_on(state.shutdown_graceful("app exit"));
-                }
-                QuitOutcome::EmbeddedShutdown
-            }
             quit_policy::QuitAction::DetachOnly => {
                 log::info!(
                     "[picot] exiting: keepRunningAfterQuit — detaching; the daemon and its agents keep running"
@@ -1701,7 +1662,7 @@ impl DaemonLink {
         }
     }
 
-    /// Default external exit: stop the daemon, then block on a **confirmed**
+    /// Default exit: stop the daemon, then block on a **confirmed**
     /// death (plan D12). Only a verified identity is waited on or signalled.
     fn stop_and_confirm(&self) -> QuitOutcome {
         let client = self.client();
@@ -1733,55 +1694,23 @@ impl DaemonLink {
     }
 }
 
-/// Which process layout this run uses (plan Task 5 Step 3).
-///
-/// `PICOT_DAEMON=embedded|external` is the dev/validation switch (plan D2): the
-/// two modes differ only by the process boundary — both run the same
-/// `DaemonState`, the same admin protocol and the same `AdminClient`.
-///
-/// The defaults are transitional and deliberate: **debug → external** (the M3
-/// dev loop exercises the real process boundary) and **release → embedded**
-/// until T11 packages the daemon sidecar and T12 deletes the embedded branch —
-/// a released app has no `picot-daemon` binary to spawn yet. Both the switch and
-/// the defaults are documented in ARCHITECTURE.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DaemonMode {
-    Embedded,
-    External,
-}
-
-fn daemon_mode() -> Result<DaemonMode, String> {
-    match std::env::var("PICOT_DAEMON").ok().as_deref() {
-        None | Some("") => Ok(if cfg!(debug_assertions) {
-            DaemonMode::External
-        } else {
-            DaemonMode::Embedded
-        }),
-        Some("external") => Ok(DaemonMode::External),
-        Some("embedded") => Ok(DaemonMode::Embedded),
-        Some(other) => Err(format!(
-            "PICOT_DAEMON must be `embedded` or `external`, got {other:?}"
-        )),
-    }
-}
-
 /// What booting the daemon produced.
 enum AttachedDaemon {
     Ready {
         manager: Option<Arc<DaemonManager>>,
-        embedded: Option<Arc<DaemonState>>,
         client: Arc<AdminClient>,
         host_origin: String,
-        /// The daemon process identity (external mode): what the quit flow is
-        /// allowed to wait on and signal. `None` in embedded mode.
+        /// The daemon process identity: what the quit flow is allowed to wait
+        /// on and signal (plan D12).
         daemon: Option<ProcessIdentity>,
     },
     /// Another live Picot app manages this daemon (plan Task 4 policy).
     BlockedByOtherApp,
 }
 
-/// Start the daemon as its own process and attach to it (external mode).
-async fn attach_external_daemon(
+/// Start the daemon as its own process and attach to it (plan Task 5 Step 3;
+/// the only path since T12 deleted the in-process mode).
+async fn attach_daemon(
     data_dir: PathBuf,
     config_dir: PathBuf,
     static_dir: PathBuf,
@@ -1820,110 +1749,20 @@ async fn attach_external_daemon(
     let daemon = ProcessIdentity::new(file.pid, file.process_start_time.clone());
     Ok(AttachedDaemon::Ready {
         manager: Some(manager),
-        embedded: None,
         client,
         host_origin: file.host_origin,
         daemon: Some(daemon),
     })
 }
 
-/// Start the daemon inside this process, behind the *same* admin listener the
-/// standalone binary uses; the app then attaches to it over the same client
-/// (embedded mode, plan D2).
-async fn start_embedded_daemon(
-    app: &tauri::App,
-    data_dir: PathBuf,
-    config_dir: PathBuf,
-    static_dir: PathBuf,
-    bundle_identifier: String,
-    executor: Arc<dyn SurfaceExecutor>,
-    mirror: Arc<NavigationMirror>,
-) -> Result<AttachedDaemon, String> {
-    let surface = Arc::new(picot_host::daemon::surface_forward::AdminForwardingSurface::new());
-    let state = Arc::new(
-        DaemonState::start(
-            picot_host::daemon::DaemonConfig {
-                data_dir,
-                config_dir,
-                static_dir,
-                bundle_identifier,
-            },
-            surface.clone(),
-        )
-        .await?,
-    );
-    let token = picot_host::daemon::instance::generate_admin_token();
-    let admin = picot_host::daemon::admin::AdminServer::start(
-        picot_host::daemon::admin::AdminConfig::new(token.clone()),
-    )
-    .await?;
-    state.install_admin(admin.clone());
-    surface.attach(admin.clone());
-    state.install_control_handler();
-    register_embedded_state(app.handle(), &state);
-    let host_origin = state.origin().to_string();
-    let client = AdminClient::connect(
-        admin.origin(),
-        &token,
-        &ManagerIdentity {
-            pid: Some(std::process::id()),
-            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            build_id: Some(picot_host::BUILD_ID.to_string()),
-        },
-        executor,
-        mirror,
-    )
-    .await?;
-    log::info!("[picot] embedded daemon host={host_origin}");
-    Ok(AttachedDaemon::Ready {
-        manager: None,
-        embedded: Some(state),
-        client,
-        host_origin,
-        // Embedded: the daemon is this process, so there is no second process
-        // for the quit flow to confirm or signal.
-        daemon: None,
-    })
-}
-
-/// Register the embedded daemon's shared state with the app.
-///
-/// Embedded mode only: these are the app-side readers that still look host
-/// objects up through the app handle (the window-destroyed teardown, the exit
-/// path, the browser-pane runtime). In external mode the same objects live in
-/// the daemon process and the app holds no copy (plan D4/D5) — the dispatcher
-/// reaches them there through `DaemonState`.
-fn register_embedded_state(app: &AppHandle, state: &Arc<DaemonState>) {
-    let host = state.host.clone();
-    // Browser panes (spec 2026-09-22): child webviews keyed by tab id. The
-    // runtime needs the app handle, so it is constructed here and registered
-    // with the host through the `PaneSurface` slot (plan D1/Step-3 exceptions).
-    let browser_panes = Arc::new(browser_pane::BrowserPaneRuntime::new(
-        app.clone(),
-        host.origin(),
-    ));
-    host.set_browser_panes(browser_panes.clone());
-    app.manage(browser_pane::BrowserPaneState(browser_panes));
-    app.manage(officecli_watch::OfficecliWatchState(
-        state.officecli_watches.clone(),
-    ));
-    // Window-destroyed teardown no longer reads host state through the app
-    // handle (T7): the window sends one `owner.detach` over the admin channel,
-    // so the owner registry, the runtimes, the ephemeral registry, the
-    // terminals, git and the skill sources have exactly one reader — the
-    // daemon. The runtime manager stays managed for the signal teardown below.
-    app.manage(state.runtimes.clone());
-    app.manage(host);
-}
-
 /// Boot the app around its daemon (plan Task 5 Step 3).
 ///
-/// Both modes run the *same* sequence: get a running `DaemonState` (in this
-/// process, or in its own), connect the `AdminClient` to its admin listener,
-/// mint the landing owner over that channel, and open the landing window at the
-/// daemon's host origin. There is no in-process shortcut in either mode — the
-/// only difference is the process boundary (plan D2).
-fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(), String> {
+/// One sequence since T12 deleted the in-process mode: get the daemon running
+/// as its own process (`DaemonManager::ensure`), connect the `AdminClient` to
+/// its admin listener, mint the landing owner over that channel, and open the
+/// landing window at the daemon's host origin. There is no in-process shortcut —
+/// the app holds no host state (plan D2/D4).
+fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(), String> {
     let data_dir = app
         .path()
         .app_data_dir()
@@ -1933,38 +1772,25 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         .app_config_dir()
         .map_err(|error| format!("Cannot resolve Picot app config directory: {error}"))?;
     let bundle_identifier = app.config().identifier.clone();
-    let mode = daemon_mode()?;
     // The app's window registry (T9/T10): recorded as windows are created, read
     // by the restart transaction's capture. Managed before the daemon boots, so
     // the landing window's row can be written as it opens.
     app.manage(WindowLedger::new());
     // The app's navigation/authorization image and the pump that executes
-    // forwarded surface ops, both shared by the two modes.
+    // forwarded surface ops.
     let mirror = Arc::new(NavigationMirror::new());
     let executor: Arc<dyn SurfaceExecutor> = Arc::new(ForwardedSurfaceOps::new(Arc::new(
         tauri_app_surface::TauriAppSurface::new(app.handle().clone(), Arc::clone(&mirror)),
     )));
-    log::info!("[picot] daemon mode {mode:?} (PICOT_DAEMON)");
-    let attached = match mode {
-        DaemonMode::External => tauri::async_runtime::block_on(attach_external_daemon(
-            data_dir.clone(),
-            config_dir.clone(),
-            static_dir.clone(),
-            bundle_identifier,
-            executor,
-            Arc::clone(&mirror),
-        ))?,
-        DaemonMode::Embedded => tauri::async_runtime::block_on(start_embedded_daemon(
-            app,
-            data_dir.clone(),
-            config_dir.clone(),
-            static_dir.clone(),
-            bundle_identifier,
-            executor,
-            Arc::clone(&mirror),
-        ))?,
-    };
-    let (manager, embedded, client, host_origin, daemon) = match attached {
+    let attached = tauri::async_runtime::block_on(attach_daemon(
+        data_dir.clone(),
+        config_dir.clone(),
+        static_dir,
+        bundle_identifier,
+        executor,
+        Arc::clone(&mirror),
+    ))?;
+    let (manager, client, host_origin, daemon) = match attached {
         AttachedDaemon::BlockedByOtherApp => {
             // The dialog blocks and the process exits non-zero: a second Picot
             // must not fight the first for the daemon's lease. `None` resolves
@@ -1973,15 +1799,24 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         }
         AttachedDaemon::Ready {
             manager,
-            embedded,
             client,
             host_origin,
             daemon,
-        } => (manager, embedded, client, host_origin, daemon),
+        } => (manager, client, host_origin, daemon),
     };
+    // Browser panes (spec 2026-09-22): child webviews keyed by tab id. They are
+    // the app's by construction (plan D1/Step-3 exceptions) — the webview needs
+    // this process's `AppHandle` — and the daemon forwards `browser_pane_*` ops
+    // to them as one app-surface op (row A13). Registered against the daemon
+    // origin the panes must never reach.
+    let browser_panes = Arc::new(browser_pane::BrowserPaneRuntime::new(
+        app.handle().clone(),
+        &host_origin,
+    ));
+    app.manage(browser_pane::BrowserPaneState(browser_panes));
     // The landing owner: no registered workspace, placeholder home cwd. Minted
-    // over the admin channel in both modes, so the mirror learns its origin
-    // before the window can load it.
+    // over the admin channel, so the mirror learns its origin before the window
+    // can load it.
     let home = canonical_home_dir()?;
     let landing = tauri::async_runtime::block_on(client.create_owner(
         "native-landing",
@@ -2005,18 +1840,15 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         ));
     }
     app.manage(DaemonLink::new(
-        mode,
         DaemonSession {
             client,
             host_origin: host_origin.clone(),
             daemon,
         },
         mirror,
-        embedded,
         manager,
         data_dir,
         config_dir,
-        static_dir,
     ));
     // The restart transaction's cross-request state (T9): managed, so two
     // triggers coalesce onto one replacement however many coordinators they
@@ -2025,7 +1857,7 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
     // Startup default is disabled (the first window is the landing); recompute
     // once now that the window exists. No-op wherever no menu bar is installed.
     update_new_session_menu_state(app.handle());
-    log::info!("[picot] landing ready mode={mode:?} origin={host_origin}");
+    log::info!("[picot] landing ready origin={host_origin}");
     Ok(())
 }
 
@@ -2325,8 +2157,8 @@ const MIGRATION_POLL: Duration = Duration::from_millis(20);
 /// window, and the window migration itself (plan Task 9 steps 4-6).
 struct AppRestartLink {
     app: AppHandle,
-    /// The canonical home: the landing owner's cwd, at boot and after every
-    /// restart (the same value `setup_native_runtime` uses).
+    /// Canonical home: the landing owner's cwd, at boot and after every
+    /// restart (the same value `setup_daemon_runtime` uses).
     home: String,
 }
 
@@ -2568,77 +2400,6 @@ fn capture_open_views(app: &AppHandle) -> Vec<CapturedView> {
     views
 }
 
-/// Embedded restart: the "stop" is the in-process drain, which returns only
-/// once the daemon has released its runtimes, terminals and files (plan D2).
-struct EmbeddedRestartStop {
-    state: Arc<DaemonState>,
-}
-
-#[async_trait::async_trait]
-impl quit_policy::StopRequester for EmbeddedRestartStop {
-    async fn request_stop(&self) -> Result<(), String> {
-        self.state.shutdown_graceful("restart").await;
-        Ok(())
-    }
-}
-
-/// Embedded restart: boot a fresh in-process daemon behind its own admin
-/// listener and install it — the same sequence `start_embedded_daemon` runs, so
-/// the transition is the in-process form of the external path (plan D2).
-struct EmbeddedRestartSpawner {
-    app: AppHandle,
-}
-
-#[async_trait::async_trait]
-impl ReplacementSpawner for EmbeddedRestartSpawner {
-    async fn spawn_and_ready(&self) -> Result<RestartTarget, String> {
-        let link_state = self
-            .app
-            .try_state::<DaemonLink>()
-            .ok_or_else(|| "Picot's daemon link is not available".to_string())?;
-        let data_dir = link_state.data_dir.clone();
-        let config_dir = link_state.config_dir.clone();
-        let static_dir = link_state.static_dir.clone();
-        let bundle_identifier = self.app.config().identifier.clone();
-        let surface = Arc::new(picot_host::daemon::surface_forward::AdminForwardingSurface::new());
-        let state = Arc::new(
-            DaemonState::start(
-                picot_host::daemon::DaemonConfig {
-                    data_dir,
-                    config_dir,
-                    static_dir,
-                    bundle_identifier,
-                },
-                surface.clone(),
-            )
-            .await?,
-        );
-        let token = picot_host::daemon::instance::generate_admin_token();
-        let admin = picot_host::daemon::admin::AdminServer::start(
-            picot_host::daemon::admin::AdminConfig::new(token.clone()),
-        )
-        .await?;
-        state.install_admin(admin.clone());
-        surface.attach(admin.clone());
-        state.install_control_handler();
-        register_embedded_state(&self.app, &state);
-        let host_origin = state.origin().to_string();
-        link_state.set_embedded(Arc::clone(&state));
-        log::info!("[picot] embedded daemon restarted host={host_origin}");
-        Ok(RestartTarget {
-            // Embedded: the daemon is this process, so the pid is this app's
-            // (there is no second process to confirm or signal).
-            pid: std::process::id(),
-            process_start_time: None,
-            host_origin,
-            admin_origin: admin.origin().to_string(),
-            admin_token: token,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            build_id: picot_host::BUILD_ID.to_string(),
-        })
-    }
-}
-
 /// Run the restart transaction against the app's current daemon (plan D10).
 ///
 /// The gate is app state, so two triggers (a double click, a command racing
@@ -2665,40 +2426,25 @@ pub async fn run_restart(app: &AppHandle) -> Result<RestartReport, String> {
         confirm_deadline: daemon_client::restart::RESTART_CONFIRM_DEADLINE,
     };
     let app_link: Arc<dyn RestartLink> = Arc::new(AppRestartLink::new(app.clone())?);
-    let coordinator = match link.mode {
-        DaemonMode::External => {
-            if config.identity.is_none() {
-                // Never restart an unverified external daemon: without a
-                // captured identity there is nothing to confirm (plan D12).
-                return Err("the running daemon has no verified process identity".to_string());
-            }
-            let manager = link
-                .manager
-                .clone()
-                .ok_or_else(|| "the external daemon manager is not available".to_string())?;
-            RestartCoordinator::new(
-                gate,
-                config,
-                Arc::new(quit_policy::AdminStopRequester::new(link.client())),
-                ExitWaiter::new(),
-                Arc::new(ManagerSpawner::new(manager)),
-                app_link,
-            )
-        }
-        DaemonMode::Embedded => {
-            let state = link
-                .embedded()
-                .ok_or_else(|| "the embedded daemon state is not available".to_string())?;
-            RestartCoordinator::new(
-                gate,
-                config,
-                Arc::new(EmbeddedRestartStop { state }),
-                ExitWaiter::new(),
-                Arc::new(EmbeddedRestartSpawner { app: app.clone() }),
-                app_link,
-            )
-        }
-    };
+    // T12: the daemon is always its own process, so a restart is always the real
+    // process replacement. It must never be attempted against a daemon whose
+    // identity this app did not verify: without one there is nothing to confirm
+    // is gone before the replacement starts (plan D12).
+    if config.identity.is_none() {
+        return Err("the running daemon has no verified process identity".to_string());
+    }
+    let manager = link
+        .manager
+        .clone()
+        .ok_or_else(|| "the daemon manager is not available".to_string())?;
+    let coordinator = RestartCoordinator::new(
+        gate,
+        config,
+        Arc::new(quit_policy::AdminStopRequester::new(link.client())),
+        ExitWaiter::new(),
+        Arc::new(ManagerSpawner::new(manager)),
+        app_link,
+    );
     let outcome = coordinator.run(views).await;
     outcome
         .report()
@@ -2885,7 +2631,7 @@ fn main() {
     // Sync the user's login-shell environment before anything else.
     // macOS GUI apps (launched from Finder/Dock) inherit neither PATH nor
     // provider API keys exported by shell startup files. `fix_all_vars()`
-    // makes the embedded pi process see the same provider configuration as a
+    // makes the bundled pi process see the same provider configuration as a
     // normal terminal session.
     if let Err(err) = fix_path_env::fix_all_vars() {
         eprintln!("[picot] failed to sync PATH and provider environment from login shell: {err}");
@@ -2968,7 +2714,7 @@ fn main() {
         .setup(|app| {
             let static_dir = find_static_dir(app);
             // Native HostServer and stdio Pi runtime are the only startup path.
-            setup_native_runtime(app, static_dir).map_err(std::io::Error::other)?;
+            setup_daemon_runtime(app, static_dir).map_err(std::io::Error::other)?;
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -3037,11 +2783,10 @@ fn main() {
                 }
             }
             tauri::RunEvent::Exit => {
-                // ⌘Q, and the re-entered exit the splash path triggers. The mode
-                // decides what app exit means: the embedded daemon is this
-                // process and drains here; the external one is stopped and its
-                // death *confirmed* by pid + start time, or only detached when
-                // `keepRunningAfterQuit` is on (plan D12/T8).
+                // ⌘Q, and the re-entered exit the splash path triggers. The
+                // daemon is stopped and its death *confirmed* by pid + start
+                // time, or only detached when `keepRunningAfterQuit` is on
+                // (plan D12/T8).
                 run_app_exit_flow(app_handle);
             }
             _ => {}
@@ -3154,8 +2899,8 @@ fn show_quit_splash(app_handle: &AppHandle) {
 /// exists for that case (spec §3.5's signal tiers).
 ///
 /// All three signals run the **same** app-exit flow as ⌘Q (plan Task 8 Step 2):
-/// external + `keepRunningAfterQuit=false` stops the daemon and waits for a
-/// confirmed death, external + `true` only detaches, embedded drains in place.
+/// `keepRunningAfterQuit=false` stops the daemon and waits for a confirmed
+/// death; `true` only detaches.
 #[cfg(unix)]
 fn install_termination_handlers(app_handle: tauri::AppHandle) {
     use std::sync::atomic::AtomicBool;

@@ -6,13 +6,10 @@
 //! menus, child webviews, the pending-close map) is implemented here against
 //! the real [`AppHandle`].
 //!
-//! Step 2 runs it in-process — the app builds `DaemonState` with this surface
-//! and calls the dispatcher directly (embedded form). T3 replaces the
-//! construction with the admin channel, and the daemon-side forwarding
-//! realization then executes the same ops over `app_surface_request` frames.
-//!
-//! Nothing here is new behavior: each method calls the same app helper the
-//! dispatcher used to call inline, with the same arguments and the same
+//! The daemon forwards these ops to the app over `app_surface_request` frames
+//! (T5); the app executes them on this surface and answers over the same admin
+//! channel. Nothing here is new behavior: each method calls the same app helper
+//! the dispatcher used to call inline, with the same arguments and the same
 //! results.
 
 use crate::daemon_client::navigation_mirror::NavigationMirror;

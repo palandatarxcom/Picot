@@ -166,19 +166,18 @@ impl StopRequester for AdminStopRequester {
 /// detached daemon plus the next launch's orphan sweep are the design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuitAction {
-    /// `keepRunningAfterQuit=true` (external): release the admin channel only.
-    /// The daemon and its resident agents keep running.
+    /// `keepRunningAfterQuit=true`: release the admin channel only. The daemon
+    /// and its resident agents keep running.
     DetachOnly,
-    /// Default (external): stop the daemon and block on a confirmed exit.
+    /// Default: stop the daemon and block on a confirmed exit.
     StopAndConfirm,
-    /// Embedded mode: the daemon *is* this process, so it drains in place.
-    EmbeddedDrain,
 }
 
-pub fn quit_action(keep_running_after_quit: bool, embedded: bool) -> QuitAction {
-    if embedded {
-        QuitAction::EmbeddedDrain
-    } else if keep_running_after_quit {
+/// T12 deleted the in-process mode, so the mode no longer enters this table:
+/// the daemon is always a separate process and a quit either detaches or stops
+/// it for real.
+pub fn quit_action(keep_running_after_quit: bool) -> QuitAction {
+    if keep_running_after_quit {
         QuitAction::DetachOnly
     } else {
         QuitAction::StopAndConfirm
@@ -198,8 +197,6 @@ pub enum QuitOutcome {
     /// Still alive after the whole ladder: the orphan evidence is retained and
     /// [`QuitFlow::unconfirmed_message`] names the daemon log path.
     Unconfirmed,
-    /// Embedded mode: the daemon *is* this process and drained in place.
-    EmbeddedShutdown,
 }
 
 /// The quit transaction: one drain, one confirmed exit, idempotent.
@@ -510,18 +507,12 @@ mod tests {
 
     // ─── The tier table (plan Task 8 Step 2: every graceful trigger) ─────────
 
-    /// One table for ⌘Q, SIGHUP, SIGINT and SIGTERM: the policy and the mode
-    /// decide, the trigger never does.
+    /// One table for ⌘Q, SIGHUP, SIGINT and SIGTERM: the policy decides, the
+    /// trigger never does.
     #[test]
     fn every_graceful_trigger_maps_through_the_same_action_table() {
-        assert_eq!(quit_action(false, false), QuitAction::StopAndConfirm);
-        assert_eq!(quit_action(true, false), QuitAction::DetachOnly);
-        assert_eq!(quit_action(false, true), QuitAction::EmbeddedDrain);
-        assert_eq!(
-            quit_action(true, true),
-            QuitAction::EmbeddedDrain,
-            "in embedded mode the app *is* the daemon: a quit always drains it, the toggle included"
-        );
+        assert_eq!(quit_action(false), QuitAction::StopAndConfirm);
+        assert_eq!(quit_action(true), QuitAction::DetachOnly);
     }
 
     // ─── The quit transaction (plan D12, Task 8 Step 1) ─────────────────────
