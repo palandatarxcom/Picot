@@ -2,36 +2,88 @@
 
 > 本文档描述 native runtime 迁移完成后的架构。
 > 迁移历史与决策记录见 `docs/superpowers/specs/2026-08-27-native-runtime-migration-design.md`。
+> Phase 1（daemon 化）实施中：目标态见「进程模型」章节的 banner 与 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`。
 
 ## 一句话概览
 
-Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi` 进程（`--mode rpc`），通过 Rust 宿主进程（HostServer）管理生命周期、授权和数据面，前端 WebView 经 v2 WebSocket 协议与运行时通信。
+Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi` 进程（`--mode rpc`），经 Rust 宿主进程（HostServer）管理生命周期、授权和数据面，前端 WebView 经 v2 WebSocket 协议与运行时通信；Phase 1 起宿主栈承载于独立进程 `picot-daemon`，app 退化为它的本地管理客户端（见「进程模型」）。
 
 ## 进程模型
 
+> **Phase 1 target（实施中；embedded 模式为开发期过渡；macOS-first）** —— 本章是 Phase 1 的目标态契约，后续任务以此对照；实施计划见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`，设计来源见 `docs/superpowers/specs/not-started/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4。T12 删除 embedded 路径后撤掉本 banner。
+
 ```text
-┌─────────────────────────────────────────────────┐
-│  Tauri App (Rust)                               │
-│  ┌───────────┐  ┌─────────────────────────────┐ │
-│  │  WebView  │  │  HostServer (axum, loopback)│ │
-│  │  (index)  │◄─┤  /v2/ws  /v2/bootstrap      │ │
-│  │           │  │  /workspaces/:wid/:sid      │ │
-│  └───────────┘  │  /api/* (compat, owner-aware)│ │
-│                 └──────────┬──────────────────┘ │
-│                            │ stdin/stdout RPC   │
-│                 ┌──────────▼──────────────────┐ │
-│                 │  pi --mode rpc               │ │
-│                 │  --extension picot-bridge.mjs│ │
-│                 │  (per workspace)             │ │
-│                 └─────────────────────────────┘ │
-└─────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  picot（Tauri app，进程 1）                           │
+│  窗口 / 菜单 / 对话框 / 更新器 / 退出策略             │
+│  WebView（窗口内容，加载 daemon origin）              │
+│  admin 客户端 + 导航镜像                              │
+│  child webview（browser pane）                        │
+└──────────────────────────┬────────────────────────────┘
+                           │  loopback 数据面 HTTP/WS（页面 origin）
+                           │  loopback admin WS（manager lease + epoch）
+┌──────────────────────────▼────────────────────────────┐
+│  picot-daemon（纯 tokio，进程 2）                     │
+│  HostServer（axum，loopback）                         │
+│    /v2/ws / /v2/bootstrap / WebView 静态资源          │
+│    /workspaces/:wid/:sid / /api/*（compat）           │
+│  NativePiManager / MetadataStore（唯一 SQLite 写者）  │
+│  RemoteAuth / EphemeralRegistry / SkillSourceRegistry │
+│  GitService / TerminalManager / admin RPC             │
+└──────────────────────────┬────────────────────────────┘
+                           │ stdin/stdout RPC（每 workspace 一个）
+┌──────────────────────────▼────────────────────────────┐
+│  pi --mode rpc（进程 3-N，每 workspace 一个）         │
+│  --extension picot-bridge.mjs                         │
+│  子进程注册表按 daemon pid 分文件                     │
+└───────────────────────────────────────────────────────┘
 ```
 
-### 三个进程角色
+### 四个进程角色
 
-1. **Tauri 主进程（Rust）**：窗口管理、系统对话框、terminal、窗口 owner 注册。每个注册工作区派生一个 native pi 进程。
-2. **HostServer（Rust, axum）**：loopback-only HTTP/WS 服务器。管理 runtime 生命周期（`NativePiManager`）、操作注册表（`OperationRegistry`）、授权（`WindowOwnerRegistry` capability）、数据面（`HostDataPlane` workspace containment）。
-3. **pi 子进程（Bun standalone）**：headless `--mode rpc`，加载 `picot-bridge.mjs` 扩展与 pi core API 通信。
+1. **picot（Tauri app 进程）**：窗口与菜单、系统对话框、更新器、child webview（browser pane）、设置界面、退出策略、daemon 管理器（只读探测 / detached spawn / 版本与 build 身份比对 / attach）、admin 客户端及其导航镜像与 app-surface 执行器。只保留与 Tauri 强耦合的关注点；不再承载 host 栈，也不再是 SQLite 写者。
+2. **picot-daemon（纯 tokio 进程）**：host 栈全部——`HostServer`（axum 的 HTTP/WS 路由与 WebView 静态资源服务）、`NativePiManager`、`MetadataStore`（**唯一 SQLite 写者**）、`RemoteAuth`、`EphemeralRegistry`、`SkillSourceRegistry`、`GitService`、`TerminalManager`，外加仅 `127.0.0.1` 的 admin RPC（manager lease + attachment epoch）。capability 签发与 owner 记录是 daemon 侧的授权权威；pi 子进程由 daemon 监管（`child_supervision` 注册表按 daemon pid 分文件）。它只依赖共享库 `picot-host`，而该库在 Cargo 层零 Tauri 依赖（guard 脚本持续强制，见「Phase 1 不变量」）——这条边界是 daemon 能独立运行的前提。
+3. **WebView**：窗口内容仍是既有前端，加载 daemon 的 host origin（`WebviewUrl::External`）；数据面 HTTP/WS 协议、静态资源 `/v/<fingerprint>/` 版本化与 no-store 语义不变。origin 会随 daemon 重启变化，跨重启的落位由 app 侧的受控导航迁移承担（见下节）。
+4. **pi 子进程（Bun standalone，每 workspace 一个）**：headless `--mode rpc`，加载 `picot-bridge.mjs`。宿主是 daemon：关窗或 app 挂掉都不再终止它，只有显式停止动作或 daemon 自身退出才停。
+
+### 边界与通道
+
+| 通道 | 端点 / 载体 | 认证 | 用途 |
+| --- | --- | --- | --- |
+| **host 数据面** | daemon host origin 的 `/v2/ws`（含 `/v2/*`、静态资源与 `/api/*` 兼容面） | desktop capability（owner + generation，既有语义） | WebView 与 runtime 的全部常规通信；不因 daemon 化改变 |
+| **admin WS** | daemon 的第二个 listener，`127.0.0.1:0`（**永不放 LAN**），`GET /admin` 升级 | 实例文件中的高熵 `adminToken`（32 随机字节 base64url） | 管理面：`daemon.status` / `daemon.stop` / owner 生命周期 / app-surface 转发 / 导航镜像事件；同一时刻只有一个 live manager（lease） |
+| **app-surface 转发** | admin WS 内的 `app_surface_request` / `surface_response`（`surface_progress` 回流进度） | 同 admin 通道 | 必须由 app 执行的能力：开工作区窗口、原生对话框（选目录/选图）、导出目标、更新器、devtools、relaunch、关窗批准与取消、菜单状态重算、browser pane 操作；5s 超时 → 类型化 `app_surface_unavailable` |
+| **导航镜像** | admin WS：attach 时的全量快照（owner/label/origin/generation/session 路由）+ 带 `epoch`/`generation` 的 `navigation_permit` / `permit_revoked` / `owner_binding_changed` | 同 admin 通道 | daemon 是授权权威（owner 记录、pending 导航许可）；app 持有 Tauri 的同步 `on_navigation` 委托，按镜像判定；许可事件需 ack，断连即 fail-closed |
+| **app 私有状态** | `app_config_dir/picot-daemon-settings.json`（0600、原子写） | 仅 app 进程读写 | 退出策略 `keepRunningAfterQuit`；daemon 不感知此值，也不进 SQLite |
+
+管理面与数据面是**通道级隔离**：admin RPC 不属于任何 principal 的权限面，也不对任何 transport（含 Phase 2 relay）开放；数据面权限跟 principal 走、不跟 transport 走（§4.4）。
+
+资源与数据归属：`MetadataStore` 由 daemon 独占（workspace registry + preferences），app 只经 loopback HTTP/WS 与之交互，不共享文件句柄；内嵌 Pi 资源（`src-tauri/resources/pi/`）由 daemon 复用同一份，不重复打包；WebView 静态资源由 daemon 的 `HostServer` 提供。
+
+### daemon 生命周期
+
+| 用户动作 | daemon 行为 |
+| --- | --- |
+| 关闭窗口 | **detach**：撤该 owner 的 capability 与窗口绑定，owner-scoped ephemeral 进程显式终止、temp 目录清理、terminal/git/关窗批准/skill 归属回收；**常驻 workspace/session runtime 照跑**（`detach_owner`）。再次打开窗口或工作区按 rebind 复用同一 runtime（新 owner + 新 generation） |
+| ⌘Q 退出（`keepRunningAfterQuit=false`，默认） | 优雅停止：`daemon.stop` 返回 **accepted**，app 再阻塞等到**确认进程真的退出**（pid + 进程启动时间身份校验，超时后 SIGTERM→SIGKILL 升级）；RPC 断连本身不算完成 |
+| ⌘Q 退出（`keepRunningAfterQuit=true`） | daemon 与 agent 存活；重开 app 接回现场（含运行中的 turn） |
+| 设置 → Restart daemon | app 管理的**替换事务**：确认弹窗列出正在跑的 agent → `daemon.stop` + 确认旧实例已退出 → 只 spawn 一个替代实例 → 等 ready 并取得 lease → 重建每个窗口的 capability 与绑定 → 把每个 WebView 受控迁移到新 origin（一次性导航许可；允许受控重载）→ 恢复各视图的 session 路由 |
+| app 被 SIGKILL / 崩溃 | admin 连接断开即标记该 attachment 死亡（短宽限）：撤其 capability、释放其窗口 label、执行与 detach 相同的归属回收；常驻 runtime 不动。重开 app 为这些 owner 重新签发，session-prepare 把「死 attachment 或已 detach 的 owner」名下的 runtime **原子 rebind** 到新 owner + generation；活 attachment 拥有的 runtime 永不被抢 |
+
+启动序（管理权在 app）：只读探测（实例文件 + 实例一致性校验 + `kill(pid,0)` + `GET /health`，**从不打开 admin 连接**）→ 未运行则 detached spawn（独立进程组，不进任何 kill-on-exit 名单）→ 等 ready（15s 超时，错误带 daemon 日志路径）→ 版本或 `buildId` 不匹配则**先取得 lease 再 stop、再重拉**（取不到 lease 就不动别人的 daemon）→ attach（`admin_hello` 取得 manager lease，第二个 live manager 被拒，在位者不受影响）。
+
+- **实例文件**：`<data_dir>/picot-daemon.json` — `{pid, processStartTime, hostOrigin, adminOrigin, adminToken, startedAt, version, buildId, manager{pid, processStartTime, startedAt, appVersion, buildId}}`。只由 daemon 写（tmp+rename 原子，临时文件以 0600 **创建**、父目录 0700）；token 不进日志与错误文本；adoption 是 daemon 授权的动作（hello → 授权 → daemon 重写文件），app 绝不改写该文件。身份校验统一用 pid + 进程启动时间（与「子进程注册表与孤儿清扫」同一纪律）。
+- **单实例**：`<data_dir>/picot-daemon.lock` 文件锁；重复启动立即退出并复用现有实例。已有存活 manager 时第二个 app 收 `BlockedByOtherApp` 并退出，**绝不踢掉在位 manager**。
+- **端口与 origin**：数据面与 admin 均临时分配（bind 0），daemon ready 后把两个 origin 写入实例文件；app 读到 origin 才造窗与连接。
+- **退出与信号**：daemon 自身安装 SIGTERM/SIGINT/SIGHUP 处理，5s 宽限；超时不清理子进程注册表，交给下一次 daemon 的 `sweep_orphans` 收拾。
+- **`PICOT_DAEMON` 开发开关**：`embedded` 在 app 进程内起同一个 `DaemonState`，走**同一条** admin 协议与同一个 `AdminClient`（差异只有进程边界）；这是验证期临时通道，验证一个迭代后删除，不留双轨。
+- **macOS-first**：Phase 1 的 sidecar 打包、签名与验证只覆盖 macOS（arm64/x64 DMG）；host 依赖在 `Cargo.toml` 里仍按 `target_os = "macos"` 门控，解门控 + Windows 验证是单独跟踪的后续任务。
+
+### Phase 1 不变量
+
+1. **零数据面 Tauri command**：WebView 的生产路径全部走 `/v2/ws` 与 HTTP；`invoke_handler` 里唯一的 command 是 daemon 管理三件套（`daemon_status` / `daemon_set_keep_running` / `daemon_restart`），每条都在 `permissions/default.toml` 显式声明，并校验调用窗口 label 属于 app 自己的窗口账本——不依赖 `windows:["*"]` / `core:default` 之类通配。
+2. **关窗 = detach**：窗口销毁不再直调 `stop_for_owner` / `stop_for_window_destroy`；停某个工作区 runtime 需要显式动作（sidebar 工作区菜单的「停止运行」→ 数据面 `workspace_close`，有活 runtime 时先确认）。`workspace.remove` 保持**纯列表移除**语义：行消失，agent 照跑。
+3. **loopback-only**：`HostServer` 与 admin listener 一律只绑 `127.0.0.1`，**与持久化偏好无关**（旧 `mobile.lanAccessEnabled` 行即使残留也被忽略）；LAN 移动访问由 Phase 2 relay 取代（§4.4），daemon 永不监听 LAN 与公网。
 
 ## 启动流程（native runtime）
 
@@ -44,7 +96,7 @@ fn native_runtime_enabled(app) -> bool {
 
 1. 检查 `PICOT_RUNTIME=native`（debug 构建限定）
 2. **冷启动进 landing**：不注册默认工作区、不预创建 session、不派生 Pi 进程，registry 在启动期零改动（2026-09-03「冷启动一律以 ~/.pi/tmp 为 workspace」决策已废弃）。冷启动仍零派生；landing 配置面（Models/MCP/高级配置/软件包技能/advisor）按需懒派生 bridge 服务 runtime（`NativeRuntimeType::Config`：sessionless+toolless，cwd `~/.pi/tmp`，不注册工作区，global-only，经 `ephemeral_command` 通道定址，transition commit sweep 一并回收——见 `2026-09-18-landing-bridge-runtime-design.md` v2）。owner 以 `TemporaryKind::Landing` 创建（label `native-landing`；canonical home 仅作 owner 记录占位，永不为 workspace 身份、scope 或授权输入）
-3. 创建 `NativePiManager` + `HostServer`（loopback:0 绑定）
+3. 创建 `NativePiManager` + `HostServer`（loopback:0 绑定）——Phase 1 起这两个对象与 host 栈其余状态全部在 `picot-daemon` 内构造（`DaemonState::start`），app 只做探测 / spawn / attach
 4. 打开 landing 窗口加载 `{origin}/`；WebView 在 bootstrap 期分叉加载 `landing.js`（仅构造 transport、sidebar 四 seam、transition controller、landing notice 与 landing 版 Quick Chat，不建任何 chat-lifecycle 对象）。首次进入工作区必为跨工作区原地切换（prepare → commit → navigate，overlay 换屏）；workspace 的 `same`/`cross` 分类按 owner 的 Registered 绑定派生，Landing owner 永不 same（即使占位 home 本身是已注册工作区）
 5. landing owner 首次 commit 后重绑为 Registered owner；窗口销毁清理、New Session 菜单状态与 Cmd+N 派发一律按 owner 注册表记录判定，不按 label 前缀（label 终身不变，非状态信号）
 6. workspace 权威性为 Registered-only：Git、terminal、文件/数据 scope、项目级 config/skills 与 Side Chat 拒绝 Landing/Temporary owner；Quick Chat 是唯一 landing 例外（自带一次性 temp cwd，显式准入路径单独测试）
@@ -83,7 +135,7 @@ fn native_runtime_enabled(app) -> bool {
 
 删除前置条件不变：D10 Stage 2+ 遥测需显示这些条目在两个稳定 release 周期内零命中。
 
-**LAN 边界**：HostServer 默认仅绑定 `127.0.0.1`（loopback-only）。用户在 设置 → Mobile Access 显式开启后（`mobile.lanAccessEnabled`，重启生效），host 绑定 `0.0.0.0`，移动端经 `/pair.html` 用桌面铸造的配对令牌换 device token；配对后 v1 仅开放只读状态，读写面仍为 desktop capability 专属（Gate B 远程矩阵未实现前不开放）。
+**LAN 边界（Phase 1）**：`HostServer` 与 admin listener 一律只绑 `127.0.0.1`（loopback-only），**与任何持久化偏好无关**——旧的「设置 → Mobile Access」（`mobile.lanAccessEnabled`）已随 Phase 1 移除，残留偏好行被忽略、不生效。配对与 device token 机制（`RemoteAuth`、`/v2/auth/exchange`、`/pair.html`）保留在 host 侧，但在 loopback-only 下没有远程可达路径：它们是 Phase 2 relay 复用的既有资产（§4.4）。远程访问一律走 daemon **出站** relay + E2EE，daemon 永不监听 LAN 与公网。
 
 ## 授权模型
 
@@ -495,10 +547,10 @@ composer 工具箱「导出 HTML」的数据流：
 
 ## 安全边界
 
-1. **Loopback 默认**：HostServer 默认只绑 loopback；`mobile.lanAccessEnabled` 显式开启后才绑全部网卡（D4 移动接入；缺省一律 loopback，配对 token 仅桌面端可铸造）
+1. **Loopback 唯一绑定**：HostServer 与 admin listener 只绑 `127.0.0.1`；持久化的 `mobile.lanAccessEnabled` 被忽略（LAN 移动接入已由 Phase 2 relay 取代，见「进程模型 → Phase 1 不变量」与 §4.4）。管理面（admin WS）与数据面通道级隔离：admin 仅 app 进程可达，不对任何 transport 开放
 2. **Owner capability**：每个桌面窗口持唯一 32 字节随机 capability
 3. **Workspace containment**：所有文件读写限制在注册根目录内（会话 HTML 导出例外：写入路径由用户在原生另存为对话框中选定，见「会话 HTML 导出」）；`file_create`/`file_rename`/`file_delete` 同样只在注册根内生效，且受 owner+workspace+generation 门禁；`file_mentions` 的列举按上表根分级可越出（仅 desktop，读写不受影响）
-4. **Generation 失效**：workspace transition 使旧代授权、操作与导出令牌全部失效；旧代 runtime 进程保留存活但不可达（授权闸门拒收），至窗口销毁/owner 撤销/app 退出、显式 restart（`restart_runtime` 控制面命令，Registered owner 经 Settings 触发）或返回 rebind
+4. **Generation 失效**：workspace transition 使旧代授权、操作与导出令牌全部失效；旧代 runtime 进程保留存活但不可达（授权闸门拒收），直至返回到新 generation 的 rebind（含 Phase 1 的 detach 后重绑）、显式 `restart_runtime` / `workspace_close`（Registered owner 经 Settings 或 sidebar 触发），或 daemon 按退出策略终止——Phase 1 起关窗只 detach，不再停 runtime（见「进程模型 → daemon 生命周期」）
 5. **跨 workspace 事件可见性**（2026-09-20 拍板）：持有 desktop capability 的本机窗口可订阅任意 live runtime 的全部非阻塞事件（消息正文、tool 输出、widget、notify）；阻塞式 `extension_ui_request`（select/confirm/input/editor）仍只投 `authorize_target` 通过的订阅者。desktop capability 只由原生窗口 owner registry 铸发，LAN 配对设备（Browser 类客户端）拿不到。
 6. **匿名遥测**：仅 allowlisted 粗粒度字段，无 per-user/per-token 维度
 7. **环境配置页的安装**（2026-10-06 定调）：安装由内嵌 Pi 执行 `pi --no-session -p "<prompt>"`，prompt 里的范围与官方来源约束**是模型行为、不是内核边界**——agent 保有 shell 能力，host 无法证明过程中未触及其他资源。v1 明确接受这一残余风险：不引入 OS 级沙箱、不做进程树零逃逸保证、不做重启可恢复的清理状态、不使用 Windows Job Object；取消与 app 退出只 kill 直接子进程，可能留下孤儿。事后事实一律以 host 复检为准。
