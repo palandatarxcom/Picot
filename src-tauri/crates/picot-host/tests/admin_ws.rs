@@ -116,7 +116,7 @@ impl StepLog {
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     state: Arc<DaemonState>,
     admin: AdminServer,
     token: String,
@@ -149,11 +149,17 @@ impl Fixture {
         .expect("the admin listener binds");
         state.install_admin(admin.clone());
         Self {
-            _temp: temp,
+            temp,
             state,
             admin,
             token,
         }
+    }
+
+    /// The fixture's own root: the test can create a workspace under it and
+    /// register it with the daemon's metadata store.
+    fn temp(&self) -> &std::path::Path {
+        self.temp.path()
     }
 
     fn admin_ws_url(&self) -> String {
@@ -430,6 +436,108 @@ async fn owner_create_mints_a_capability_that_authenticates() {
         welcome["epoch"].as_u64().unwrap(),
         "the owner is stamped with the granting attachment epoch"
     );
+    fixture.state.shutdown_graceful("test").await;
+}
+
+/// T9 amendment (plan D10 step 4): the restart transaction rebuilds one owner
+/// per captured window, and the app does **not** know a workspace window's
+/// canonical root — only its `workspaceId` (the daemon minted that owner). The
+/// daemon is the authority for its own registry data (D4), so `owner.create`
+/// accepts a request without `cwd` and resolves the registered root itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_create_without_cwd_resolves_the_registered_workspace_root() {
+    use picot_host::window_owner::OwnerWorkspaceSnapshot;
+
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let root = fixture.temp().join("project");
+    std::fs::create_dir_all(&root).expect("workspace dir");
+    let (row, _added) = fixture
+        .state
+        .metadata
+        .lock()
+        .expect("metadata lock")
+        .add_workspace(&root)
+        .expect("register the workspace");
+    let wid = row.workspace_id.clone();
+    let canonical = std::path::PathBuf::from(row.canonical_path.clone());
+
+    let (mut socket, _welcome) = fixture.attach().await;
+    let response = request(
+        &mut socket,
+        "r1",
+        "owner.create",
+        json!({
+            "label": format!("native-workspace-{wid}"),
+            "workspaceId": wid,
+            "port": 0,
+            "origin": "http://127.0.0.1:3001",
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"]["workspaceId"], wid, "{response}");
+
+    let owner = OwnerId::from_string(response["result"]["owner"].as_str().unwrap().to_string());
+    match fixture.state.owner_registry.owner_current_workspace(&owner) {
+        OwnerWorkspaceSnapshot::Registered { root, .. } => assert_eq!(
+            root, canonical,
+            "the daemon resolved the registered root, not a caller-supplied path"
+        ),
+        other => panic!("expected the registered workspace, got {other:?}"),
+    }
+
+    fixture.state.shutdown_graceful("test").await;
+}
+
+/// The other half of the T9 amendment: with neither `cwd` nor a resolvable
+/// `workspaceId` the op is refused (fail closed — never invent a home), and a
+/// `workspaceId` the registry does not know is refused rather than recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_create_without_cwd_fails_closed() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let (mut socket, _welcome) = fixture.attach().await;
+
+    let no_cwd_no_workspace = request(
+        &mut socket,
+        "r1",
+        "owner.create",
+        json!({
+            "label": "native-landing",
+            "port": 0,
+            "origin": "http://127.0.0.1:3001",
+        }),
+    )
+    .await;
+    assert_eq!(no_cwd_no_workspace["ok"], false, "{no_cwd_no_workspace}");
+    assert!(
+        no_cwd_no_workspace["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cwd"),
+        "the refusal names the missing argument: {no_cwd_no_workspace}"
+    );
+
+    let unknown_workspace = request(
+        &mut socket,
+        "r2",
+        "owner.create",
+        json!({
+            "label": "native-workspace-ghost",
+            "workspaceId": "ghost",
+            "port": 0,
+            "origin": "http://127.0.0.1:3001",
+        }),
+    )
+    .await;
+    assert_eq!(unknown_workspace["ok"], false, "{unknown_workspace}");
+    assert!(
+        unknown_workspace["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ghost"),
+        "the refusal names the unknown workspace: {unknown_workspace}"
+    );
+
     fixture.state.shutdown_graceful("test").await;
 }
 

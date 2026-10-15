@@ -275,26 +275,29 @@ impl AdminClient {
     /// what the daemon returned (never from the arguments this app sent), which
     /// is why a landing window can load its origin without a permit while a
     /// caller-supplied origin cannot smuggle itself into the mirror.
+    ///
+    /// `canonical_cwd` is `None` for a **workspace** owner being rebuilt (the
+    /// restart transaction, T9): the app knows only the `workspaceId` the daemon
+    /// minted, so the daemon resolves the canonical root from its own workspace
+    /// registry. The argument is omitted from the frame rather than sent empty.
     pub async fn create_owner(
         &self,
         label: &str,
-        canonical_cwd: &str,
+        canonical_cwd: Option<&str>,
         port: u16,
         origin: &str,
         workspace_id: Option<&str>,
     ) -> Result<CreatedOwner, String> {
-        let reply = self
-            .request(
-                "owner.create",
-                json!({
-                    "label": label,
-                    "cwd": canonical_cwd,
-                    "port": port,
-                    "origin": origin,
-                    "workspaceId": workspace_id,
-                }),
-            )
-            .await?;
+        let mut args = json!({
+            "label": label,
+            "port": port,
+            "origin": origin,
+            "workspaceId": workspace_id,
+        });
+        if let Some(cwd) = canonical_cwd {
+            args["cwd"] = Value::String(cwd.to_string());
+        }
+        let reply = self.request("owner.create", args).await?;
         let field = |key: &str| -> Result<String, String> {
             reply
                 .get(key)
@@ -803,7 +806,7 @@ mod tests {
         let created = client
             .create_owner(
                 "native-landing",
-                "/workspace",
+                Some("/workspace"),
                 5001,
                 "http://127.0.0.1:5001",
                 None,
@@ -865,7 +868,13 @@ mod tests {
         let fixture = boot().await;
         let (client, mirror) = attach(&fixture, Arc::new(RecordingExecutor::default())).await;
         let created = client
-            .create_owner("w1", "/workspace", 5001, "http://127.0.0.1:5001", None)
+            .create_owner(
+                "w1",
+                Some("/workspace"),
+                5001,
+                "http://127.0.0.1:5001",
+                None,
+            )
             .await
             .expect("owner.create");
         let owner = OwnerId::from_string(created.owner);
@@ -922,7 +931,7 @@ mod tests {
         let created = client
             .create_owner(
                 "native-landing",
-                "/workspace",
+                Some("/workspace"),
                 5001,
                 "http://127.0.0.1:5001",
                 None,
@@ -977,7 +986,13 @@ mod tests {
         let (first, first_mirror) = attach(&fixture, Arc::new(RecordingExecutor::default())).await;
         let epoch_one = first_mirror.epoch().expect("attached");
         let created = first
-            .create_owner("w1", "/workspace", 5001, "http://127.0.0.1:5001", None)
+            .create_owner(
+                "w1",
+                Some("/workspace"),
+                5001,
+                "http://127.0.0.1:5001",
+                None,
+            )
             .await
             .expect("owner.create");
         let owner = created.owner;
@@ -1069,7 +1084,13 @@ mod tests {
         let fixture = boot().await;
         let (client, mirror) = attach(&fixture, Arc::new(RecordingExecutor::default())).await;
         let created = client
-            .create_owner("w1", "/workspace", 5001, "http://127.0.0.1:5001", None)
+            .create_owner(
+                "w1",
+                Some("/workspace"),
+                5001,
+                "http://127.0.0.1:5001",
+                None,
+            )
             .await
             .expect("owner.create");
         let owner = created.owner;

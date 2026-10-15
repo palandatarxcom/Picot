@@ -1,5 +1,5 @@
 // ABOUTME: The app-side daemon client: the manager (probe/spawn/adopt), the confirmed-exit waiter,
-// ABOUTME: and the localized "Picot is already running" policy for a blocked second instance.
+// ABOUTME: the restart transaction, and the localized "Picot is already running" policy.
 
 //! # daemon_client (plan Task 4 Step 3)
 //!
@@ -17,6 +17,15 @@
 //! - [`quit_policy`] — the app-private `keepRunningAfterQuit` file and the
 //!   quit transaction (accepted ≠ completed: app exit blocks on a *confirmed*
 //!   daemon death, plan D12/T8);
+//! - [`window_ledger`] — the app's own registry of the windows it created
+//!   (label, owner, owner home, workspace, route): the restart transaction's
+//!   pre-state and T10's caller-validation set;
+//! - [`restart`] — the app-managed restart transaction (plan D10/T9): stop the
+//!   captured instance, confirm its death **by pid + start time**, spawn exactly
+//!   one replacement, rebuild one owner per captured window, migrate every view
+//!   to the new origin, restore its route;
+//! - [`commands`] — the Tauri commands' daemon half: T9's `daemon_restart`
+//!   (T10 adds the other two commands and all permission wiring);
 //! - [`present_blocked_by_other_app`] — the localized dialog + non-zero exit for
 //!   a second Picot instance while another app manages the daemon.
 //!
@@ -27,20 +36,25 @@
 //! channel and opens the landing window against the daemon's host origin.
 //! Wired (T8): app exit runs [`quit_policy`]'s transaction from
 //! `RunEvent::ExitRequested`, `RunEvent::Exit` and the SIGTERM/SIGINT/SIGHUP
-//! handlers. Still unwired: the three admin commands and their UI (T10) and the
-//! restart transaction (T9) — items those tasks own, marked `#[allow(dead_code)]`
-//! where they exist already and documented at their definitions.
+//! handlers. Wired (T9): [`restart`]'s transaction behind the `daemon_restart`
+//! command and `crate::run_restart`, with the window ledger feeding the
+//! capture. Still unwired: the three admin commands' permission wiring and UI
+//! (T10) — items that task owns, marked `#[allow(dead_code)]` where they exist
+//! already and documented at their definitions.
 //!
 //! [`navigation_mirror`] is the app-side half of the daemon's authorization
 //! mirror: the WebView's synchronous `on_navigation` delegate reads it, and it
 //! fails closed (only the opaque `about:` documents survive a dropped channel).
 
 pub mod admin_client;
+pub mod commands;
 pub mod exit_waiter;
 pub mod manager;
 pub mod navigation_mirror;
 pub mod quit_policy;
+pub mod restart;
 pub mod surface_ops;
+pub mod window_ledger;
 
 /// The exit code of a second instance that is blocked by an already-running
 /// Picot. Non-zero and distinct from the usage error (2) and from a generic

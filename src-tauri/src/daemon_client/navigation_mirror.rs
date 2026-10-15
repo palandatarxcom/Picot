@@ -257,6 +257,25 @@ impl NavigationMirror {
             .map(|record| record.label.clone())
     }
 
+    /// The full wire row for a label, if the mirror has one.
+    ///
+    /// The restart transaction's capture (T9) reads it: the row carries the
+    /// owner's workspace binding and route, which the window ledger cannot know
+    /// for a daemon-minted workspace owner.
+    pub fn owner_row_for_label(&self, label: &str) -> Option<MirrorOwner> {
+        let state = self.inner.lock().expect("mirror lock poisoned");
+        let owner = state.labels.get(label)?;
+        let row = state.owners.get(owner)?;
+        Some(MirrorOwner {
+            owner: row.owner.clone(),
+            label: row.label.clone(),
+            current_origin: row.current_origin.clone(),
+            workspace_id: row.workspace_id.clone(),
+            session_route: row.session_route.clone(),
+            generation: row.generation,
+        })
+    }
+
     /// Whether the owner is bound to a workspace, or `None` for an unknown
     /// owner — the menu/Cmd+N gate's input (never the window label).
     pub fn owner_has_workspace(&self, owner: &str) -> Option<bool> {

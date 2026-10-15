@@ -19,7 +19,12 @@ use daemon_client::exit_waiter::{ExitWaiter, ProcessIdentity};
 use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
 use daemon_client::navigation_mirror::NavigationMirror;
 use daemon_client::quit_policy::{self, QuitOutcome};
+use daemon_client::restart::{
+    CapturedView, ManagerSpawner, OwnerBinding, ReplacementSpawner, RestartConfig,
+    RestartCoordinator, RestartLink, RestartReport, RestartTarget, ViewMigration,
+};
 use daemon_client::surface_ops::ForwardedSurfaceOps;
+use daemon_client::window_ledger::{route_for_url, LedgerRow, WindowLedger};
 use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::daemon::DaemonState;
 use picot_host::{child_supervision, officecli_watch, window_owner};
@@ -31,7 +36,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -410,11 +415,30 @@ fn open_native_workspace_window(
     capability: &str,
 ) -> Result<(), String> {
     let label = format!("native-workspace-{}", target.workspace_id);
-    let url = format!(
-        "{}/workspaces/{}/sessions/{}",
-        host_origin, target.workspace_id, target.session_id
+    let route = format!(
+        "/workspaces/{}/sessions/{}",
+        target.workspace_id, target.session_id
     );
-    open_native_window(app, &label, &url, mirror, owner, capability)
+    // The ledger remembers what the app knows about this window (T9/T10): the
+    // workspace binding and the route. The owner's canonical root is
+    // deliberately **not** here — the daemon minted that owner and stays the
+    // authority for it (the T9 `owner.create` amendment).
+    if let Some(ledger) = app.try_state::<WindowLedger>() {
+        ledger.record(LedgerRow::workspace(
+            &label,
+            owner.as_str(),
+            &target.workspace_id,
+            Some(route.clone()),
+        ));
+    }
+    open_native_window(
+        app,
+        &label,
+        &format!("{host_origin}{route}"),
+        mirror,
+        owner,
+        capability,
+    )
 }
 
 fn canonical_if_exists(dir: PathBuf) -> Option<PathBuf> {
@@ -1478,39 +1502,148 @@ fn canonical_home_dir() -> Result<PathBuf, String> {
     fs::canonicalize(&home).map_err(|error| format!("Cannot canonicalize home directory: {error}"))
 }
 
-/// The app's daemon link (plan Task 5).
+/// The app's live daemon attachment (plan Task 5/T9).
 ///
 /// One mode-independent shape for both process layouts: the admin client, the
 /// navigation mirror it feeds, and the mode-specific handles (`embedded` holds
 /// the in-process daemon state; `external` holds the manager whose spawn and
 /// child handle the quit path (T8) and the restart transaction (T9) reuse).
 ///
+/// The **session** is swappable: a restart replaces the daemon, so the admin
+/// client, the origin the WebViews load from and the process identity all
+/// change together ([`DaemonLink::replace_session`]). Everything else in the
+/// app reads them through this one place.
+///
 /// Managed as app state so the window lifecycle, the menu gate and
 /// `RunEvent::Exit` can reach it; nothing here is a Tauri command (D8 keeps the
-/// app's command surface empty until T10).
-pub struct DaemonLink {
-    pub mode: DaemonMode,
+/// app's command surface to the three daemon commands, T10).
+pub struct DaemonSession {
     pub client: Arc<AdminClient>,
-    pub mirror: Arc<NavigationMirror>,
-    /// `Some` in embedded mode only: the in-process daemon this app runs.
-    pub embedded: Option<Arc<DaemonState>>,
-    /// `Some` in external mode only: how this app started/adopted the daemon.
-    pub manager: Option<Arc<DaemonManager>>,
     /// The daemon's HTTP origin (the WebView's page origin in both modes).
     pub host_origin: String,
+    /// The daemon process identity captured at attach (external mode):
+    /// pid + process start time, the only thing a stop/restart is allowed to
+    /// signal (plan D12). `None` in embedded mode — there is no other process.
+    pub daemon: Option<ProcessIdentity>,
+}
+
+pub struct DaemonLink {
+    pub mode: DaemonMode,
+    session: RwLock<DaemonSession>,
+    pub mirror: Arc<NavigationMirror>,
+    /// `Some` in embedded mode only: the in-process daemon this app runs. Also
+    /// swappable — an embedded restart reboots it in place (T9).
+    embedded: RwLock<Option<Arc<DaemonState>>>,
+    /// `Some` in external mode only: how this app started/adopted the daemon.
+    pub manager: Option<Arc<DaemonManager>>,
+    /// The WebView bundle the embedded daemon serves; an embedded restart boots
+    /// its replacement from the same directory (plan D2/T9).
+    pub static_dir: PathBuf,
     /// The daemon's private data directory: `instance_path`/`log_path` below
     /// are derived from it (the quit flow names both).
     pub data_dir: PathBuf,
     /// `app_config_dir`: the app-private quit policy (`keepRunningAfterQuit`)
     /// lives here and is read *at exit*, never by the daemon (spec §3.2.2).
     pub config_dir: PathBuf,
-    /// The daemon process identity captured at attach (external mode):
-    /// pid + process start time, the only thing the quit flow is allowed to
-    /// signal (plan D12). `None` in embedded mode — there is no other process.
-    pub daemon: Option<ProcessIdentity>,
+    /// Labels the restart transaction is destroying and re-creating (T9): the
+    /// window-destroyed path must not detach the owner it is about to re-mint
+    /// for the same label.
+    migrating: Mutex<std::collections::HashSet<String>>,
 }
 
 impl DaemonLink {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mode: DaemonMode,
+        session: DaemonSession,
+        mirror: Arc<NavigationMirror>,
+        embedded: Option<Arc<DaemonState>>,
+        manager: Option<Arc<DaemonManager>>,
+        data_dir: PathBuf,
+        config_dir: PathBuf,
+        static_dir: PathBuf,
+    ) -> Self {
+        Self {
+            mode,
+            session: RwLock::new(session),
+            mirror,
+            embedded: RwLock::new(embedded),
+            manager,
+            data_dir,
+            config_dir,
+            static_dir,
+            migrating: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// The in-process daemon (embedded mode), if any.
+    pub fn embedded(&self) -> Option<Arc<DaemonState>> {
+        self.embedded
+            .read()
+            .expect("embedded daemon lock")
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    /// Install the replacement in-process daemon (embedded restart, T9).
+    pub fn set_embedded(&self, state: Arc<DaemonState>) {
+        *self.embedded.write().expect("embedded daemon lock") = Some(state);
+    }
+
+    /// The live admin client (a restart swaps it).
+    pub fn client(&self) -> Arc<AdminClient> {
+        Arc::clone(&self.session.read().expect("daemon session lock").client)
+    }
+
+    /// The origin the WebViews load from.
+    pub fn host_origin(&self) -> String {
+        self.session
+            .read()
+            .expect("daemon session lock")
+            .host_origin
+            .clone()
+    }
+
+    /// The verified daemon identity, if this app has one (external mode).
+    pub fn daemon(&self) -> Option<ProcessIdentity> {
+        self.session
+            .read()
+            .expect("daemon session lock")
+            .daemon
+            .clone()
+    }
+
+    /// Install a replacement attachment and return the superseded session.
+    ///
+    /// The caller disconnects the old client immediately: its fail-closed
+    /// mirror clear must never land after the new snapshot (plan T9 step 4).
+    pub fn replace_session(&self, session: DaemonSession) -> DaemonSession {
+        let mut slot = self.session.write().expect("daemon session lock");
+        std::mem::replace(&mut *slot, session)
+    }
+
+    /// Mark labels as being migrated by the restart transaction.
+    pub fn begin_migration(&self, labels: &[String]) {
+        let mut guard = self.migrating.lock().expect("migration label lock");
+        guard.extend(labels.iter().cloned());
+    }
+
+    /// Clear the migration marks once the transaction is done with them.
+    pub fn end_migration(&self, labels: &[String]) {
+        let mut guard = self.migrating.lock().expect("migration label lock");
+        for label in labels {
+            guard.remove(label);
+        }
+    }
+
+    /// Whether the restart transaction currently owns this label.
+    pub fn is_migrating(&self, label: &str) -> bool {
+        self.migrating
+            .lock()
+            .expect("migration label lock")
+            .contains(label)
+    }
+
     /// The app-side owner/authorization image the daemon feeds (plan D4).
     fn mirror_for(app: &AppHandle) -> Option<Arc<NavigationMirror>> {
         app.try_state::<DaemonLink>()
@@ -1547,7 +1680,7 @@ impl DaemonLink {
         );
         match action {
             quit_policy::QuitAction::EmbeddedDrain => {
-                if let Some(state) = self.embedded.as_ref() {
+                if let Some(state) = self.embedded() {
                     // The exit path runs on the main thread; the drain is async
                     // (runtimes, terminals, watches, the child registry, the
                     // host listener), so it is driven to completion here exactly
@@ -1560,7 +1693,7 @@ impl DaemonLink {
                 log::info!(
                     "[picot] exiting: keepRunningAfterQuit — detaching; the daemon and its agents keep running"
                 );
-                self.client.disconnect();
+                self.client().disconnect();
                 QuitOutcome::Detached
             }
             quit_policy::QuitAction::StopAndConfirm => self.stop_and_confirm(),
@@ -1570,19 +1703,18 @@ impl DaemonLink {
     /// Default external exit: stop the daemon, then block on a **confirmed**
     /// death (plan D12). Only a verified identity is waited on or signalled.
     fn stop_and_confirm(&self) -> QuitOutcome {
-        let Some(identity) = self.daemon.clone() else {
+        let client = self.client();
+        let Some(identity) = self.daemon() else {
             // No verified process identity was captured (the daemon is not this
             // app's to signal): releasing the channel is all that is safe.
             log::warn!(
                 "[picot] exiting: no verified daemon identity; releasing the admin channel only"
             );
-            self.client.disconnect();
+            client.disconnect();
             return QuitOutcome::Detached;
         };
         let flow = quit_policy::QuitFlow::new(
-            Arc::new(quit_policy::AdminStopRequester::new(Arc::clone(
-                &self.client,
-            ))),
+            Arc::new(quit_policy::AdminStopRequester::new(client)),
             ExitWaiter::new(),
             identity,
             self.manager
@@ -1595,7 +1727,7 @@ impl DaemonLink {
         let outcome = tauri::async_runtime::block_on(flow.run());
         // The daemon is gone (or unconfirmed): either way the app's channel is
         // done, and closing it deliberately keeps the next attach clean.
-        self.client.disconnect();
+        self.client().disconnect();
         outcome
     }
 }
@@ -1727,7 +1859,7 @@ async fn start_embedded_daemon(
     state.install_admin(admin.clone());
     surface.attach(admin.clone());
     state.install_control_handler();
-    register_embedded_state(app, &state);
+    register_embedded_state(app.handle(), &state);
     let host_origin = state.origin().to_string();
     let client = AdminClient::connect(
         admin.origin(),
@@ -1760,13 +1892,13 @@ async fn start_embedded_daemon(
 /// path, the browser-pane runtime). In external mode the same objects live in
 /// the daemon process and the app holds no copy (plan D4/D5) — the dispatcher
 /// reaches them there through `DaemonState`.
-fn register_embedded_state(app: &tauri::App, state: &Arc<DaemonState>) {
+fn register_embedded_state(app: &AppHandle, state: &Arc<DaemonState>) {
     let host = state.host.clone();
     // Browser panes (spec 2026-09-22): child webviews keyed by tab id. The
     // runtime needs the app handle, so it is constructed here and registered
     // with the host through the `PaneSurface` slot (plan D1/Step-3 exceptions).
     let browser_panes = Arc::new(browser_pane::BrowserPaneRuntime::new(
-        app.handle().clone(),
+        app.clone(),
         host.origin(),
     ));
     host.set_browser_panes(browser_panes.clone());
@@ -1801,6 +1933,10 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         .map_err(|error| format!("Cannot resolve Picot app config directory: {error}"))?;
     let bundle_identifier = app.config().identifier.clone();
     let mode = daemon_mode()?;
+    // The app's window registry (T9/T10): recorded as windows are created, read
+    // by the restart transaction's capture. Managed before the daemon boots, so
+    // the landing window's row can be written as it opens.
+    app.manage(WindowLedger::new());
     // The app's navigation/authorization image and the pump that executes
     // forwarded surface ops, both shared by the two modes.
     let mirror = Arc::new(NavigationMirror::new());
@@ -1812,7 +1948,7 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         DaemonMode::External => tauri::async_runtime::block_on(attach_external_daemon(
             data_dir.clone(),
             config_dir.clone(),
-            static_dir,
+            static_dir.clone(),
             bundle_identifier,
             executor,
             Arc::clone(&mirror),
@@ -1821,7 +1957,7 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
             app,
             data_dir.clone(),
             config_dir.clone(),
-            static_dir,
+            static_dir.clone(),
             bundle_identifier,
             executor,
             Arc::clone(&mirror),
@@ -1848,7 +1984,7 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
     let home = canonical_home_dir()?;
     let landing = tauri::async_runtime::block_on(client.create_owner(
         "native-landing",
-        &home.to_string_lossy(),
+        Some(&home.to_string_lossy()),
         0,
         &host_origin,
         None,
@@ -1860,17 +1996,31 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         window_owner::OwnerId::from_string(landing.owner.clone()),
         &landing.capability,
     )?;
-    app.manage(DaemonLink {
+    if let Some(ledger) = app.try_state::<WindowLedger>() {
+        ledger.record(LedgerRow::landing(
+            "native-landing",
+            &landing.owner,
+            &home.to_string_lossy(),
+        ));
+    }
+    app.manage(DaemonLink::new(
         mode,
-        client,
+        DaemonSession {
+            client,
+            host_origin: host_origin.clone(),
+            daemon,
+        },
         mirror,
         embedded,
         manager,
-        host_origin: host_origin.clone(),
         data_dir,
         config_dir,
-        daemon,
-    });
+        static_dir,
+    ));
+    // The restart transaction's cross-request state (T9): managed, so two
+    // triggers coalesce onto one replacement however many coordinators they
+    // build.
+    app.manage(Arc::new(daemon_client::restart::RestartGate::default()));
     // Startup default is disabled (the first window is the landing); recompute
     // once now that the window exists. No-op wherever no menu bar is installed.
     update_new_session_menu_state(app.handle());
@@ -2123,9 +2273,22 @@ fn handle_window_destroyed(window: &tauri::Window) {
     if let Some(panes) = window.try_state::<browser_pane::BrowserPaneState>() {
         panes.0.destroy_all_for_window(label);
     }
+    // The app's own window record dies with the window (T9): a label the app no
+    // longer has must not be migrated by a later restart.
+    if let Some(ledger) = window.try_state::<WindowLedger>() {
+        ledger.forget(label);
+    }
     let Some(link) = window.app_handle().try_state::<DaemonLink>() else {
         return;
     };
+    // The restart transaction destroys a window only to re-create it at the new
+    // origin with a fresh capability (T9 step 5). Detaching here would revoke
+    // the owner it just minted for the same label, so a migration in progress
+    // owns the label for the duration of the transaction.
+    if link.is_migrating(label) {
+        log::info!("[picot] window {label} destroyed by the restart migration; not detaching");
+        return;
+    }
     // The daemon owns the label↔owner registry; the app's copy is the
     // daemon-fed mirror (D4), so a label with no owner is simply nothing to do.
     let Some(owner) = link.mirror.owner_for_label(label) else {
@@ -2135,7 +2298,7 @@ fn handle_window_destroyed(window: &tauri::Window) {
     // window's entry outlives its window forever.
     let owner_id = window_owner::OwnerId::from_string(owner.clone());
     close_approvals().lock().unwrap().remove(&owner_id);
-    let client = Arc::clone(&link.client);
+    let client = link.client();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = client
             .request("owner.detach", serde_json::json!({ "owner": owner }))
@@ -2147,6 +2310,399 @@ fn handle_window_destroyed(window: &tauri::Window) {
             log::warn!("[picot] window detach failed for owner {owner}: {error}");
         }
     });
+}
+
+// ─── Restart transaction (plan Task 9 / D10) ─────────────────────────────────
+
+/// How long a migrated label's window may take to finish destroying before the
+/// transaction gives up on it (Tauri refuses a duplicate label).
+const MIGRATION_DESTROY_DEADLINE: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for a destroyed window's label to be free.
+const MIGRATION_POLL: Duration = Duration::from_millis(20);
+
+/// The app-side restart seam: the admin channel, one fresh owner per captured
+/// window, and the window migration itself (plan Task 9 steps 4-6).
+struct AppRestartLink {
+    app: AppHandle,
+    /// The canonical home: the landing owner's cwd, at boot and after every
+    /// restart (the same value `setup_native_runtime` uses).
+    home: String,
+}
+
+impl AppRestartLink {
+    fn new(app: AppHandle) -> Result<Self, String> {
+        Ok(Self {
+            app,
+            home: canonical_home_dir()?.to_string_lossy().to_string(),
+        })
+    }
+
+    /// The managed link state, or the documented "not booted" error.
+    fn link(&self) -> Result<tauri::State<'_, DaemonLink>, String> {
+        self.app
+            .try_state::<DaemonLink>()
+            .ok_or_else(|| "Picot's daemon link is not available".to_string())
+    }
+
+    /// Mint one owner over the (already attached) new admin channel.
+    async fn mint(
+        &self,
+        label: &str,
+        cwd: Option<&str>,
+        workspace_id: Option<&str>,
+        host_origin: &str,
+    ) -> Result<(String, String), String> {
+        let created = self
+            .link()?
+            .client()
+            .create_owner(label, cwd, 0, host_origin, workspace_id)
+            .await?;
+        Ok((created.owner, created.capability))
+    }
+
+    /// Destroy and re-create every migrated window at its new URL, with the new
+    /// capability injected as the initialization script.
+    ///
+    /// `destroy()` (not `close()`) is deliberate: the app's own close-request
+    /// handler must not be able to veto a migration it knows nothing about.
+    async fn recreate_windows(&self, rows: &[ViewMigration]) -> Result<(), String> {
+        let mirror = DaemonLink::mirror_for(&self.app)
+            .ok_or_else(|| "Picot's navigation mirror is not available".to_string())?;
+        let host_origin = self.link()?.host_origin();
+        for row in rows {
+            if let Some(window) = self.app.get_webview_window(&row.label) {
+                window.destroy().map_err(|error| {
+                    format!("cannot close window {} for migration: {error}", row.label)
+                })?;
+            }
+            let deadline = std::time::Instant::now() + MIGRATION_DESTROY_DEADLINE;
+            while self.app.get_webview_window(&row.label).is_some() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "window {} was still alive {}s after destroy",
+                        row.label,
+                        MIGRATION_DESTROY_DEADLINE.as_secs()
+                    ));
+                }
+                tokio::time::sleep(MIGRATION_POLL).await;
+            }
+            open_native_window(
+                &self.app,
+                &row.label,
+                &row.url,
+                Arc::clone(&mirror),
+                window_owner::OwnerId::from_string(row.owner.clone()),
+                &row.capability,
+            )
+            .map_err(|error| format!("cannot re-create {} at {}: {error}", row.label, row.url))?;
+            if let Some(ledger) = self.app.try_state::<WindowLedger>() {
+                ledger.record(self.ledger_row_for(row, &host_origin));
+            }
+        }
+        Ok(())
+    }
+
+    /// The ledger row the re-created window gets: the new owner, the binding it
+    /// was minted with, and the route it actually loaded.
+    fn ledger_row_for(&self, row: &ViewMigration, host_origin: &str) -> LedgerRow {
+        let previous = self
+            .app
+            .try_state::<WindowLedger>()
+            .and_then(|ledger| ledger.row_for_label(&row.label));
+        let home = previous
+            .and_then(|row| row.owner_home)
+            .unwrap_or_else(|| self.home.clone());
+        match row.workspace_id.as_deref() {
+            Some(workspace_id) => LedgerRow::workspace(
+                &row.label,
+                &row.owner,
+                workspace_id,
+                route_for_url(&row.url, host_origin),
+            ),
+            None => LedgerRow::landing(&row.label, &row.owner, &home),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RestartLink for AppRestartLink {
+    async fn attach(&self, target: &RestartTarget) -> Result<u64, String> {
+        let mirror = DaemonLink::mirror_for(&self.app)
+            .ok_or_else(|| "Picot's navigation mirror is not available".to_string())?;
+        // The superseded daemon is gone (confirmed by the coordinator), so its
+        // channel is done: closing it here — *before* the new snapshot — is what
+        // keeps a late fail-closed `clear()` from wiping the fresh mirror state.
+        self.link()?.client().disconnect();
+        let executor: Arc<dyn SurfaceExecutor> = Arc::new(ForwardedSurfaceOps::new(Arc::new(
+            tauri_app_surface::TauriAppSurface::new(self.app.clone(), Arc::clone(&mirror)),
+        )));
+        let identity = ManagerIdentity {
+            pid: Some(std::process::id()),
+            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            build_id: Some(picot_host::BUILD_ID.to_string()),
+        };
+        let client = AdminClient::connect(
+            &target.admin_origin,
+            &target.admin_token,
+            &identity,
+            executor,
+            Arc::clone(&mirror),
+        )
+        .await?;
+        let epoch = client.epoch().unwrap_or_default();
+        let superseded = self.link()?.replace_session(DaemonSession {
+            client,
+            host_origin: target.host_origin.clone(),
+            daemon: Some(target.identity()),
+        });
+        superseded.client.disconnect();
+        Ok(epoch)
+    }
+
+    async fn rebuild_owner(
+        &self,
+        view: &CapturedView,
+        target: &RestartTarget,
+    ) -> Result<OwnerBinding, String> {
+        match view.workspace_id.as_deref() {
+            // A workspace window: the app knows only the workspace id, so the
+            // daemon resolves the canonical root from its own registry (T9
+            // amendment).
+            Some(workspace_id) => {
+                match self
+                    .mint(&view.label, None, Some(workspace_id), &target.host_origin)
+                    .await
+                {
+                    Ok((owner, capability)) => Ok(OwnerBinding {
+                        owner,
+                        capability,
+                        degraded: false,
+                    }),
+                    Err(error) => {
+                        // The view cannot be rebuilt for its captured binding
+                        // (the workspace left the registry, or the daemon
+                        // refused). Landing it on the new origin root is better
+                        // than leaving a window that cannot load at all.
+                        log::warn!(
+                            "[picot] cannot rebuild the owner of {} (workspace {workspace_id}): \
+                             {error}; migrating it as a landing window instead",
+                            view.label
+                        );
+                        let home = self.home.clone();
+                        let (owner, capability) = self
+                            .mint(&view.label, Some(&home), None, &target.host_origin)
+                            .await?;
+                        Ok(OwnerBinding {
+                            owner,
+                            capability,
+                            degraded: true,
+                        })
+                    }
+                }
+            }
+            // A landing (or workspaceless) window: the app minted its owner and
+            // knows the home it used.
+            None => {
+                let cwd = view.owner_home.clone().unwrap_or_else(|| self.home.clone());
+                let (owner, capability) = self
+                    .mint(&view.label, Some(&cwd), None, &target.host_origin)
+                    .await?;
+                Ok(OwnerBinding {
+                    owner,
+                    capability,
+                    degraded: false,
+                })
+            }
+        }
+    }
+
+    async fn migrate_views(&self, rows: &[ViewMigration]) -> Result<(), String> {
+        let labels: Vec<String> = rows.iter().map(|row| row.label.clone()).collect();
+        let link = self.link()?;
+        // The destroy path must not detach the owner this transaction is about
+        // to re-mint for the same label.
+        link.begin_migration(&labels);
+        let result = self.recreate_windows(rows).await;
+        link.end_migration(&labels);
+        result
+    }
+}
+
+/// The captured pre-state (plan Task 9 step 1): every window the app created
+/// that still exists and still has an owner, with the route its **live**
+/// document is at (SPA `pushState` session switches are only visible there).
+fn capture_open_views(app: &AppHandle) -> Vec<CapturedView> {
+    let Some(link) = app.try_state::<DaemonLink>() else {
+        return Vec::new();
+    };
+    let Some(ledger) = app.try_state::<WindowLedger>() else {
+        return Vec::new();
+    };
+    let host_origin = link.host_origin();
+    let mut views = Vec::new();
+    for row in ledger.rows() {
+        let Some(window) = app.get_webview_window(&row.label) else {
+            continue;
+        };
+        let Some(owner) = link.mirror.owner_for_label(&row.label) else {
+            continue;
+        };
+        let live_route = window
+            .url()
+            .ok()
+            .and_then(|url| route_for_url(url.as_str(), &host_origin));
+        let workspace_id = link
+            .mirror
+            .owner_row_for_label(&row.label)
+            .and_then(|owner_row| owner_row.workspace_id)
+            .or_else(|| row.workspace_id.clone());
+        views.push(CapturedView {
+            label: row.label.clone(),
+            owner,
+            owner_home: row.owner_home.clone(),
+            workspace_id,
+            route: live_route.or_else(|| row.route.clone()),
+        });
+    }
+    views
+}
+
+/// Embedded restart: the "stop" is the in-process drain, which returns only
+/// once the daemon has released its runtimes, terminals and files (plan D2).
+struct EmbeddedRestartStop {
+    state: Arc<DaemonState>,
+}
+
+#[async_trait::async_trait]
+impl quit_policy::StopRequester for EmbeddedRestartStop {
+    async fn request_stop(&self) -> Result<(), String> {
+        self.state.shutdown_graceful("restart").await;
+        Ok(())
+    }
+}
+
+/// Embedded restart: boot a fresh in-process daemon behind its own admin
+/// listener and install it — the same sequence `start_embedded_daemon` runs, so
+/// the transition is the in-process form of the external path (plan D2).
+struct EmbeddedRestartSpawner {
+    app: AppHandle,
+}
+
+#[async_trait::async_trait]
+impl ReplacementSpawner for EmbeddedRestartSpawner {
+    async fn spawn_and_ready(&self) -> Result<RestartTarget, String> {
+        let link_state = self
+            .app
+            .try_state::<DaemonLink>()
+            .ok_or_else(|| "Picot's daemon link is not available".to_string())?;
+        let data_dir = link_state.data_dir.clone();
+        let config_dir = link_state.config_dir.clone();
+        let static_dir = link_state.static_dir.clone();
+        let bundle_identifier = self.app.config().identifier.clone();
+        let surface = Arc::new(picot_host::daemon::surface_forward::AdminForwardingSurface::new());
+        let state = Arc::new(
+            DaemonState::start(
+                picot_host::daemon::DaemonConfig {
+                    data_dir,
+                    config_dir,
+                    static_dir,
+                    bundle_identifier,
+                },
+                surface.clone(),
+            )
+            .await?,
+        );
+        let token = picot_host::daemon::instance::generate_admin_token();
+        let admin = picot_host::daemon::admin::AdminServer::start(
+            picot_host::daemon::admin::AdminConfig::new(token.clone()),
+        )
+        .await?;
+        state.install_admin(admin.clone());
+        surface.attach(admin.clone());
+        state.install_control_handler();
+        register_embedded_state(&self.app, &state);
+        let host_origin = state.origin().to_string();
+        link_state.set_embedded(Arc::clone(&state));
+        log::info!("[picot] embedded daemon restarted host={host_origin}");
+        Ok(RestartTarget {
+            // Embedded: the daemon is this process, so the pid is this app's
+            // (there is no second process to confirm or signal).
+            pid: std::process::id(),
+            process_start_time: None,
+            host_origin,
+            admin_origin: admin.origin().to_string(),
+            admin_token: token,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: picot_host::BUILD_ID.to_string(),
+        })
+    }
+}
+
+/// Run the restart transaction against the app's current daemon (plan D10).
+///
+/// The gate is app state, so two triggers (a double click, a command racing
+/// another) produce **one** replacement; each request still builds the
+/// coordinator from the daemon facts of *its* moment.
+pub async fn run_restart(app: &AppHandle) -> Result<RestartReport, String> {
+    let link = app
+        .try_state::<DaemonLink>()
+        .ok_or_else(|| "Picot's daemon link is not available".to_string())?;
+    let gate = app
+        .try_state::<Arc<daemon_client::restart::RestartGate>>()
+        .map(|state| Arc::clone(state.inner()))
+        .ok_or_else(|| "Picot's restart gate is not available".to_string())?;
+    let views = capture_open_views(app);
+    let config = RestartConfig {
+        identity: link.daemon(),
+        child: link
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.take_child()),
+        instance_path: link.instance_path(),
+        log_path: link.log_path(),
+        config_dir: link.config_dir.clone(),
+        confirm_deadline: daemon_client::restart::RESTART_CONFIRM_DEADLINE,
+    };
+    let app_link: Arc<dyn RestartLink> = Arc::new(AppRestartLink::new(app.clone())?);
+    let coordinator = match link.mode {
+        DaemonMode::External => {
+            if config.identity.is_none() {
+                // Never restart an unverified external daemon: without a
+                // captured identity there is nothing to confirm (plan D12).
+                return Err("the running daemon has no verified process identity".to_string());
+            }
+            let manager = link
+                .manager
+                .clone()
+                .ok_or_else(|| "the external daemon manager is not available".to_string())?;
+            RestartCoordinator::new(
+                gate,
+                config,
+                Arc::new(quit_policy::AdminStopRequester::new(link.client())),
+                ExitWaiter::new(),
+                Arc::new(ManagerSpawner::new(manager)),
+                app_link,
+            )
+        }
+        DaemonMode::Embedded => {
+            let state = link
+                .embedded()
+                .ok_or_else(|| "the embedded daemon state is not available".to_string())?;
+            RestartCoordinator::new(
+                gate,
+                config,
+                Arc::new(EmbeddedRestartStop { state }),
+                ExitWaiter::new(),
+                Arc::new(EmbeddedRestartSpawner { app: app.clone() }),
+                app_link,
+            )
+        }
+    };
+    let outcome = coordinator.run(views).await;
+    outcome
+        .report()
+        .cloned()
+        .ok_or_else(|| outcome.failure_message().unwrap_or_default())
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -2447,7 +3003,7 @@ fn main() {
                         "[picot] app restart requested; detaching without stopping the daemon"
                     );
                     if let Some(link) = app_handle.try_state::<DaemonLink>() {
-                        link.client.disconnect();
+                        link.client().disconnect();
                     }
                     QUIT_STATE.store(2, Ordering::SeqCst);
                     return;

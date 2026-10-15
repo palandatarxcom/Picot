@@ -1055,7 +1055,6 @@ async fn run_op_inner(
         "owner.create" => {
             require_lease(inner, conn_id)?;
             let label = arg_str(&args, "label")?;
-            let cwd = arg_str(&args, "cwd")?;
             let origin = arg_str(&args, "origin")?;
             let port = args
                 .get("port")
@@ -1066,10 +1065,20 @@ async fn run_op_inner(
                 .get("workspaceId")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            // `cwd` is **optional** (T9 amendment, plan D10 step 4): the app's
+            // restart transaction rebuilds one owner per captured window and
+            // knows only the `workspaceId` the daemon minted, never the
+            // canonical root. The daemon is the authority for its own registry
+            // data (plan D4), so it resolves the root itself. Neither argument
+            // present is a refusal, not a guess.
+            let cwd = match args.get("cwd").and_then(Value::as_str) {
+                Some(cwd) => std::path::PathBuf::from(cwd),
+                None => resolve_owner_cwd(&state, workspace_id.as_deref())?,
+            };
             state.owner_registry.set_attachment_epoch(epoch);
             let (owner, capability) = state.owner_registry.create_owner_with_workspace(
                 label,
-                std::path::PathBuf::from(cwd),
+                cwd,
                 port,
                 origin,
                 workspace_id,
@@ -1136,6 +1145,28 @@ fn arg_str(args: &Value, key: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| format!("the op requires a string {key} argument"))
+}
+
+/// The canonical root for an `owner.create` that carried no `cwd` (T9
+/// amendment): resolve the registered workspace the daemon itself minted, or
+/// refuse. Never invents a path, never falls back to the caller's home.
+fn resolve_owner_cwd(
+    state: &Arc<DaemonState>,
+    workspace_id: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let Some(workspace_id) = workspace_id else {
+        return Err(
+            "owner.create requires a string cwd argument, or a registered \
+                    workspaceId to resolve it from"
+                .to_string(),
+        );
+    };
+    state
+        .metadata
+        .lock()
+        .map_err(|_| "the workspace registry is unavailable".to_string())?
+        .canonical_root_for_workspace_id(workspace_id)
+        .map_err(|error| format!("owner.create cannot resolve workspaceId {workspace_id}: {error}"))
 }
 
 fn constant_time_eq(candidate: &str, expected: &str) -> bool {
