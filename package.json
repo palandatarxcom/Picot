@@ -20,6 +20,7 @@
     "tauri": "tauri",
     "dev": "bun run fetch:pi && bun run fetch:terminal-font && bun run fetch:cjk-font && bun run build:extensions && bun run build:frontend && PATH=\"$HOME/.cargo/bin:$PATH\" tauri dev --config src-tauri/tauri.dev.conf.json",
     "fetch:pi": "bun run scripts/fetch-pi-binary.js",
+    "fetch:pi-bolt": "bun run scripts/fetch-pi-bolt.js",
     "fetch:terminal-font": "bun run scripts/fetch-terminal-font.js",
     "fetch:cjk-font": "bun run scripts/fetch-cjk-font.js",
     "smoke:pi-rpc": "bun run scripts/smoke-pi-rpc.js",

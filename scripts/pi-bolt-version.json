@@ -1,0 +1,10 @@
+{
+  "version": "0.8.5",
+  "piVersion": "1.1.0",
+  "variant": "jit",
+  "sha256": {
+    "pi-bolt-darwin-arm64-jit.tar.gz": "033e71d57d08e91909454deae190c54fc19e6ae7a6537b6bf3ac497ec57a3566",
+    "pi-bolt-win32-x64-jit.zip": "afda9a82d3db15975132b77721fec56a2b6dd48512804f0016f173cef433f28e"
+  },
+  "_comment": "Pi-Bolt (github.com/opensec-git/Pi-Bolt) JIT builds fetched by scripts/fetch-pi-bolt.js into src-tauri/resources/pi-bolt/. version = bolt release (tag bolt-v*), piVersion = upstream Pi it was built from — must stay in sync with scripts/pi-version.json. sha256 values are taken from the release's SHA256SUMS asset (signature-verified by the installer, checksum-verified here)."
+}
