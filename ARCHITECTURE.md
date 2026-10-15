@@ -65,6 +65,7 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 | 用户动作 | daemon 行为 |
 | --- | --- |
 | 关闭窗口 | **detach**：撤该 owner 的 capability 与窗口绑定，owner-scoped ephemeral 进程显式终止、temp 目录清理、terminal/git/关窗批准/skill 归属回收；**常驻 workspace/session runtime 照跑**（`detach_owner`）。再次打开窗口或工作区按 rebind 复用同一 runtime（新 owner + 新 generation） |
+| sidebar 侧栏工作区菜单 →「停止运行」（**只有活 runtime 行才出现**；确认弹窗列出工作区与该工作区的运行状态，含「有回合正在跑」的提示） | 数据面 `workspace_close {workspaceId}`：只停该工作区名下的 runtime（进程组终止并 reap、child registry 条目落清），registry row 保留，窗口随后就是既有的 stopped-session 状态（host 发布 `runtime_stopped`，绿点与队列 pill 随进程消失）。当前工作区也允许停（与「从列表移除」不同）。`workspace.remove` 不做这件事，保持纯列表移除 |
 | ⌘Q 退出（`keepRunningAfterQuit=false`，默认） | 优雅停止：`daemon.stop` 返回 **accepted**，app 再阻塞等到**确认进程真的退出**（pid + 进程启动时间身份校验，超时后 SIGTERM→SIGKILL 升级）；RPC 断连本身不算完成 |
 | ⌘Q 退出（`keepRunningAfterQuit=true`） | daemon 与 agent 存活；重开 app 接回现场（含运行中的 turn） |
 | 设置 → Restart daemon | app 管理的**替换事务**：确认弹窗列出正在跑的 agent → `daemon.stop` + 确认旧实例已退出 → 只 spawn 一个替代实例 → 等 ready 并取得 lease → 重建每个窗口的 capability 与绑定 → 把每个 WebView 受控迁移到新 origin（一次性导航许可；允许受控重载）→ 恢复各视图的 session 路由 |

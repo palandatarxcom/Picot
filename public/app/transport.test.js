@@ -296,6 +296,17 @@ describe("WsTransport", () => {
     );
   });
 
+  test("stopWorkspace asks the host to stop one workspace's runtime", async () => {
+    const ws = fakeWsClient();
+    const transport = new WsTransport(ws, {});
+
+    await transport.stopWorkspace("uuid-2");
+
+    // The sidebar passes the raw DB uuid; the display-only `ws:` identity never
+    // crosses the wire.
+    expect(ws.sendControl).toHaveBeenCalledWith("workspace_close", { workspaceId: "uuid-2" }, {});
+  });
+
   test("pickImageFiles sends a pick_image_files control command with initialDir and no timeout", async () => {
     const ws = fakeWsClient();
     const transport = createTransport({ wsClient: ws, env: { location: { port: "47821" } } });

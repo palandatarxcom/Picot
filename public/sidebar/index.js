@@ -1063,6 +1063,21 @@ export class SessionSidebar {
         label: t("sidebar.openInFinder"),
         action: () => this.onOpenProject?.(workspace),
       },
+      // Stop Running (plan T7/D6, Dr. Lin decision 2): the one user path that
+      // ends a single workspace's Pi runtime. Closing a window detaches
+      // instead of stopping, so without this entry a background workspace's
+      // runtime could not be stopped at all. Absent when nothing runs there
+      // (nothing to stop) and on live-only rows (no registered id the host
+      // would act on), never a permanently dead item.
+      ...(this.canStopWorkspace(workspace)
+        ? [
+            {
+              iconKind: "square",
+              label: t("sidebar.stopWorkspace"),
+              action: () => void this.stopWorkspace(workspace),
+            },
+          ]
+        : []),
       // Registry rows offer list-removal without touching the directory or
       // its session files — unlike the destructive batch delete below. The
       // current workspace itself is never removable: its window cannot be
@@ -1142,6 +1157,132 @@ export class SessionSidebar {
       return;
     }
     await this.refresh();
+  }
+
+  /**
+   * Live runtimes still attached to this workspace row. The sidebar's running
+   * set — never the existence of a window — is what the stop entry keys on:
+   * closing a window detaches without stopping (plan D6/T7).
+   */
+  workspaceRunningInstances(workspace) {
+    return Array.isArray(workspace?.runningInstances) ? workspace.runningInstances : [];
+  }
+
+  /** The workspace's display name for dialogs and notices (path as a fallback). */
+  workspaceDisplayName(workspace) {
+    return (
+      workspace?.folderName ||
+      basenameLocalPath(workspace?.path) ||
+      workspace?.path ||
+      t("sidebar.unavailable")
+    );
+  }
+
+  /**
+   * Whether this row offers "Stop Running" (plan D6/T7, Dr. Lin decision 2): a
+   * registry row with at least one live runtime, on a native transport that can
+   * carry the op. A live-only row (removed from the list, agent still running)
+   * has no registered id the host would act on, so it shows no entry rather
+   * than one that could only fail; with nothing running there is nothing to
+   * stop, so the entry is absent instead of permanently disabled.
+   */
+  canStopWorkspace(workspace) {
+    return Boolean(
+      workspace?.source === "registry" &&
+        workspace.registryId &&
+        this.isRegistryAvailable() &&
+        typeof this.transport?.stopWorkspace === "function" &&
+        this.workspaceRunningInstances(workspace).length > 0,
+    );
+  }
+
+  /**
+   * Confirm dialog for the stop entry: names the workspace and what is running
+   * there, because stopping ends whatever the runtime was doing. The confirm
+   * button is labelled with the stop action, not with `actions.delete`.
+   */
+  confirmWorkspaceStop(workspaceName, live) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.className = "sidebar-confirm-overlay";
+      const dialog = document.createElement("div");
+      dialog.className = "sidebar-confirm-dialog";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-label", t("sidebar.stopWorkspace"));
+
+      const message = document.createElement("div");
+      message.className = "sidebar-confirm-message";
+      message.textContent = t("sidebar.stopWorkspaceConfirm", {
+        workspace: workspaceName,
+        count: live.length,
+      });
+      dialog.appendChild(message);
+      // The running *state*, not just the count: a mid-turn stop kills the turn.
+      if (live.some((instance) => instance?.streaming)) {
+        const busy = document.createElement("div");
+        busy.className = "sidebar-confirm-message";
+        busy.textContent = t("sidebar.stopWorkspaceStreaming");
+        dialog.appendChild(busy);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "sidebar-confirm-actions";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "sidebar-confirm-no";
+      cancel.textContent = t("actions.cancel");
+      const confirm = document.createElement("button");
+      confirm.type = "button";
+      confirm.className = "sidebar-confirm-yes";
+      confirm.textContent = t("sidebar.stopWorkspace");
+      actions.append(cancel, confirm);
+      dialog.appendChild(actions);
+      overlay.appendChild(dialog);
+
+      const cleanup = (result) => {
+        document.removeEventListener("keydown", onKeyDown);
+        overlay.remove();
+        resolve(result);
+      };
+      const onKeyDown = (event) => {
+        if (event.key === "Escape") cleanup(false);
+      };
+      cancel.addEventListener("click", () => cleanup(false));
+      confirm.addEventListener("click", () => cleanup(true));
+      overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) cleanup(false);
+      });
+      document.addEventListener("keydown", onKeyDown);
+      document.body.appendChild(overlay);
+    });
+  }
+
+  /**
+   * Stop one workspace's runtime (plan D6/T7). Deliberately allowed for the
+   * current workspace, unlike list-removal: the row stays registered and the
+   * open window degrades to the ordinary stopped-session state — the host
+   * publishes `runtime_stopped` for the session it rendered, so the green dot
+   * and queue pills go with the process.
+   */
+  async stopWorkspace(workspace) {
+    if (!this.canStopWorkspace(workspace)) return;
+    const live = this.workspaceRunningInstances(workspace);
+    const workspaceName = this.workspaceDisplayName(workspace);
+    if (!(await this.confirmWorkspaceStop(workspaceName, live))) return;
+    try {
+      await this.transport.stopWorkspace(workspace.registryId);
+    } catch (error) {
+      console.error("[Sidebar] stop workspace failed:", error);
+      this.onSessionNotice?.(t("sidebar.stopWorkspaceFailed"));
+      return;
+    }
+    // The stopped runtime drops out of the inventory, so this reload clears the
+    // row's live sessions; the notice names what was stopped.
+    await this.refresh({ workspacePath: workspace.path });
+    this.onSessionNotice?.(
+      t("sidebar.stopWorkspaceStopped", { workspace: workspaceName, count: live.length }),
+    );
   }
 
   /** Remove a registry row only; directories and session files untouched. */

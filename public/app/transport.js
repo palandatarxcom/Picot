@@ -257,6 +257,14 @@ export class WsTransport {
     return this._control("workspace.remove", { workspaceId });
   }
 
+  // Stop one workspace's runtime (plan T7/D6). Closing a window detaches
+  // instead of stopping, so this op is the only user path that ends a single
+  // workspace's Pi process — the sidebar's "Stop Running" entry calls it.
+  // `workspace.remove` keeps its list-removal-only semantics either way.
+  stopWorkspace(workspaceId) {
+    return this._control("workspace_close", { workspaceId });
+  }
+
   setWorkspacePinned(workspaceId, pinned) {
     return this._control("workspace.pin", { workspaceId, pinned });
   }

@@ -401,7 +401,10 @@ lands in the same change.
   workspace opens in place;
   Cmd+N on landing → item greyed, keypress no-op;
   Cmd+N after transition → works;
-  close the transitioned window → Pi subprocess gone;
+  close the transitioned window → Pi subprocess keeps running (window close
+  detaches; the runtime survives for a reattach);
+  the sidebar workspace menu's “Stop Running” entry (confirm dialog) stops
+  that workspace's Pi subprocess;
   Quick Chat opens over landing without workspace tools; theme switch
   redraws landing (dark/light); landing Focus enters the selected workspace's
   Focus view.
