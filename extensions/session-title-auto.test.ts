@@ -10,7 +10,7 @@ function deferred<T>() {
 }
 
 function createHarness(generateTitle: (prompt: string) => Promise<string>) {
-  let beforeAgentStart: ((event: { prompt: string }, ctx: { model?: unknown }) => void) | undefined;
+  let beforeAgentStart: ((event: unknown, ctx: { model?: unknown }) => void) | undefined;
   let sessionName: string | undefined;
   const pi = {
     getSessionName: vi.fn(() => sessionName),
@@ -22,7 +22,11 @@ function createHarness(generateTitle: (prompt: string) => Promise<string>) {
     }),
   };
   registerAutomaticSessionTitle(pi as never, { generateTitle });
-  return { pi, run: (prompt: string) => beforeAgentStart?.({ prompt }, {}) };
+  return {
+    pi,
+    run: (prompt: string) => beforeAgentStart?.({ prompt }, {}),
+    fire: (event: unknown) => beforeAgentStart?.(event, {}),
+  };
 }
 
 describe("automatic session titles", () => {
@@ -68,5 +72,16 @@ describe("automatic session titles", () => {
 
     expect(pi.setSessionName).toHaveBeenCalledTimes(1);
     expect(pi.getSessionName()).toBe("My Manual Name");
+  });
+
+  it("ignores custom-triggered runs without a prompt (pi 1.2.0 event union)", async () => {
+    const generateTitle = vi.fn(() => Promise.resolve("Custom Title"));
+    const { fire, run } = createHarness(generateTitle);
+
+    expect(() => fire({ messageType: "custom", message: { customType: "task" } })).not.toThrow();
+    expect(generateTitle).not.toHaveBeenCalled();
+
+    run("Real user prompt");
+    expect(generateTitle).toHaveBeenCalledWith("Real user prompt", undefined);
   });
 });

@@ -178,7 +178,16 @@ fn project_server_row(row: &Value) -> Result<Value, String> {
         }
         Some(_) => return Err("MCP server report field toolExposure must be an object".to_string()),
     };
-    let resources = optional_count(object, "resources")?;
+    // pi 1.2.0 reports `resources: true` ("offers resources", unlisted) instead
+    // of a count; older CLIs still report a number. `resourceTemplates` was removed.
+    let resources = match object.get("resources") {
+        None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(Value::Bool(true)),
+        Some(Value::Number(number)) => Some(Value::Number(number.clone())),
+        Some(_) => {
+            return Err("MCP server report field resources must be true or a count".to_string())
+        }
+    };
     let resource_templates = optional_count(object, "resourceTemplates")?;
     let failed = match object.get("error") {
         None => false,
@@ -205,7 +214,7 @@ fn project_server_row(row: &Value) -> Result<Value, String> {
         projected.insert("toolExposure".into(), tool_exposure);
     }
     if let Some(resources) = resources {
-        projected.insert("resources".into(), Value::Number(resources.into()));
+        projected.insert("resources".into(), resources);
     }
     if let Some(resource_templates) = resource_templates {
         projected.insert(
@@ -780,6 +789,19 @@ mod tests {
         let report = runner.list(&binary, dir.path()).unwrap();
         assert_eq!(report["servers"][0]["transport"], "stdio");
         assert!(report.get("note").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_list_accepts_resource_offering_server_from_pi_1_2_0() {
+        // pi 1.2.0 reports `resources: true` for servers that offer resources
+        // and no longer emits `resourceTemplates` counts.
+        let row = r#"{"name":"docs","scope":"global","source":"/agent/mcp.json","enabled":true,"exposure":"direct","transport":"/opt/bin/docs-mcp","state":"connected","tools":["read"],"resources":true}"#;
+        let (dir, binary) = list_fixture(&format!(r#"{{"servers":[{row}],"errors":[]}}"#), 0);
+        let (runner, _owner) = runner();
+        let report = runner.list(&binary, dir.path()).unwrap();
+        assert_eq!(report["servers"][0]["resources"], true);
+        assert!(report["servers"][0].get("resourceTemplates").is_none());
     }
 
     #[cfg(unix)]

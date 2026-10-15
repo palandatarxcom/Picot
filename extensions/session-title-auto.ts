@@ -22,6 +22,9 @@ export function registerAutomaticSessionTitle(
   let inFlight = false;
 
   pi.on("before_agent_start", (event, ctx) => {
+    // pi 1.2.0 split this event: "custom" runs started via pi.sendMessage carry
+    // `message` instead of `prompt`; naming stays anchored to real user prompts.
+    if (typeof event.prompt !== "string") return;
     const prompt = event.prompt.trim();
     if (!prompt || attempted || inFlight || pi.getSessionName()) return;
 
