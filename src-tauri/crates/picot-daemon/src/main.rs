@@ -36,12 +36,13 @@
 //!
 //! ## The app surface
 //!
-//! Until T5, a daemon-only process has **no app** behind the control
-//! dispatcher's forwarded rows, so every one of them fails closed with
-//! `app_surface_unavailable` ([`UnattachedSurface`]). That is the truthful
-//! answer for a daemon with no manager attached, not a stand-in for the
-//! forwarding surface T5 builds (`DaemonState`'s surface = admin-channel
-//! forwarding), which keeps the same typed failure when no manager is attached.
+//! Since T5 the daemon's [`AppSurface`] is
+//! [`AdminForwardingSurface`]: every forwarded row of the control dispatcher
+//! travels over the admin channel to the attached app (plan D5), so one protocol
+//! serves both the standalone daemon and the embedded form. With **no** manager
+//! attached the same surface fails every row closed with the typed
+//! `app_surface_unavailable` — the truthful answer for a daemon no app is
+//! driving, and the same string the client surfaces to the WebView.
 
 mod log_sink;
 
@@ -51,11 +52,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use picot_host::daemon::admin::{AdminConfig, AdminServer};
-use picot_host::daemon::app_surface::{AppSurface, PaneOp, SurfaceProgress};
 use picot_host::daemon::instance::{self, DaemonFiles, InstanceFile, InstanceLock, InstanceStore};
+use picot_host::daemon::surface_forward::AdminForwardingSurface;
 use picot_host::daemon::{DaemonConfig, DaemonState};
-use picot_host::runtime_coordinator::RuntimeTarget;
-use serde_json::Value;
 
 /// Grace period for the signal path, the same 5s the app's own termination
 /// handlers use (`main.rs::install_termination_handlers`). On expiry the
@@ -205,6 +204,9 @@ async fn run(paths: ResolvedPaths) -> Result<u8, String> {
     };
 
     let token = instance::generate_admin_token();
+    // The daemon's app surface is the admin-channel forwarding one (T5, plan
+    // D5/D2): the same realization the embedded form uses.
+    let surface = Arc::new(AdminForwardingSurface::new());
     let state = Arc::new(
         DaemonState::start(
             DaemonConfig {
@@ -213,12 +215,13 @@ async fn run(paths: ResolvedPaths) -> Result<u8, String> {
                 static_dir: paths.static_dir.clone(),
                 bundle_identifier: paths.bundle_identifier.clone(),
             },
-            Arc::new(UnattachedSurface),
+            surface.clone(),
         )
         .await?,
     );
     let admin = AdminServer::start(AdminConfig::new(token.clone())).await?;
     state.install_admin(admin.clone());
+    surface.attach(admin.clone());
     state.install_control_handler();
 
     let store = InstanceStore::new(paths.instance_path.clone());
@@ -348,88 +351,6 @@ impl Args {
     }
 }
 
-/// The app surface of a daemon with no app attached.
-///
-/// Every forwarded row (plan Task 2 Step 0 inventory A2–A13) needs the app
-/// process: windows, native dialogs, the updater, devtools, relaunch. A daemon
-/// that no app has attached to cannot serve them, so each call fails with the
-/// typed `app_surface_unavailable` error the client surfaces to the WebView —
-/// the same failure T5's forwarding surface produces when no manager holds the
-/// lease (plan D5: "forwarding timeout 5s → typed `app_surface_unavailable`").
-struct UnattachedSurface;
-
-impl UnattachedSurface {
-    fn unavailable(op: &str) -> String {
-        format!("app_surface_unavailable: {op} needs the Picot app, and no app is attached")
-    }
-}
-
-#[async_trait::async_trait]
-impl AppSurface for UnattachedSurface {
-    async fn open_workspace_window(
-        &self,
-        _host_origin: &str,
-        _target: &RuntimeTarget,
-        _owner: &str,
-        _capability: &str,
-    ) -> Result<(), String> {
-        Err(Self::unavailable("open_workspace_window"))
-    }
-
-    async fn open_devtools(&self, _label: &str) -> Result<(), String> {
-        Err(Self::unavailable("open_devtools"))
-    }
-
-    async fn close_window(&self, _label: &str, _request_id: &str) -> Result<(), String> {
-        Err(Self::unavailable("close_window"))
-    }
-
-    async fn cancel_window_close(&self, _label: &str, _request_id: &str) -> Result<(), String> {
-        Err(Self::unavailable("cancel_window_close"))
-    }
-
-    async fn menu_state_changed(&self) -> Result<(), String> {
-        Err(Self::unavailable("menu_state_changed"))
-    }
-
-    async fn relaunch_app(&self) -> Result<(), String> {
-        Err(Self::unavailable("relaunch_app"))
-    }
-
-    async fn pane(&self, _op: PaneOp) -> Result<Value, String> {
-        Err(Self::unavailable("pane"))
-    }
-
-    async fn pick_folder(&self) -> Result<Option<String>, String> {
-        Err(Self::unavailable("pick_folder"))
-    }
-
-    async fn pick_image_files(&self, _initial_dir: Option<String>) -> Result<Value, String> {
-        Err(Self::unavailable("pick_image_files"))
-    }
-
-    async fn save_session_export(
-        &self,
-        _host_origin: &str,
-        _export_url: &str,
-        _file_name: &str,
-        _initial_dir: Option<String>,
-    ) -> Result<Value, String> {
-        Err(Self::unavailable("save_session_export"))
-    }
-
-    async fn check_for_update(&self) -> Result<Value, String> {
-        Err(Self::unavailable("check_for_update"))
-    }
-
-    async fn download_and_install_update(
-        &self,
-        _progress: SurfaceProgress,
-    ) -> Result<Value, String> {
-        Err(Self::unavailable("download_and_install_update"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,7 +399,10 @@ mod tests {
 
     #[test]
     fn a_daemon_with_no_app_fails_closed_on_every_forwarded_row() {
-        let surface = UnattachedSurface;
+        use picot_host::daemon::app_surface::AppSurface;
+        // No admin attachment: the forwarding surface must still fail every row
+        // closed with the typed error the client surfaces to the WebView.
+        let surface = AdminForwardingSurface::new();
         let failures = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()

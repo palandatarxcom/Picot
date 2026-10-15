@@ -8,17 +8,28 @@
 //! - [`manager`] — probe, spawn, adopt, version/build-gated stop, readiness;
 //! - [`exit_waiter`] — "accepted ≠ completed" (plan D12): confirm a daemon's
 //!   death by pid + process start time, escalating SIGTERM → SIGKILL;
+//! - [`navigation_mirror`] — the daemon-fed navigation/authorization image and
+//!   the app's label↔owner map;
+//! - [`admin_client`] — the admin channel client (hello/welcome, id-matched
+//!   requests, the read pump, the surface pump) and [`admin_client::CreatedOwner`];
+//! - [`surface_ops`] — the app-side execution of forwarded `app_surface_request`
+//!   frames on the real `AppSurface`;
 //! - [`present_blocked_by_other_app`] — the localized dialog + non-zero exit for
 //!   a second Picot instance while another app manages the daemon.
 //!
 //! ## Wiring status
 //!
-//! T4 delivers this module; **T5 wires it into startup** (`PICOT_DAEMON=external`
-//! / embedded branching) and T10 exposes it through the three admin commands.
-//! Until then nothing in the app calls it, which is why `main.rs` gates the
-//! module with `#[allow(dead_code)]` — a recorded, temporary posture, not a
-//! silent one. The M2 milestone contract is explicit that the app stays embedded
-//! in this task, so wiring the manager here would be the wrong change.
+//! Wired (T5): `main.rs::setup_native_runtime` boots either mode, attaches
+//! through [`admin_client::AdminClient`], mints the landing owner over the admin
+//! channel and opens the landing window against the daemon's host origin;
+//! `RunEvent::Exit` branches on the mode. Still unwired: the three admin
+//! commands and their UI (T10), the quit policy (T8) and the restart transaction
+//! (T9) — items those tasks own, marked `#[allow(dead_code)]` where they exist
+//! already and documented at their definitions.
+//!
+//! [`navigation_mirror`] is the app-side half of the daemon's authorization
+//! mirror: the WebView's synchronous `on_navigation` delegate reads it, and it
+//! fails closed (only the opaque `about:` documents survive a dropped channel).
 
 pub mod admin_client;
 pub mod exit_waiter;

@@ -795,7 +795,7 @@ async fn mirror_event_frames_match_the_protocol_table() {
         "{created_row}"
     );
     assert_eq!(
-        keys(&created_row),
+        keys(created_row),
         vec![
             "currentOrigin",
             "epoch",

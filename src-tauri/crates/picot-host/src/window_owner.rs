@@ -916,7 +916,7 @@ fn normalize_origin(origin: &str) -> Option<String> {
 /// Exported because the two sides must not drift: the daemon publishes
 /// `currentOrigin`/`permit.origin` strings it produced with this function, and
 /// the app compares a live navigation URL against them. The app crate sees the
-/// same `url` type (`tauri::Url` re-exports it), so it calls this directly
+/// same `url` type (the app framework re-exports it), so it calls this directly
 /// instead of re-implementing the loopback/port rules.
 ///
 /// `None` means "not a loopback http origin": `127.0.0.1`, `::1` and

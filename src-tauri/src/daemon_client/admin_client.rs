@@ -97,6 +97,9 @@ pub trait SurfaceExecutor: Send + Sync {
         -> Result<Value, String>;
 }
 
+/// One pending request's settlement slot: the pump fills it exactly once, by id.
+type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+
 /// What `owner.create` produced: the identity the app injects into a window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedOwner {
@@ -114,7 +117,7 @@ pub struct AdminClient {
     mirror: Arc<NavigationMirror>,
     executor: Arc<dyn SurfaceExecutor>,
     outbound: mpsc::UnboundedSender<WsMessage>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>,
+    pending: PendingRequests,
     events: broadcast::Sender<AdminEvent>,
     epoch: Mutex<Option<u64>>,
     next_id: AtomicU64,
@@ -156,11 +159,7 @@ impl AdminClient {
             "buildId": identity.build_id,
             "pid": identity.pid,
         });
-        if sink
-            .send(WsMessage::Text(hello.to_string().into()))
-            .await
-            .is_err()
-        {
+        if sink.send(WsMessage::Text(hello.to_string())).await.is_err() {
             return Err("cannot write the admin_hello frame".to_string());
         }
         let welcome = read_welcome(&mut stream).await?;
@@ -367,7 +366,7 @@ impl AdminClient {
             return Err("the admin channel is not connected".to_string());
         }
         self.outbound
-            .send(WsMessage::Text(value.to_string().into()))
+            .send(WsMessage::Text(value.to_string()))
             .map_err(|_| "the admin channel writer is gone".to_string())
     }
 
@@ -510,8 +509,7 @@ impl AdminClient {
                 Arc::new(move |event: Value| {
                     let _ = outbound.send(WsMessage::Text(
                         json!({"type": "surface_progress", "ackId": ack_id, "event": event})
-                            .to_string()
-                            .into(),
+                            .to_string(),
                     ));
                 })
             };
@@ -529,7 +527,7 @@ impl AdminClient {
                     "result": {"error": error},
                 }),
             };
-            let _ = outbound.send(WsMessage::Text(frame.to_string().into()));
+            let _ = outbound.send(WsMessage::Text(frame.to_string()));
         });
     }
 
@@ -588,7 +586,7 @@ async fn read_welcome(stream: &mut AdminStream) -> Result<Value, String> {
                 let value: Value = serde_json::from_str(&text).map_err(|error| {
                     format!("malformed admin frame during the handshake: {error}")
                 })?;
-                if value["type"] == Value::from("admin_welcome") {
+                if value["type"] == "admin_welcome" {
                     return Ok(value);
                 }
             }

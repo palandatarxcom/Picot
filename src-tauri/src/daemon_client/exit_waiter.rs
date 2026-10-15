@@ -159,6 +159,11 @@ impl ExitWaiter {
         self
     }
 
+    /// Quit and restart transactions consume this (T8/T9); T5 wires the manager and
+    /// the client, and the app's exit path deliberately only detaches for now (the
+    /// accepted/completed separation lands with the quit policy). Exported here so
+    /// the confirm-by-identity discipline has one implementation, not two.
+    #[allow(dead_code)]
     /// Wait for the process to be gone, escalating on a deadline.
     ///
     /// `child` is the handle when *this* app spawned the daemon (a `kill -9`
@@ -240,6 +245,12 @@ impl Default for ExitWaiter {
 }
 
 /// The system-handle convenience wrapper (plan Task 4's signature).
+///
+/// T8's quit policy and T9's restart transaction consume this; T5 wires the
+/// manager and the client, and its exit path deliberately only detaches (the
+/// accepted/completed separation is T8's). Kept exported so the
+/// confirm-by-identity discipline has exactly one implementation.
+#[allow(dead_code)]
 pub async fn confirm_exit(
     identity: &ProcessIdentity,
     child: Option<&mut Child>,

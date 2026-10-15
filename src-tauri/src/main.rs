@@ -9,20 +9,18 @@ mod browser_pane;
 // The app-side half of the dispatcher split (Task 2 Step 2): the real
 // `AppHandle` behind `picot_host::daemon::app_surface::AppSurface`.
 mod tauri_app_surface;
-// The app-side daemon client (Task 4 Step 3): probe/spawn/adopt, the
-// confirmed-exit waiter, and the blocked-instance policy.
-//
-// `allow(dead_code)` is deliberate and temporary: T4 delivers the module, T5
-// wires it into startup and T10 through the admin commands. Until then no path
-// in the app calls it, and this task's milestone contract keeps the app on the
-// embedded daemon, so pretending otherwise would be a larger change than the
-// plan asked for. The attribute goes away with the T5 wiring.
-#[allow(dead_code)]
+// The app-side daemon client: probe/spawn/adopt (T4), the admin client and the
+// navigation mirror it feeds, the surface pump, and the blocked-instance policy.
+// Wired into startup by T5; T10 exposes it through the admin commands.
 mod daemon_client;
 
-use picot_host::{
-    child_supervision, environment_install, git_service, officecli_watch, window_owner,
-};
+use daemon_client::admin_client::{AdminClient, SurfaceExecutor};
+use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
+use daemon_client::navigation_mirror::NavigationMirror;
+use daemon_client::surface_ops::ForwardedSurfaceOps;
+use picot_host::daemon::admin::ManagerIdentity;
+use picot_host::daemon::DaemonState;
+use picot_host::{child_supervision, git_service, officecli_watch, window_owner};
 
 use picot_host::ephemeral_registry::EphemeralRegistry;
 use picot_host::host_control::ProgressSink;
@@ -294,14 +292,17 @@ fn open_native_window(
     app: &AppHandle,
     label: &str,
     url: &str,
-    owner_registry: Arc<WindowOwnerRegistry>,
+    mirror: Arc<NavigationMirror>,
     owner: window_owner::OwnerId,
     capability: &str,
 ) -> Result<(), String> {
     let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))
         .map_err(|error| format!("Failed to load window icon: {error}"))?;
     let init_script = window_owner::capability_initialization_script(capability);
-    let nav_owner = owner;
+    // The synchronous delegate reads the daemon-fed mirror (plan D4/Task 5 R1):
+    // fail-closed, with the opaque `about:` exceptions as the only survivors of
+    // a dropped admin channel.
+    let nav_owner = owner.as_str().to_string();
     let parsed_url: tauri::Url = url
         .parse()
         .map_err(|error| format!("Invalid native Host URL: {error}"))?;
@@ -312,7 +313,7 @@ fn open_native_window(
         .icon(icon)
         .map_err(|error| error.to_string())?
         .initialization_script(init_script)
-        .on_navigation(move |url| owner_registry.authorize_navigation(&nav_owner, url))
+        .on_navigation(move |url| mirror.authorize(&nav_owner, url))
         .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
         // Built hidden so the saved geometry is applied before the first
         // paint: restoring a visible window shows a resize jump.
@@ -393,7 +394,7 @@ fn open_native_window(
 fn open_native_landing_window(
     app: &AppHandle,
     host_origin: &str,
-    owner_registry: Arc<WindowOwnerRegistry>,
+    mirror: Arc<NavigationMirror>,
     owner: window_owner::OwnerId,
     capability: &str,
 ) -> Result<(), String> {
@@ -401,7 +402,7 @@ fn open_native_landing_window(
         app,
         "native-landing",
         &format!("{host_origin}/"),
-        owner_registry,
+        mirror,
         owner,
         capability,
     )
@@ -411,7 +412,7 @@ fn open_native_workspace_window(
     app: &AppHandle,
     host_origin: &str,
     target: &RuntimeTarget,
-    owner_registry: Arc<WindowOwnerRegistry>,
+    mirror: Arc<NavigationMirror>,
     owner: window_owner::OwnerId,
     capability: &str,
 ) -> Result<(), String> {
@@ -420,7 +421,7 @@ fn open_native_workspace_window(
         "{}/workspaces/{}/sessions/{}",
         host_origin, target.workspace_id, target.session_id
     );
-    open_native_window(app, &label, &url, owner_registry, owner, capability)
+    open_native_window(app, &label, &url, mirror, owner, capability)
 }
 
 fn canonical_if_exists(dir: PathBuf) -> Option<PathBuf> {
@@ -1476,15 +1477,248 @@ fn canonical_home_dir() -> Result<PathBuf, String> {
     fs::canonicalize(&home).map_err(|error| format!("Cannot canonicalize home directory: {error}"))
 }
 
-/// Build the host stack (in the daemon's terms, see `picot_host::daemon`) and
-/// wire the app-only pieces around it.
+/// The app's daemon link (plan Task 5).
 ///
-/// Task 2 Step 3 moved the construction into `DaemonState::start`: this
-/// function now only supplies the argv surface, registers the app's managed
-/// state, and creates what is the app's by the Step-3 exception list — the
-/// browser panes (registered through the host's `PaneSurface` slot), the
-/// landing owner + window, and the app-only `manage` calls the window-lifecycle
-/// and exit paths read back through the app handle.
+/// One mode-independent shape for both process layouts: the admin client, the
+/// navigation mirror it feeds, and the mode-specific handles (`embedded` holds
+/// the in-process daemon state; `external` holds the manager whose spawn and
+/// child handle the quit path (T8) and the restart transaction (T9) reuse).
+///
+/// Managed as app state so the window lifecycle, the menu gate and
+/// `RunEvent::Exit` can reach it; nothing here is a Tauri command (D8 keeps the
+/// app's command surface empty until T10).
+pub struct DaemonLink {
+    pub mode: DaemonMode,
+    pub client: Arc<AdminClient>,
+    pub mirror: Arc<NavigationMirror>,
+    /// `Some` in embedded mode only: the in-process daemon this app runs.
+    pub embedded: Option<Arc<DaemonState>>,
+    /// `Some` in external mode only: how this app started/adopted the daemon.
+    #[allow(dead_code)]
+    pub manager: Option<Arc<DaemonManager>>,
+    /// The daemon's HTTP origin (the WebView's page origin in both modes).
+    pub host_origin: String,
+}
+
+impl DaemonLink {
+    /// The app-side owner/authorization image the daemon feeds (plan D4).
+    fn mirror_for(app: &AppHandle) -> Option<Arc<NavigationMirror>> {
+        app.try_state::<DaemonLink>()
+            .map(|link| Arc::clone(&link.mirror))
+    }
+
+    /// The app-process half of app exit.
+    ///
+    /// External: disconnect the admin channel only — the daemon keeps running,
+    /// and dropping the socket is exactly what makes the daemon run its
+    /// dead-attachment cleanup (plan D11). The quit *policy* (keepRunning,
+    /// confirmed exit, signal tiers) arrives with T8; this interim behaviour is
+    /// recorded in ARCHITECTURE.
+    ///
+    /// Embedded: the daemon is this process, so exit drains it through the same
+    /// `shutdown_graceful` the standalone binary's signal path uses.
+    fn on_app_exit(&self) {
+        match self.mode {
+            DaemonMode::External => {
+                log::info!("[picot] exiting: detaching from the Picot daemon (it keeps running)");
+                self.client.disconnect();
+            }
+            DaemonMode::Embedded => {
+                if let Some(state) = self.embedded.as_ref() {
+                    // The exit path runs on the main thread; the drain is async
+                    // (runtimes, terminals, watches, the child registry, the
+                    // host listener), so it is driven to completion here exactly
+                    // as startup drives the async boot.
+                    tauri::async_runtime::block_on(state.shutdown_graceful("app exit"));
+                }
+            }
+        }
+    }
+}
+
+/// Which process layout this run uses (plan Task 5 Step 3).
+///
+/// `PICOT_DAEMON=embedded|external` is the dev/validation switch (plan D2): the
+/// two modes differ only by the process boundary — both run the same
+/// `DaemonState`, the same admin protocol and the same `AdminClient`.
+///
+/// The defaults are transitional and deliberate: **debug → external** (the M3
+/// dev loop exercises the real process boundary) and **release → embedded**
+/// until T11 packages the daemon sidecar and T12 deletes the embedded branch —
+/// a released app has no `picot-daemon` binary to spawn yet. Both the switch and
+/// the defaults are documented in ARCHITECTURE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonMode {
+    Embedded,
+    External,
+}
+
+fn daemon_mode() -> Result<DaemonMode, String> {
+    match std::env::var("PICOT_DAEMON").ok().as_deref() {
+        None | Some("") => Ok(if cfg!(debug_assertions) {
+            DaemonMode::External
+        } else {
+            DaemonMode::Embedded
+        }),
+        Some("external") => Ok(DaemonMode::External),
+        Some("embedded") => Ok(DaemonMode::Embedded),
+        Some(other) => Err(format!(
+            "PICOT_DAEMON must be `embedded` or `external`, got {other:?}"
+        )),
+    }
+}
+
+/// What booting the daemon produced.
+enum AttachedDaemon {
+    Ready {
+        manager: Option<Arc<DaemonManager>>,
+        embedded: Option<Arc<DaemonState>>,
+        client: Arc<AdminClient>,
+        host_origin: String,
+    },
+    /// Another live Picot app manages this daemon (plan Task 4 policy).
+    BlockedByOtherApp,
+}
+
+/// Start the daemon as its own process and attach to it (external mode).
+async fn attach_external_daemon(
+    data_dir: PathBuf,
+    config_dir: PathBuf,
+    static_dir: PathBuf,
+    bundle_identifier: String,
+    executor: Arc<dyn SurfaceExecutor>,
+    mirror: Arc<NavigationMirror>,
+) -> Result<AttachedDaemon, String> {
+    let manager = Arc::new(DaemonManager::for_app(ManagerConfig::for_app(
+        data_dir,
+        config_dir,
+        static_dir,
+        bundle_identifier,
+    )));
+    let file = match manager.ensure().await {
+        Ok(EnsureOutcome::Started(file)) | Ok(EnsureOutcome::Attached(file)) => file,
+        Ok(EnsureOutcome::BlockedByOtherApp) => return Ok(AttachedDaemon::BlockedByOtherApp),
+        Err(error) => return Err(format!("cannot reach the Picot daemon: {error}")),
+    };
+    let client = AdminClient::connect(
+        &file.admin_origin,
+        &file.admin_token,
+        &manager.config().identity(),
+        executor,
+        mirror,
+    )
+    .await?;
+    log::info!(
+        "[picot] external daemon pid={} host={} admin={}",
+        file.pid,
+        file.host_origin,
+        file.admin_origin
+    );
+    Ok(AttachedDaemon::Ready {
+        manager: Some(manager),
+        embedded: None,
+        client,
+        host_origin: file.host_origin,
+    })
+}
+
+/// Start the daemon inside this process, behind the *same* admin listener the
+/// standalone binary uses; the app then attaches to it over the same client
+/// (embedded mode, plan D2).
+async fn start_embedded_daemon(
+    app: &tauri::App,
+    data_dir: PathBuf,
+    config_dir: PathBuf,
+    static_dir: PathBuf,
+    bundle_identifier: String,
+    executor: Arc<dyn SurfaceExecutor>,
+    mirror: Arc<NavigationMirror>,
+) -> Result<AttachedDaemon, String> {
+    let surface = Arc::new(picot_host::daemon::surface_forward::AdminForwardingSurface::new());
+    let state = Arc::new(
+        DaemonState::start(
+            picot_host::daemon::DaemonConfig {
+                data_dir,
+                config_dir,
+                static_dir,
+                bundle_identifier,
+            },
+            surface.clone(),
+        )
+        .await?,
+    );
+    let token = picot_host::daemon::instance::generate_admin_token();
+    let admin = picot_host::daemon::admin::AdminServer::start(
+        picot_host::daemon::admin::AdminConfig::new(token.clone()),
+    )
+    .await?;
+    state.install_admin(admin.clone());
+    surface.attach(admin.clone());
+    state.install_control_handler();
+    register_embedded_state(app, &state);
+    let host_origin = state.origin().to_string();
+    let client = AdminClient::connect(
+        admin.origin(),
+        &token,
+        &ManagerIdentity {
+            pid: Some(std::process::id()),
+            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            build_id: Some(picot_host::BUILD_ID.to_string()),
+        },
+        executor,
+        mirror,
+    )
+    .await?;
+    log::info!("[picot] embedded daemon host={host_origin}");
+    Ok(AttachedDaemon::Ready {
+        manager: None,
+        embedded: Some(state),
+        client,
+        host_origin,
+    })
+}
+
+/// Register the embedded daemon's shared state with the app.
+///
+/// Embedded mode only: these are the app-side readers that still look host
+/// objects up through the app handle (the window-destroyed teardown, the exit
+/// path, the browser-pane runtime). In external mode the same objects live in
+/// the daemon process and the app holds no copy (plan D4/D5) — the dispatcher
+/// reaches them there through `DaemonState`.
+fn register_embedded_state(app: &tauri::App, state: &Arc<DaemonState>) {
+    let host = state.host.clone();
+    app.manage(state.skill_sources.clone());
+    app.manage(state.git.clone());
+    app.manage(state.terminals.clone());
+    // No `EnvironmentInstaller` registration: its only reader was the app's exit
+    // path, and the embedded daemon's drain now stops the installer itself
+    // (`DaemonState::drain_runtimes`). A managed copy with no reader is exactly
+    // the dead state this move is supposed to delete.
+    // Browser panes (spec 2026-09-22): child webviews keyed by tab id. The
+    // runtime needs the app handle, so it is constructed here and registered
+    // with the host through the `PaneSurface` slot (plan D1/Step-3 exceptions).
+    let browser_panes = Arc::new(browser_pane::BrowserPaneRuntime::new(
+        app.handle().clone(),
+        host.origin(),
+    ));
+    host.set_browser_panes(browser_panes.clone());
+    app.manage(browser_pane::BrowserPaneState(browser_panes));
+    app.manage(officecli_watch::OfficecliWatchState(
+        state.officecli_watches.clone(),
+    ));
+    app.manage(state.runtimes.clone());
+    app.manage(host);
+    app.manage(state.owner_registry.clone());
+    app.manage(state.ephemeral_registry.clone());
+}
+
+/// Boot the app around its daemon (plan Task 5 Step 3).
+///
+/// Both modes run the *same* sequence: get a running `DaemonState` (in this
+/// process, or in its own), connect the `AdminClient` to its admin listener,
+/// mint the landing owner over that channel, and open the landing window at the
+/// daemon's host origin. There is no in-process shortcut in either mode — the
+/// only difference is the process boundary (plan D2).
 fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(), String> {
     let data_dir = app
         .path()
@@ -1494,72 +1728,78 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         .path()
         .app_config_dir()
         .map_err(|error| format!("Cannot resolve Picot app config directory: {error}"))?;
-    let cfg = picot_host::daemon::DaemonConfig {
-        data_dir,
-        config_dir,
-        static_dir: static_dir.clone(),
-        bundle_identifier: app.config().identifier.clone(),
+    let bundle_identifier = app.config().identifier.clone();
+    let mode = daemon_mode()?;
+    // The app's navigation/authorization image and the pump that executes
+    // forwarded surface ops, both shared by the two modes.
+    let mirror = Arc::new(NavigationMirror::new());
+    let executor: Arc<dyn SurfaceExecutor> = Arc::new(ForwardedSurfaceOps::new(Arc::new(
+        tauri_app_surface::TauriAppSurface::new(app.handle().clone(), Arc::clone(&mirror)),
+    )));
+    log::info!("[picot] daemon mode {mode:?} (PICOT_DAEMON)");
+    let attached = match mode {
+        DaemonMode::External => tauri::async_runtime::block_on(attach_external_daemon(
+            data_dir,
+            config_dir,
+            static_dir,
+            bundle_identifier,
+            executor,
+            Arc::clone(&mirror),
+        ))?,
+        DaemonMode::Embedded => tauri::async_runtime::block_on(start_embedded_daemon(
+            app,
+            data_dir,
+            config_dir,
+            static_dir,
+            bundle_identifier,
+            executor,
+            Arc::clone(&mirror),
+        ))?,
     };
-    // Embedded form for this task: the app constructs the daemon state in-process
-    // and hands the dispatcher a surface that executes the app-side rows
-    // directly. T3 replaces the surface with the admin-channel realization and
-    // T5 makes the daemon a separate process; neither changes this call's shape.
-    let app_surface = Arc::new(tauri_app_surface::TauriAppSurface::new(
-        app.handle().clone(),
-    ));
-    let daemon_state = Arc::new(tauri::async_runtime::block_on(
-        picot_host::daemon::DaemonState::start(cfg, app_surface),
-    )?);
-    daemon_state.install_control_handler();
-    let host = daemon_state.host.clone();
-    let runtimes = daemon_state.runtimes.clone();
-    let owner_registry = daemon_state.owner_registry.clone();
-    app.manage(daemon_state.skill_sources.clone());
-    app.manage(daemon_state.git.clone());
-    app.manage(daemon_state.terminals.clone());
-    if let Ok(installer) = daemon_state.environment_installer.as_ref() {
-        let _ = app.manage(EnvironmentInstaller(installer.clone()));
-    }
-    // Browser panes (spec 2026-09-22): child webviews keyed by tab id. The
-    // runtime needs the app handle, so it is constructed here and registered
-    // with the host through the `PaneSurface` slot (plan D1/Step-3 exceptions).
-    let browser_panes = std::sync::Arc::new(browser_pane::BrowserPaneRuntime::new(
-        app.handle().clone(),
-        host.origin(),
-    ));
-    host.set_browser_panes(browser_panes.clone());
-    app.manage(browser_pane::BrowserPaneState(browser_panes));
-    app.manage(officecli_watch::OfficecliWatchState(
-        daemon_state.officecli_watches.clone(),
-    ));
-    // Landing owner: no registered workspace, no runtime. The canonical home
-    // path is an owner-record placeholder only — never a workspace identity,
-    // workspace scope, or authorization input. The label stays `native-landing`
-    // for the window's whole life; the owner record carries the truth.
+    let (manager, embedded, client, host_origin) = match attached {
+        AttachedDaemon::BlockedByOtherApp => {
+            // The dialog blocks and the process exits non-zero: a second Picot
+            // must not fight the first for the daemon's lease. `None` resolves
+            // the locale from the OS (T10 passes the app's preference).
+            daemon_client::present_blocked_by_other_app(app.handle(), None);
+        }
+        AttachedDaemon::Ready {
+            manager,
+            embedded,
+            client,
+            host_origin,
+        } => (manager, embedded, client, host_origin),
+    };
+    // The landing owner: no registered workspace, placeholder home cwd. Minted
+    // over the admin channel in both modes, so the mirror learns its origin
+    // before the window can load it.
     let home = canonical_home_dir()?;
-    let (owner, capability) = owner_registry.create_owner_with_workspace(
-        "native-landing".to_string(),
-        home,
+    let landing = tauri::async_runtime::block_on(client.create_owner(
+        "native-landing",
+        &home.to_string_lossy(),
         0,
-        host.origin().to_string(),
+        &host_origin,
         None,
-        window_owner::TemporaryKind::Landing,
-    )?;
+    ))?;
     open_native_landing_window(
         app.handle(),
-        host.origin(),
-        owner_registry.clone(),
-        owner.clone(),
-        &capability,
+        &host_origin,
+        Arc::clone(&mirror),
+        window_owner::OwnerId::from_string(landing.owner.clone()),
+        &landing.capability,
     )?;
+    app.manage(DaemonLink {
+        mode,
+        client,
+        mirror,
+        embedded,
+        manager,
+        host_origin: host_origin.clone(),
+    });
     // Startup default is disabled (the first window is the landing); recompute
     // once now that the window exists. No-op wherever no menu bar is installed.
     update_new_session_menu_state(app.handle());
-    log::info!("[picot-native] landing ready origin={}", host.origin());
-    app.manage(runtimes);
-    app.manage(host.clone());
-    app.manage(owner_registry);
-    app.manage(daemon_state.ephemeral_registry.clone());
+    log::info!("[picot] landing ready mode={mode:?} origin={host_origin}");
     Ok(())
 }
 
@@ -1636,9 +1876,6 @@ async fn download_and_install_update_core(
 
 // ─── Host control handler ────────────────────────────────────────────────────
 
-/// The running environment installer, reachable from the app exit path.
-struct EnvironmentInstaller(Arc<environment_install::Installer>);
-
 /// Spawn an ephemeral candidate, wait for readiness, and compare-and-commit it.
 /// On any failure the candidate process, broker route, registry record, and
 /// (for Quick Chat) temp directory are cleaned up before returning the error.
@@ -1704,11 +1941,19 @@ fn close_approvals(
 /// the one-shot approval consumed by the close triggered from the host. A
 /// disconnected WebView falls back to a native warning.
 fn handle_close_requested(window: &tauri::Window, api: &tauri::CloseRequestApi) {
-    let Some(registry) = window.try_state::<OwnerRegistryState>() else {
+    // The label↔owner map is the app's, fed by the daemon's mirror (plan D4).
+    // Using the mirror — not the in-process registry — is what keeps this path
+    // working in both modes; with no attachment the lookup is empty and the
+    // close is simply allowed (fail-open only for *confirmation*, never for
+    // authorization: the window's own navigation authority is the mirror too).
+    let app = window.app_handle();
+    let Some(mirror) = DaemonLink::mirror_for(app) else {
         return;
     };
-    let registry = registry.inner().clone();
-    let Some(owner) = registry.owner_for_label(window.label()) else {
+    let Some(owner) = mirror
+        .owner_for_label(window.label())
+        .map(window_owner::OwnerId::from_string)
+    else {
         return;
     };
 
@@ -1755,7 +2000,7 @@ fn handle_close_requested(window: &tauri::Window, api: &tauri::CloseRequestApi) 
     // settlement of host-owned state); cancel drops the pending request.
     let app = window.app_handle().clone();
     let owner_for_dialog = owner.clone();
-    let registry_for_dialog = registry.clone();
+    let mirror_for_dialog = mirror.clone();
     window
         .app_handle()
         .dialog()
@@ -1771,7 +2016,7 @@ fn handle_close_requested(window: &tauri::Window, api: &tauri::CloseRequestApi) 
                 if let Some(pending) = g.get_mut(&owner_for_dialog) {
                     pending.approved = true;
                 }
-                let label = registry_for_dialog.label_for_owner(&owner_for_dialog);
+                let label = mirror_for_dialog.label_for_owner(owner_for_dialog.as_str());
                 drop(g);
                 if let Some(label) = label {
                     let _ = app.get_webview_window(&label).map(|w| w.close());
@@ -1860,9 +2105,11 @@ fn focused_owner_has_workspace(app: &AppHandle) -> Option<bool> {
         .webview_windows()
         .into_values()
         .find(|window| window.is_focused().unwrap_or(false))?;
-    let registry = app.try_state::<OwnerRegistryState>()?;
-    let owner = registry.owner_for_label(focused.label())?;
-    Some(registry.owner_has_workspace(&owner))
+    // The mirror carries the binding the daemon holds (plan D4): the same answer
+    // in both modes, and no in-process registry read.
+    let mirror = DaemonLink::mirror_for(app)?;
+    let owner = mirror.owner_for_label(focused.label())?;
+    mirror.owner_has_workspace(&owner)
 }
 
 /// Find a menu item by id, descending into submenus. Tauri's `Menu::get`
@@ -2042,12 +2289,12 @@ fn main() {
                 else {
                     return;
                 };
-                let Some(registry) = app.try_state::<OwnerRegistryState>() else {
+                let Some(mirror) = DaemonLink::mirror_for(app) else {
                     return;
                 };
-                let bound = registry
+                let bound = mirror
                     .owner_for_label(window.label())
-                    .map(|owner| registry.owner_has_workspace(&owner))
+                    .and_then(|owner| mirror.owner_has_workspace(&owner))
                     .unwrap_or(false);
                 if bound {
                     let _ = window.eval(
@@ -2121,21 +2368,17 @@ fn main() {
                 install_termination_handlers(app_handle.clone());
             }
             if let tauri::RunEvent::Exit = event {
-                if let Some(installer) = app_handle.try_state::<EnvironmentInstaller>() {
-                    installer.0.stop_for_app_exit();
+                // The mode decides what app exit means (plan Task 5 Step 3): the
+                // embedded daemon is this process and drains here; the external
+                // one owns its own lifetime, so the app only detaches. The
+                // accepted/completed separation and the keepRunning policy are
+                // T8's.
+                match app_handle.try_state::<DaemonLink>() {
+                    Some(link) => link.on_app_exit(),
+                    // No daemon link (boot failed before startup finished):
+                    // nothing daemon-side to tear down.
+                    None => child_supervision::clear_registry(),
                 }
-                if let Some(manager) = app_handle.try_state::<NativePiManagerState>() {
-                    manager.stop_for_app_exit();
-                }
-                if let Some(terminal_manager) = app_handle.try_state::<TerminalManagerState>() {
-                    terminal_manager.kill_all();
-                }
-                if let Some(officecli_watches) =
-                    app_handle.try_state::<officecli_watch::OfficecliWatchState>()
-                {
-                    officecli_watches.0.stop_all();
-                }
-                child_supervision::clear_registry();
             }
         });
 }

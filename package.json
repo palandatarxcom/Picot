@@ -18,7 +18,8 @@
   },
   "scripts": {
     "tauri": "tauri",
-    "dev": "bun run fetch:pi && bun run fetch:terminal-font && bun run fetch:cjk-font && bun run build:extensions && bun run build:frontend && PATH=\"$HOME/.cargo/bin:$PATH\" tauri dev --config src-tauri/tauri.dev.conf.json",
+    "dev": "bun run fetch:pi && bun run fetch:terminal-font && bun run fetch:cjk-font && bun run build:extensions && bun run build:frontend && bun run build:daemon && PATH=\"$HOME/.cargo/bin:$PATH\" tauri dev --config src-tauri/tauri.dev.conf.json",
+    "build:daemon": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --manifest-path src-tauri/Cargo.toml -p picot-daemon",
     "fetch:pi": "bun run scripts/fetch-pi-binary.js",
     "fetch:pi-bolt": "bun run scripts/fetch-pi-bolt.js",
     "fetch:terminal-font": "bun run scripts/fetch-terminal-font.js",

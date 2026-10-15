@@ -15,6 +15,7 @@
 //! dispatcher used to call inline, with the same arguments and the same
 //! results.
 
+use crate::daemon_client::navigation_mirror::NavigationMirror;
 use crate::{
     check_for_update_core, close_approvals, download_and_install_update_core,
     open_native_workspace_window, pick_folder_core, pick_image_files_core,
@@ -22,36 +23,33 @@ use crate::{
 };
 use picot_host::daemon::app_surface::{AppSurface, PaneOp, SurfaceProgress};
 use picot_host::runtime_coordinator::RuntimeTarget;
-use picot_host::window_owner::{OwnerId, WindowOwnerRegistry};
+use picot_host::window_owner::OwnerId;
 use serde_json::Value;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 pub struct TauriAppSurface {
     app: AppHandle,
+    /// The app-side navigation authority the daemon feeds (Task 5). Windows are
+    /// opened against it, and the pending-close map is keyed by the owner it
+    /// yields — the same answers in both modes, with no in-process registry.
+    mirror: Arc<NavigationMirror>,
 }
 
 impl TauriAppSurface {
-    /// Step 3: only the app handle. The owner registry is read from the app's
-    /// managed state at call time instead of being captured here — the registry
-    /// is created inside `DaemonState::start`, which needs this surface as its
-    /// argument, and the app manages the same `Arc` right after the call
-    /// returns (before any window — hence any capability — exists).
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
+    /// The app handle plus the mirror: the mirror is created before the daemon
+    /// boots (the daemon's surface forwards through this one), so it is passed
+    /// in rather than looked up through the app handle.
+    pub fn new(app: AppHandle, mirror: Arc<NavigationMirror>) -> Self {
+        Self { app, mirror }
     }
 
-    /// The daemon-owned owner registry, read back from the app's managed state.
-    ///
-    /// Step 3 note: `DaemonState::start` creates it and the app manages the
-    /// same `Arc` immediately after, before any window (and therefore any
-    /// capability or pending close) exists — so this lookup cannot lose a race
-    /// in production. A missing registry is "unavailable", never a panic.
-    fn owner_registry(&self) -> Result<Arc<WindowOwnerRegistry>, String> {
-        self.app
-            .try_state::<Arc<WindowOwnerRegistry>>()
-            .map(|state| state.inner().clone())
-            .ok_or_else(|| "owner registry is not available".to_string())
+    /// The owner that owns `label`, per the daemon-fed label↔owner map.
+    fn owner_for_label(&self, label: &str) -> Result<OwnerId, String> {
+        self.mirror
+            .owner_for_label(label)
+            .map(OwnerId::from_string)
+            .ok_or_else(|| "no pending window close".to_string())
     }
 }
 
@@ -69,7 +67,7 @@ impl AppSurface for TauriAppSurface {
             &self.app,
             host_origin,
             target,
-            self.owner_registry()?,
+            Arc::clone(&self.mirror),
             OwnerId::from_string(owner.to_string()),
             capability,
         )
@@ -92,10 +90,7 @@ impl AppSurface for TauriAppSurface {
     /// the registry lives, exactly as the app's own close delegate does. The
     /// validation results are the ones `window_close_approve` already returned.
     async fn close_window(&self, label: &str, request_id: &str) -> Result<(), String> {
-        let registry = self.owner_registry()?;
-        let owner = registry
-            .owner_for_label(label)
-            .ok_or_else(|| "no pending window close".to_string())?;
+        let owner = self.owner_for_label(label)?;
         {
             let mut guard = close_approvals().lock().unwrap();
             let Some(pending) = guard.get_mut(&owner) else {

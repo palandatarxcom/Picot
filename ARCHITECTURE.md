@@ -76,7 +76,8 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 - **单实例**：`<data_dir>/picot-daemon.lock` 文件锁；重复启动立即退出并复用现有实例。已有存活 manager 时第二个 app 收 `BlockedByOtherApp` 并退出，**绝不踢掉在位 manager**。
 - **端口与 origin**：数据面与 admin 均临时分配（bind 0），daemon ready 后把两个 origin 写入实例文件；app 读到 origin 才造窗与连接。
 - **退出与信号**：daemon 自身安装 SIGTERM/SIGINT/SIGHUP 处理，5s 宽限；超时不清理子进程注册表，交给下一次 daemon 的 `sweep_orphans` 收拾。
-- **`PICOT_DAEMON` 开发开关**：`embedded` 在 app 进程内起同一个 `DaemonState`，走**同一条** admin 协议与同一个 `AdminClient`（差异只有进程边界）；这是验证期临时通道，验证一个迭代后删除，不留双轨。
+- **`PICOT_DAEMON` 开发开关**（T5 已接线）：`external` 由 app 探测 / spawn / attach 独立进程；`embedded` 在 app 进程内起同一个 `DaemonState`、开同一个 admin listener，app 仍经**同一条** admin 协议与同一个 `AdminClient` 连它——两种模式无直连内进程调用，差异只有进程边界。**过渡默认值**：debug 默认 `external`（M3 开发环走真实进程边界），release 默认 `embedded` 直到 T11 打包 sidecar、T12 删除 embedded 路径（release 版 app 目前没有可 spawn 的 daemon 二进制）。取值非法（非 `embedded`/`external`）时启动报错退出。dev 链路：`bun run dev` 与 `tauri.conf.json` 的 `beforeDevCommand` 都会先 `bun run build:daemon`（两处重复是有意的：Tauri 只在直接 CLI 调用时跑 hook，见 `scripts/build.sh` 的 `run_prebuild` 说明）。
+- **退出过渡语义**（T5 现状，T8 接管）：external 模式下 app 退出只断开 admin 连接（daemon 与 agent 继续跑，下次启动 attach/adopt）；embedded 模式下 app 退出调 `DaemonState::shutdown_graceful`。`keepRunningAfterQuit` 策略、`daemon.stop` 的 accepted/completed 分离与信号分级都在 T8 落地。
 - **macOS-first**：Phase 1 的 sidecar 打包、签名与验证只覆盖 macOS（arm64/x64 DMG）；host 依赖在 `Cargo.toml` 里仍按 `target_os = "macos"` 门控，解门控 + Windows 验证是单独跟踪的后续任务。
 
 ### Phase 1 不变量
