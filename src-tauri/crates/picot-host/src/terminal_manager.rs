@@ -1050,8 +1050,8 @@ mod windows_job {
 
     /// Owned handle to a Win32 Job Object. Wraps the raw `HANDLE` (a
     /// `*mut c_void`, which is `!Send`) so a terminal's job handle can cross
-    /// the thread boundary imposed by `tauri::State` and
-    /// `tauri::async_runtime::spawn`.
+    /// the thread boundary imposed by Tauri's managed state and its async
+    /// runtime spawner.
     ///
     /// Soundness: a Job Object handle is an opaque, process-local identifier
     /// for a kernel object whose operations the kernel itself serializes.

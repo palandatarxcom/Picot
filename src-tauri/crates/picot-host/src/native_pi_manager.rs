@@ -6,7 +6,7 @@
 use crate::ephemeral_registry::EphemeralRegistry;
 use crate::mutation_types::is_mutation;
 use crate::operation_registry::{OperationRegistry, OperationScope};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 use crate::pi_rpc_bridge::InMemoryPiProcess;
 use crate::pi_rpc_bridge::{BridgeFrame, PiRpcBridge, PiRpcProcess, PiRpcProcessObserver};
 use crate::runtime_coordinator::{
@@ -459,11 +459,13 @@ impl NativePiManager {
             .is_some_and(|state| state == crate::runtime_coordinator::RuntimeState::Working)
     }
 
-    #[cfg(test)]
-    pub(crate) fn register_in_memory(
-        &self,
-        target: RuntimeTarget,
-    ) -> Result<InMemoryPiProcess, String> {
+    /// Test seam: register a runtime backed by an in-memory bridge instead of a
+    /// spawned Pi child. Compiled for this crate's tests and for consuming
+    /// packages that enable `test-seams` (the app package owns the launch
+    /// orchestration those tests assert on) — same posture as
+    /// `host_server::set_agent_root_for_tests`.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn register_in_memory(&self, target: RuntimeTarget) -> Result<InMemoryPiProcess, String> {
         // Production runtimes allow 16MB frames (snapshot-scale get_tree
         // replies); tests that push big payloads must see the same ceiling,
         // not a 1MB test-only cap.
@@ -500,9 +502,9 @@ impl NativePiManager {
     ) {
         let inner = Arc::clone(&self.inner);
         // Called synchronously from the Tauri setup thread during native
-        // startup; use the process-wide global runtime instead of the
+        // startup; spawn on the process-wide host runtime instead of the
         // ambient tokio context (which does not exist on that thread).
-        tauri::async_runtime::spawn(async move {
+        crate::runtime::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_millis(50));
             loop {
                 let frame = if observer.is_some() {
@@ -1785,7 +1787,7 @@ mod tests {
         session_path: Option<PathBuf>,
         no_tools: bool,
     ) {
-        let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let static_dir = PathBuf::from(env!("PICOT_SRC_TAURI_DIR")).join("resources");
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

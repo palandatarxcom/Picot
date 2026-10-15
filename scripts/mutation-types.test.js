@@ -5,8 +5,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const manifest = JSON.parse(readFileSync("shared/mutation-types.json", "utf8"));
-const router = readFileSync("src-tauri/src/host_router.rs", "utf8");
-const manager = readFileSync("src-tauri/src/native_pi_manager.rs", "utf8");
+const router = readFileSync("src-tauri/crates/picot-host/src/host_router.rs", "utf8");
+const manager = readFileSync("src-tauri/crates/picot-host/src/native_pi_manager.rs", "utf8");
 
 describe("shared mutation types", () => {
   it("contains exactly 14 unique command names", () => {

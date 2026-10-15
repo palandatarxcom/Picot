@@ -15,12 +15,12 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const EPHEMERAL_SESSION_PREFIX: &str = "ephemeral-";
+pub const EPHEMERAL_SESSION_PREFIX: &str = "ephemeral-";
 
 /// Landing bridge-service cwd: the scratch root `~/.pi/tmp` (sibling of the
 /// agent root, never a registered workspace). Created on demand so the spawn
 /// never races a fresh machine's first landing.
-pub(crate) fn config_runtime_cwd() -> Result<PathBuf, String> {
+pub fn config_runtime_cwd() -> Result<PathBuf, String> {
     let agent_root = crate::pi_launch::resolve_pi_agent_root()?;
     let scratch = agent_root
         .parent()
@@ -875,7 +875,7 @@ impl EphemeralHub {
     pub fn spawn_pump(self: &Arc<Self>, runtimes: &NativePiManager) {
         let receiver = runtimes.subscribe();
         let hub = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
+        crate::runtime::spawn(async move {
             let mut receiver = receiver;
             loop {
                 match receiver.recv().await {
@@ -1057,7 +1057,7 @@ mod tests {
         // this serialization without regenerating the fixture fails here;
         // changing the fixture without this serializer fails on the JS side.
         let fixture_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
+            env!("PICOT_SRC_TAURI_DIR"),
             "/../tests/fixtures/ephemeral/turns-snapshot.json"
         );
         let fixture: Value =
@@ -1191,7 +1191,7 @@ mod admission_tests {
     #[tokio::test]
     #[ignore = "real embedded-Pi smoke; run with --ignored --nocapture"]
     async fn native_smoke_config_runtime_answers_every_landing_op() {
-        let static_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let static_dir = std::path::PathBuf::from(env!("PICOT_SRC_TAURI_DIR")).join("resources");
         let (sender, mut receiver) = tokio::sync::broadcast::channel(256);
         let registry = Arc::new(EphemeralRegistry::default());
         let hub = Arc::new(EphemeralHub::new(

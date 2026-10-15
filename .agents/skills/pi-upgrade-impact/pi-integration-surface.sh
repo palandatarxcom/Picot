@@ -14,7 +14,7 @@ section "Pinned Pi version"
 head -5 scripts/pi-version.json
 
 section "Direct SDK imports"
-grep -rn "@earendil-works/pi-coding-agent" extensions/ public/ src-tauri/src/ 2>/dev/null | grep -Ev "$EXCLUDES" || true
+grep -rn "@earendil-works/pi-coding-agent" extensions/ public/ src-tauri/src/ src-tauri/crates/picot-host/src/ 2>/dev/null | grep -Ev "$EXCLUDES" || true
 
 section "SessionManager usage"
 grep -rn "SessionManager\." extensions/ 2>/dev/null | grep -Ev "$EXCLUDES" || true

@@ -99,9 +99,9 @@ impl PiRpcBridge {
         });
         let parser_frame_tx = frame_tx.clone();
         // attach runs on the Tauri setup thread, outside any ambient tokio
-        // runtime; tauri::async_runtime owns the process-wide global runtime
-        // the rest of the app (host server, terminal manager) already uses.
-        tauri::async_runtime::spawn(read_frames(
+        // runtime; the host runtime owns the process-wide tasks the rest of
+        // the app (host server, terminal manager) already uses.
+        crate::runtime::spawn(read_frames(
             incoming_rx,
             parser_frame_tx,
             Arc::clone(&inner),
@@ -151,7 +151,7 @@ impl PiRpcBridge {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn in_memory(max_frame_bytes: usize) -> (Self, InMemoryPiProcess) {
         let (outbound_tx, outbound_rx) = mpsc::channel(32);
         let (incoming_tx, incoming_rx) = mpsc::channel(32);
@@ -459,21 +459,23 @@ mod windows_job {
     }
 }
 
-#[cfg(test)]
+/// Test seam: drives the bridge without a Pi child process. Compiled for this
+/// crate's tests and for consuming packages that enable `test-seams`.
+#[cfg(any(test, feature = "test-seams"))]
 impl InMemoryPiProcess {
-    pub(crate) async fn read_request(&mut self) -> Option<Value> {
+    pub async fn read_request(&mut self) -> Option<Value> {
         self.outbound.recv().await
     }
 
-    pub(crate) fn try_read_request(&mut self) -> Option<Value> {
+    pub fn try_read_request(&mut self) -> Option<Value> {
         self.outbound.try_recv().ok()
     }
 
-    pub(crate) async fn write_frame(&mut self, value: Value) -> Result<(), BridgeError> {
+    pub async fn write_frame(&mut self, value: Value) -> Result<(), BridgeError> {
         self.write_raw(format!("{}\n", value)).await
     }
 
-    pub(crate) async fn write_raw(&mut self, raw: String) -> Result<(), BridgeError> {
+    pub async fn write_raw(&mut self, raw: String) -> Result<(), BridgeError> {
         self.incoming
             .as_ref()
             .ok_or(BridgeError::ProcessClosed)?
@@ -482,7 +484,7 @@ impl InMemoryPiProcess {
             .map_err(|_| BridgeError::ProcessClosed)
     }
 
-    pub(crate) async fn close(&mut self) {
+    pub async fn close(&mut self) {
         self.incoming.take();
         self.fatal_frames.take();
     }
@@ -490,7 +492,7 @@ impl InMemoryPiProcess {
     /// Close only the host→child request pipe. The bridge writer task then
     /// observes a failed send — the writer-fail fault class — while the
     /// child→host direction stays alive.
-    pub(crate) fn fail_outbound(&mut self) {
+    pub fn fail_outbound(&mut self) {
         self.outbound.close();
         if let Some(fatal_frames) = self.fatal_frames.take() {
             let _ =

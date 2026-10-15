@@ -2,96 +2,40 @@
 // ABOUTME: Picot Tauri host entry point: spawns per-workspace Pi processes and
 // ABOUTME: owns windows, HostServer v2, ephemeral chats, and native close lifecycle.
 
-// Host runtime modules are compiled into one native transport path.
-// Retired compatibility handlers remain explicit and fail closed where needed.
-#[allow(dead_code)]
-mod anydoc_preview;
+// The host stack lives in the shared `picot-host` library, which links no
+// Tauri (plan D1; enforced by scripts/check-daemon-no-tauri.js). Only the
+// app-side child-webview surface stays a module of this binary.
 mod browser_pane;
-mod cache_optimizer_config;
-mod caveman_config;
-mod child_supervision;
-mod environment_install;
-mod environment_probe;
-mod environment_prompt;
-mod fff_config;
-mod goal_config;
-mod host_capability;
-#[allow(dead_code)]
-mod host_config;
-#[allow(dead_code)]
-mod host_control;
-mod host_data;
-mod host_files;
-mod host_router;
-mod host_server;
-mod mcp_login_runner;
-mod metadata_store;
-mod mutation_types;
-mod native_pi_manager;
-#[allow(dead_code)]
-mod oauth_manager;
-mod officecli_watch;
-mod operation_registry;
-mod package_manager;
-mod paste_offload;
-mod search_env_config;
-// Public API staged for the broker (Task 5) and host lifecycle (Task 7a).
-#[allow(dead_code)]
-mod command_policy;
-mod cost_compat;
-#[allow(dead_code)]
-mod ephemeral_registry;
-mod git_pi_runner;
-mod git_service;
-mod host_credentials;
-mod host_ephemeral;
-mod host_models;
-mod host_skills;
-mod lens_config;
-mod pi_launch;
-mod pi_path;
-mod pi_rpc_bridge;
-mod ponytail_config;
-#[allow(dead_code)]
-mod process_tree;
-mod project_trust;
-mod remote_auth;
-mod rpiv_config;
-mod runtime_coordinator;
-mod session_ui_profile_store;
-mod skill_install;
-mod skill_source_registry;
-mod subagents_inventory;
-mod subagents_settings;
-mod telemetry;
-#[allow(dead_code)]
-mod temp_resources;
-mod terminal_manager;
-mod terminal_output;
-mod terminal_profiles;
-mod terminal_registry;
-mod terminal_state_store;
-mod transport_limits;
-mod vcc_config;
-mod window_owner;
-mod windows_child;
-mod workspace_controls;
 
-use ephemeral_registry::{EphemeralKind, EphemeralRegistry};
-use git_service::GitService;
-use host_control::{
+use picot_host::{
+    cache_optimizer_config, caveman_config, child_supervision, environment_install,
+    environment_probe, fff_config, git_pi_runner, git_service, goal_config, host_credentials,
+    host_data, host_ephemeral, host_models, host_router, host_server, host_skills, lens_config,
+    officecli_watch, package_manager, pi_launch, pi_path, ponytail_config, project_trust,
+    rpiv_config, search_env_config, skill_install, vcc_config, window_owner, windows_child,
+    workspace_controls,
+};
+
+use picot_host::ephemeral_registry::{EphemeralKind, EphemeralRegistry};
+use picot_host::git_service::GitService;
+use picot_host::host_control::{
     ClientClass, ControlHandler, HostEventSink, ProgressSink, VerifiedClientContext,
 };
-use host_ephemeral::SharedEphemeralHub;
-use host_server::HostServer;
-use metadata_store::{MetadataStore, SharedMetadataStore};
-use native_pi_manager::NativePiManager;
-use pi_launch::locked_pi_version;
-use remote_auth::RemoteAuth;
-use runtime_coordinator::RuntimeTarget;
+use picot_host::host_ephemeral::SharedEphemeralHub;
+use picot_host::host_server::HostServer;
+use picot_host::metadata_store::{MetadataStore, SharedMetadataStore};
+use picot_host::native_pi_manager::NativePiManager;
+use picot_host::pi_launch::locked_pi_version;
+use picot_host::remote_auth::RemoteAuth;
+use picot_host::runtime_coordinator::RuntimeTarget;
+use picot_host::session_ui_profile_store::{validate_session_path, SessionUiProfileStore};
+use picot_host::skill_source_registry::SkillSourceRegistry;
+use picot_host::temp_resources::{canonical_temp_root, cleanup_quick_chat_dir};
+use picot_host::terminal_manager::TerminalManager;
+use picot_host::terminal_registry::TerminalRegistry;
+use picot_host::terminal_state_store::TerminalStateStore;
+use picot_host::window_owner::WindowOwnerRegistry;
 use serde_json::{json, Map, Value};
-use session_ui_profile_store::{validate_session_path, SessionUiProfileStore};
-use skill_source_registry::SkillSourceRegistry;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -101,11 +45,6 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Manager, TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_window_state::StateFlags;
-use temp_resources::{canonical_temp_root, cleanup_quick_chat_dir};
-use terminal_manager::TerminalManager;
-use terminal_registry::TerminalRegistry;
-use terminal_state_store::TerminalStateStore;
-use window_owner::WindowOwnerRegistry;
 
 type HostServerState = HostServer;
 type NativePiManagerState = NativePiManager;
@@ -134,7 +73,7 @@ type EphemeralRegistryState = Arc<EphemeralRegistry>;
 async fn record_session_bucket_after_spawn(
     runtimes: NativePiManager,
     metadata: SharedMetadataStore,
-    host_events: crate::host_control::HostEventSink,
+    host_events: picot_host::host_control::HostEventSink,
     target: RuntimeTarget,
     owner: Option<window_owner::OwnerId>,
 ) {
@@ -948,7 +887,7 @@ fn target_for_owner_in_workspace(
                 && target.workspace_id == workspace_id
                 && !target
                     .session_id
-                    .starts_with(crate::host_ephemeral::EPHEMERAL_SESSION_PREFIX)
+                    .starts_with(picot_host::host_ephemeral::EPHEMERAL_SESSION_PREFIX)
         })
         .max_by(|a, b| {
             a.workspace_generation
@@ -1084,7 +1023,7 @@ mod tests {
         skill_scope_context, target_for_owner_in_workspace, touch_registered_workspace,
         workspace_snapshot_for,
     };
-    use crate::metadata_store::{MetadataStore, SharedMetadataStore};
+    use picot_host::metadata_store::{MetadataStore, SharedMetadataStore};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1195,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_spawn_recording_persists_the_pi_reported_bucket() {
-        let manager = crate::native_pi_manager::NativePiManager::new(8);
+        let manager = picot_host::native_pi_manager::NativePiManager::new(8);
         let (metadata, temp) = shared_test_metadata("bucket-record");
         let workspace = temp.join("ws");
         fs::create_dir_all(&workspace).unwrap();
@@ -1203,7 +1142,7 @@ mod tests {
         assert!(added);
         // The runtime target carries the registered row's workspace id —
         // production prepare resolves it the same way before spawning.
-        let target = crate::runtime_coordinator::RuntimeTarget::with_owner(
+        let target = picot_host::runtime_coordinator::RuntimeTarget::with_owner(
             row.workspace_id.clone(),
             "session-a",
             "instance-a",
@@ -1213,8 +1152,8 @@ mod tests {
         let mut fake = manager.register_in_memory(target.clone()).unwrap();
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(16);
-        let sink = crate::host_control::HostEventSink::new(event_tx);
-        let owner = crate::window_owner::OwnerId::from_string("owner-a".to_string());
+        let sink = picot_host::host_control::HostEventSink::new(event_tx);
+        let owner = picot_host::window_owner::OwnerId::from_string("owner-a".to_string());
         let task = tokio::spawn(super::record_session_bucket_after_spawn(
             manager.clone(),
             metadata.clone(),
@@ -1257,8 +1196,8 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_reuses_live_runtime_for_matching_persisted_session() {
-        let manager = crate::native_pi_manager::NativePiManager::new(8);
-        let target = crate::runtime_coordinator::RuntimeTarget::with_owner(
+        let manager = picot_host::native_pi_manager::NativePiManager::new(8);
+        let target = picot_host::runtime_coordinator::RuntimeTarget::with_owner(
             "workspace-a",
             "saved",
             "instance-a",
@@ -1311,7 +1250,7 @@ mod tests {
 
     #[test]
     fn runtime_started_event_identifies_spawned_runtime() {
-        use crate::runtime_coordinator::RuntimeTarget;
+        use picot_host::runtime_coordinator::RuntimeTarget;
         let target =
             RuntimeTarget::with_owner("workspace-a", "session-a", "instance-a", "owner-a", 4);
         assert_eq!(
@@ -1327,8 +1266,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_instance_summaries_span_every_registered_workspace() {
-        use crate::native_pi_manager::NativePiManager;
-        use crate::runtime_coordinator::RuntimeTarget;
+        use picot_host::native_pi_manager::NativePiManager;
+        use picot_host::runtime_coordinator::RuntimeTarget;
 
         let manager = NativePiManager::new(8);
         let (metadata, temp) = shared_test_metadata("instance-summaries");
@@ -1429,8 +1368,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_instance_summaries_prefers_retained_session_file_without_rescan() {
-        use crate::native_pi_manager::NativePiManager;
-        use crate::runtime_coordinator::RuntimeTarget;
+        use picot_host::native_pi_manager::NativePiManager;
+        use picot_host::runtime_coordinator::RuntimeTarget;
 
         let manager = NativePiManager::new(8);
         let (metadata, temp) = shared_test_metadata("instance-retained");
@@ -1467,7 +1406,7 @@ mod tests {
             .unwrap();
 
         // Precondition: the bucket lookup alone resolves nothing.
-        let data = crate::host_data::HostDataPlane::new(metadata.clone())
+        let data = picot_host::host_data::HostDataPlane::new(metadata.clone())
             .with_session_root(sessions_root.clone());
         assert!(data
             .session_file_path(&row.workspace_id, "session-retained")
@@ -1486,8 +1425,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_instance_summaries_report_streaming_state() {
-        use crate::native_pi_manager::NativePiManager;
-        use crate::runtime_coordinator::RuntimeTarget;
+        use picot_host::native_pi_manager::NativePiManager;
+        use picot_host::runtime_coordinator::RuntimeTarget;
 
         // `streaming` mirrors the coordinator's event-driven state so the
         // sidebar can light the green dot for a turn that began before this
@@ -1571,8 +1510,8 @@ mod tests {
 
     #[tokio::test]
     async fn restart_targets_only_the_current_workspaces_runtime() {
-        use crate::native_pi_manager::NativePiManager;
-        use crate::runtime_coordinator::RuntimeTarget;
+        use picot_host::native_pi_manager::NativePiManager;
+        use picot_host::runtime_coordinator::RuntimeTarget;
 
         let manager = NativePiManager::new(8);
         // The owner keeps a stale runtime alive in workspace A (generation 1)
@@ -1640,8 +1579,8 @@ mod tests {
     /// HashMap order and a manual restart could stop the side chat instead.
     #[tokio::test]
     async fn restart_prefers_the_session_runtime_over_a_same_generation_ephemeral_one() {
-        use crate::native_pi_manager::NativePiManager;
-        use crate::runtime_coordinator::RuntimeTarget;
+        use picot_host::native_pi_manager::NativePiManager;
+        use picot_host::runtime_coordinator::RuntimeTarget;
 
         let manager = NativePiManager::new(8);
         manager
@@ -1674,8 +1613,8 @@ mod tests {
     /// caller must fail loudly rather than restart the wrong thing.
     #[tokio::test]
     async fn restart_reports_no_target_when_only_an_ephemeral_runtime_is_live() {
-        use crate::native_pi_manager::NativePiManager;
-        use crate::runtime_coordinator::RuntimeTarget;
+        use picot_host::native_pi_manager::NativePiManager;
+        use picot_host::runtime_coordinator::RuntimeTarget;
 
         let manager = NativePiManager::new(8);
         manager
@@ -1696,8 +1635,8 @@ mod tests {
 
     #[tokio::test]
     async fn cross_workspace_return_reuses_the_prior_runtime() {
-        let manager = crate::native_pi_manager::NativePiManager::new(8);
-        let prior = crate::runtime_coordinator::RuntimeTarget::with_owner(
+        let manager = picot_host::native_pi_manager::NativePiManager::new(8);
+        let prior = picot_host::runtime_coordinator::RuntimeTarget::with_owner(
             "workspace-a",
             "saved-session",
             "instance-a",
@@ -1721,7 +1660,7 @@ mod tests {
         assert!(manager.rebind_owner_generation("owner-a", "saved-session", 3));
         assert_eq!(
             manager.target_for_session_id("saved-session"),
-            Some(crate::runtime_coordinator::RuntimeTarget::with_owner(
+            Some(picot_host::runtime_coordinator::RuntimeTarget::with_owner(
                 "workspace-a",
                 "saved-session",
                 "instance-a",
@@ -1733,7 +1672,7 @@ mod tests {
 
     #[test]
     fn cancel_stops_only_the_instance_its_transition_created() {
-        let created = crate::runtime_coordinator::RuntimeTarget::with_owner(
+        let created = picot_host::runtime_coordinator::RuntimeTarget::with_owner(
             "workspace-a",
             "session-new",
             "instance-new",
@@ -1745,7 +1684,7 @@ mod tests {
         // A different live runtime (sibling session) is never cancel's target.
         assert!(!cancel_should_stop_target(
             Some("instance-new"),
-            &crate::runtime_coordinator::RuntimeTarget::with_owner(
+            &picot_host::runtime_coordinator::RuntimeTarget::with_owner(
                 "workspace-a",
                 "session-live",
                 "instance-live",
@@ -1755,7 +1694,7 @@ mod tests {
         ));
         // A REUSED prepare records no created instance: cancel must not stop
         // the reused runtime, even when session ids match the pending record.
-        let reused = crate::runtime_coordinator::RuntimeTarget::with_owner(
+        let reused = picot_host::runtime_coordinator::RuntimeTarget::with_owner(
             "workspace-b",
             "session-live",
             "instance-live",
@@ -1779,7 +1718,9 @@ mod tests {
 
     #[test]
     fn landing_owner_rejects_workspace_snapshot_but_admits_quick_chat() {
-        use crate::window_owner::{OwnerWorkspaceSnapshot, TemporaryKind, WindowOwnerRegistry};
+        use picot_host::window_owner::{
+            OwnerWorkspaceSnapshot, TemporaryKind, WindowOwnerRegistry,
+        };
         use std::sync::{Arc, Mutex as StdMutex};
         let registry = Arc::new(WindowOwnerRegistry::default());
         let (owner, _) = registry
@@ -1855,12 +1796,12 @@ mod tests {
 
     #[test]
     fn skill_scope_context_reports_project_trust_for_every_scope() {
-        use crate::window_owner::{TemporaryKind, WindowOwnerRegistry};
+        use picot_host::window_owner::{TemporaryKind, WindowOwnerRegistry};
         use std::sync::Arc;
         let registry = Arc::new(WindowOwnerRegistry::default());
         let agent_root = tempfile::tempdir().expect("agent root temp dir");
         let workspace = tempfile::tempdir().expect("workspace temp dir");
-        crate::project_trust::trust_project(agent_root.path(), workspace.path())
+        picot_host::project_trust::trust_project(agent_root.path(), workspace.path())
             .expect("seed trust entry");
         let (owner, _) = registry
             .create_owner_with_workspace(
@@ -4918,6 +4859,11 @@ fn disable_press_and_hold_accents() {
 }
 
 fn main() {
+    // Host tasks spawned through `picot_host::runtime::spawn` must land on the
+    // app's tokio runtime (the one `tauri::async_runtime` owns): the pre-split
+    // code called `tauri::async_runtime::spawn` for exactly those tasks.
+    picot_host::runtime::install(tauri::async_runtime::handle().inner().clone());
+
     // Sync the user's login-shell environment before anything else.
     // macOS GUI apps (launched from Finder/Dock) inherit neither PATH nor
     // provider API keys exported by shell startup files. `fix_all_vars()`
@@ -5158,7 +5104,7 @@ mod skill_source_scope_tests {
 
 #[cfg(test)]
 mod startup_tests {
-    use crate::temp_resources::{create_quick_chat_temp_dir_in, ensure_picot_tmp_root_in};
+    use picot_host::temp_resources::{create_quick_chat_temp_dir_in, ensure_picot_tmp_root_in};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;

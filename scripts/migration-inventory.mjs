@@ -5,7 +5,10 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
-const hostSource = await readFile(resolve(root, "src-tauri/src/host_server.rs"), "utf8");
+const hostSource = await readFile(
+  resolve(root, "src-tauri/crates/picot-host/src/host_server.rs"),
+  "utf8",
+);
 const commandManifestPath = resolve(root, "protocol/picot-core-commands.json");
 let commandManifest;
 try {
@@ -47,7 +50,10 @@ for (const file of files.sort()) {
 }
 
 const hostControlSource = await readFile(resolve(root, "src-tauri/src/main.rs"), "utf8");
-const routerSource = await readFile(resolve(root, "src-tauri/src/host_router.rs"), "utf8");
+const routerSource = await readFile(
+  resolve(root, "src-tauri/crates/picot-host/src/host_router.rs"),
+  "utf8",
+);
 const controls = unique(
   [...hostControlSource.matchAll(/^\s*"([A-Za-z][A-Za-z0-9_.-]*)"\s*=>/gm)].map((m) => m[1]),
 );

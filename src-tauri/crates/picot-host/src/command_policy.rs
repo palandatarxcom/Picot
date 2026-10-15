@@ -26,7 +26,7 @@ static MANIFEST: OnceLock<ParsedManifest> = OnceLock::new();
 
 fn manifest() -> &'static ParsedManifest {
     MANIFEST.get_or_init(|| {
-        let raw = include_str!("../../protocol/picot-core-commands.json");
+        let raw = include_str!("../../../../protocol/picot-core-commands.json");
         let manifest: Manifest =
             serde_json::from_str(raw).expect("picot-core-commands.json must be valid");
         assert_eq!(
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn manifest_has_exact_parity_with_json_command_count() {
-        let raw = include_str!("../../protocol/picot-core-commands.json");
+        let raw = include_str!("../../../../protocol/picot-core-commands.json");
         let manifest: Manifest = serde_json::from_str(raw).expect("manifest parses");
         assert_eq!(manifest.version, 1);
         // Assert known Skills commands are classified desktopOwnerOnly rather

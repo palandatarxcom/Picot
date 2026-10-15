@@ -11,7 +11,7 @@ static MUTATION_TYPES: OnceLock<HashSet<&'static str>> = OnceLock::new();
 pub fn is_mutation(command_type: &str) -> bool {
     MUTATION_TYPES
         .get_or_init(|| {
-            serde_json::from_str(include_str!("../../shared/mutation-types.json"))
+            serde_json::from_str(include_str!("../../../../shared/mutation-types.json"))
                 .expect("shared mutation types must be valid JSON")
         })
         .contains(command_type)

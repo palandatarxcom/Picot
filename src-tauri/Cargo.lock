@@ -3587,29 +3587,17 @@ dependencies = [
 name = "picot"
 version = "0.5.0"
 dependencies = [
- "anydoc",
- "axum",
+ "async-trait",
  "base64 0.22.1",
- "chrono",
  "dirs 5.0.1",
  "fix-path-env",
- "futures-util",
- "hex",
- "hmac",
- "libc",
  "log",
- "notify-rust",
  "objc2-foundation",
- "percent-encoding",
- "portable-pty",
+ "picot-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "rusqlite",
- "semver",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -3621,9 +3609,49 @@ dependencies = [
  "tauri-plugin-window-state",
  "tempfile",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "picot-daemon"
+version = "0.5.0"
+dependencies = [
+ "picot-host",
+]
+
+[[package]]
+name = "picot-host"
+version = "0.5.0"
+dependencies = [
+ "anydoc",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "dirs 5.0.1",
+ "fix-path-env",
+ "futures-util",
+ "hex",
+ "hmac",
+ "libc",
+ "log",
+ "notify-rust",
+ "percent-encoding",
+ "portable-pty",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "tokio",
  "tokio-tungstenite 0.24.0",
  "tower",
  "tower-http",
+ "url",
  "uuid",
  "windows-sys 0.59.0",
 ]

@@ -1,0 +1,15 @@
+[package]
+name = "picot-daemon"
+version = "0.5.0"
+description = "Picot daemon: the Picot host stack running outside the Tauri app process"
+authors = ["Pi Desktop"]
+edition = "2021"
+
+# Phase 1 (plan D1): the daemon depends on the shared host crate only. No
+# `tauri` here, directly or transitively (scripts/check-daemon-no-tauri.js).
+[[bin]]
+name = "picot-daemon"
+path = "src/main.rs"
+
+[dependencies]
+picot-host = { path = "../picot-host" }

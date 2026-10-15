@@ -43,6 +43,39 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 const MAX_HTTP_BODY_BYTES: usize = HTTP_DEFAULT_BODY_BYTES;
+
+/// Child-webview pane rectangle, in logical pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// App-owned child-webview surface behind the `browser_pane_*` data-plane ops.
+///
+/// The concrete runtime lives in the Tauri app package (`browser_pane.rs`), so
+/// the host holds a trait slot instead of that type: the host crate stays free
+/// of Tauri (plan D1), and a process without a WebView (the daemon) simply
+/// installs nothing — which is the answer the ops already give today when no
+/// runtime is attached (`unavailable`).
+#[async_trait::async_trait]
+pub trait PaneSurface: Send + Sync {
+    fn create(
+        &self,
+        pane_id: &str,
+        window_label: &str,
+        url: &str,
+        rect: PaneRect,
+    ) -> Result<(), String>;
+    fn set_rect(&self, pane_id: &str, rect: PaneRect) -> Result<(), String>;
+    fn set_visible(&self, pane_id: &str, visible: bool) -> Result<(), String>;
+    async fn eval_json(&self, pane_id: &str, expression: &str) -> Result<String, String>;
+    fn navigate(&self, pane_id: &str, url: &str) -> Result<(), String>;
+    fn url(&self, pane_id: &str) -> Result<String, String>;
+    fn destroy(&self, pane_id: &str) -> Result<(), String>;
+}
 // JSON string escaping can inflate each payload byte up to sixfold
 // (\uXXXX); the semantic paste bound in paste_offload stays authoritative,
 // so the transport limit only needs headroom for the encoded form.
@@ -140,7 +173,7 @@ struct HostState {
     #[allow(dead_code)]
     desktop_capabilities: Mutex<HostCapabilityStore>,
     owner_registry: Mutex<Option<Arc<WindowOwnerRegistry>>>,
-    browser_panes: Mutex<Option<Arc<crate::browser_pane::BrowserPaneRuntime>>>,
+    browser_panes: Mutex<Option<Arc<dyn PaneSurface>>>,
     officecli_watches: Mutex<Option<Arc<crate::officecli_watch::OfficecliWatchRuntime>>>,
     runtimes: NativePiManager,
     auth: Arc<Mutex<RemoteAuth>>,
@@ -515,7 +548,7 @@ impl HostServer {
     }
 
     /// Attach the browser-pane runtime (child webviews) after host bind.
-    pub fn set_browser_panes(&self, runtime: Arc<crate::browser_pane::BrowserPaneRuntime>) {
+    pub fn set_browser_panes(&self, runtime: Arc<dyn PaneSurface>) {
         if let Ok(mut slot) = self.state.browser_panes.lock() {
             *slot = Some(runtime);
         }
@@ -3583,7 +3616,7 @@ async fn dispatch(
                             pane_id,
                             window_label,
                             url,
-                            crate::browser_pane::PaneRect {
+                            PaneRect {
                                 x: num("x")?,
                                 y: num("y")?,
                                 width: num("width")?,
@@ -3617,7 +3650,7 @@ async fn dispatch(
                     panes
                         .set_rect(
                             pane_id,
-                            crate::browser_pane::PaneRect {
+                            PaneRect {
                                 x: num("x")?,
                                 y: num("y")?,
                                 width: num("width")?,
@@ -5761,7 +5794,7 @@ mod tests {
 
     fn anydoc_fixture(name: &str) -> std::path::PathBuf {
         [
-            env!("CARGO_MANIFEST_DIR"),
+            env!("PICOT_SRC_TAURI_DIR"),
             "..",
             "extensions",
             "fixtures",
@@ -6375,7 +6408,7 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("picot-host-origin-p3-{nonce}"));
         let workspace = temp.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
-        let public = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let public = std::path::PathBuf::from(env!("PICOT_SRC_TAURI_DIR"))
             .join("..")
             .join("public");
         let metadata = Arc::new(Mutex::new(

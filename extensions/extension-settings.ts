@@ -1,5 +1,5 @@
 // ABOUTME: Bridge ops for advisor's config (XDG-aware rpiv-advisor/advisor.json); pi-fff moved to
-// ABOUTME: the host control plane (src-tauri/src/fff_config.rs) so landing pages can configure it.
+// ABOUTME: the host control plane (src-tauri/crates/picot-host/src/fff_config.rs) so landing pages can configure it.
 
 import * as fs from "node:fs";
 import * as os from "node:os";

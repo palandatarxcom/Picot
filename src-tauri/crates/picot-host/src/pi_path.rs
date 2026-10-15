@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
-pub(crate) const PREF_KEY: &str = "pi.pathEnabled";
+pub const PREF_KEY: &str = "pi.pathEnabled";
 
 const MARKER_BEGIN: &str = "# >>> picot embedded pi >>>";
 const MARKER_END: &str = "# <<< picot embedded pi <<<";
 
 /// Q3: one rc file per detected login shell; unsupported shells disable the
 /// toggle instead of guessing a file.
-pub(crate) fn rc_filename_for_shell(shell: &str) -> Option<&'static str> {
+pub fn rc_filename_for_shell(shell: &str) -> Option<&'static str> {
     let basename = shell.rsplit('/').next().unwrap_or("");
     match basename {
         "zsh" => Some(".zshrc"),
@@ -93,11 +93,7 @@ pub(crate) fn remove_from_rc_text(text: &str) -> (bool, String) {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn apply_posix(
-    home: &std::path::Path,
-    shell: &str,
-    pi_dir: &str,
-) -> Result<String, String> {
+pub fn apply_posix(home: &std::path::Path, shell: &str, pi_dir: &str) -> Result<String, String> {
     let rc_name =
         rc_filename_for_shell(shell).ok_or_else(|| format!("unsupported shell: {shell}"))?;
     let rc_path = home.join(rc_name);
@@ -114,7 +110,7 @@ pub(crate) fn apply_posix(
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn remove_posix(home: &std::path::Path, shell: &str) -> Result<String, String> {
+pub fn remove_posix(home: &std::path::Path, shell: &str) -> Result<String, String> {
     let rc_name =
         rc_filename_for_shell(shell).ok_or_else(|| format!("unsupported shell: {shell}"))?;
     let rc_path = home.join(rc_name);
@@ -128,7 +124,7 @@ pub(crate) fn remove_posix(home: &std::path::Path, shell: &str) -> Result<String
 }
 
 /// Directory containing the embedded `pi` binary; the PATH entry itself.
-pub(crate) fn bundled_pi_dir(static_dir: &std::path::Path) -> Result<PathBuf, String> {
+pub fn bundled_pi_dir(static_dir: &std::path::Path) -> Result<PathBuf, String> {
     crate::pi_launch::resolve_bundled_pi(static_dir)?
         .parent()
         .map(PathBuf::from)

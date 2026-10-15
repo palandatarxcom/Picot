@@ -39,7 +39,7 @@ pub struct OwnerEvent {
 }
 
 impl HostEventSink {
-    pub(crate) fn new(sender: broadcast::Sender<OwnerEvent>) -> Self {
+    pub fn new(sender: broadcast::Sender<OwnerEvent>) -> Self {
         Self { sender }
     }
 

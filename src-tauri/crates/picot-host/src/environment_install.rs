@@ -28,7 +28,7 @@ pub(crate) enum Phase {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Snapshot {
+pub struct Snapshot {
     pub(crate) tool: ToolId,
     pub(crate) action: ToolAction,
     pub(crate) phase: Phase,
@@ -57,7 +57,7 @@ struct Running {
     cancelled: bool,
 }
 
-pub(crate) struct Installer {
+pub struct Installer {
     pi_binary: PathBuf,
     prober: Prober,
     inner: Mutex<Inner>,
@@ -70,11 +70,11 @@ struct Inner {
 }
 
 impl Installer {
-    pub(crate) fn new(pi_binary: PathBuf) -> Self {
+    pub fn new(pi_binary: PathBuf) -> Self {
         Self::with_prober(pi_binary, Arc::new(probe_one))
     }
 
-    pub(crate) fn with_prober(pi_binary: PathBuf, prober: Prober) -> Self {
+    pub fn with_prober(pi_binary: PathBuf, prober: Prober) -> Self {
         Self {
             pi_binary,
             prober,
@@ -83,7 +83,7 @@ impl Installer {
     }
 
     /// Reject a second job while one is running: the page offers one at a time.
-    pub(crate) fn start(
+    pub fn start(
         &self,
         tool: ToolId,
         action: ToolAction,
@@ -134,7 +134,7 @@ impl Installer {
     }
 
     /// Advance the job: a finished process is re-checked by the host here.
-    pub(crate) fn status(&self) -> Option<Snapshot> {
+    pub fn status(&self) -> Option<Snapshot> {
         let mut inner = self.inner.lock().ok()?;
         if inner.running.is_none() {
             // A finished job stays readable. Without this the page loses the
@@ -171,7 +171,7 @@ impl Installer {
         }
     }
 
-    pub(crate) fn cancel(&self) -> Option<Snapshot> {
+    pub fn cancel(&self) -> Option<Snapshot> {
         let mut inner = self.inner.lock().ok()?;
         let running = inner.running.as_mut()?;
         running.cancelled = true;
@@ -184,7 +184,7 @@ impl Installer {
     }
 
     /// Best effort on the way out: stop the child, do not wait for a re-check.
-    pub(crate) fn stop_for_app_exit(&self) {
+    pub fn stop_for_app_exit(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(running) = inner.running.as_mut() {
                 let _ = running.child.kill();

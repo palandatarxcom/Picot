@@ -1,0 +1,58 @@
+[package]
+name = "picot-host"
+version = "0.5.0"
+description = "Picot host stack (host server, Pi runtimes, metadata, terminals) with zero Tauri coupling"
+authors = ["Pi Desktop"]
+edition = "2021"
+
+[features]
+# Test seams this crate shares with the app package's tests (and, from T2 on,
+# the daemon's): an in-memory Pi bridge instead of a spawned child, so both
+# packages can exercise launch orchestration. Enabled only through
+# `[dev-dependencies]`, never in a production build.
+test-seams = []
+
+# Phase 1 (plan D1, Dr. Lin decision 4): no `tauri` dependency here, directly or
+# transitively. scripts/check-daemon-no-tauri.js enforces this in `bun run test`.
+# Host dependencies stay target-gated exactly as they were in the app package
+# (macOS-first scope, plan D9); un-gating for Windows is a separate follow-up.
+[dependencies]
+anydoc = "=0.2.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+dirs = "5"
+log = "0.4"
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
+sha2 = "0.10"
+hmac = "0.12"
+# `url` is the crate the app framework's URL type re-exports; linking it
+# directly keeps window_owner's exact URL semantics without the framework.
+# (Spelled out rather than named, because the guard script scans for the
+# framework path form.)
+url = "2"
+async-trait = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+percent-encoding = "2"
+semver = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+base64 = "0.22"
+rand = "0.8"
+subtle = "2"
+tempfile = "3"
+portable-pty = "0.9"
+libc = "0.2"
+notify-rust = "4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }

@@ -74,7 +74,7 @@ pub struct SessionSearchResult {
 }
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct SessionMetrics {
+pub struct SessionMetrics {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) cwd: Option<PathBuf>,
@@ -1124,7 +1124,7 @@ impl SessionExportRegistry {
 
 /// Bounded session header (legacy `parseSessionFile`): at most 50 lines,
 /// early exit once name and first message are both known.
-pub(crate) struct SessionHeader {
+pub struct SessionHeader {
     pub id: String,
     pub timestamp: String,
     pub name: Option<String>,
@@ -1338,7 +1338,7 @@ fn scan_session_sidebar_visibility(path: &Path) -> Result<SidebarScan, HostDataE
     Ok(SidebarScan { header })
 }
 
-pub(crate) fn parse_session_header(path: &Path) -> Option<SessionHeader> {
+pub fn parse_session_header(path: &Path) -> Option<SessionHeader> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
     let mut header: Option<(String, String, Option<String>, Option<String>)> = None;

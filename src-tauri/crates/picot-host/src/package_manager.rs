@@ -29,7 +29,7 @@ const RESOURCE_KINDS: [(&str, &str); 4] = [
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum PiPackageResourceKind {
+pub enum PiPackageResourceKind {
     Extension,
     Skill,
     Prompt,
@@ -38,14 +38,14 @@ pub(crate) enum PiPackageResourceKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum PiPackageScope {
+pub enum PiPackageScope {
     Global,
     Project,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PiPackageResource {
+pub struct PiPackageResource {
     pub kind: PiPackageResourceKind,
     pub name: String,
     pub relative_path: String,
@@ -53,7 +53,7 @@ pub(crate) struct PiPackageResource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PiPackageCounts {
+pub struct PiPackageCounts {
     pub extensions: usize,
     pub skills: usize,
     pub prompts: usize,
@@ -62,7 +62,7 @@ pub(crate) struct PiPackageCounts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PiPackageRecord {
+pub struct PiPackageRecord {
     pub source: String,
     pub scope: PiPackageScope,
     pub installed_path: Option<String>,
@@ -75,16 +75,14 @@ pub(crate) struct PiPackageRecord {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PackageLocations {
+pub struct PackageLocations {
     pub global_settings: PathBuf,
     pub project_settings: Option<PathBuf>,
     pub global_agent_dir: PathBuf,
     pub project_root: Option<PathBuf>,
 }
 
-pub(crate) fn locations_for_workspace(
-    workspace: Option<&Path>,
-) -> Result<PackageLocations, String> {
+pub fn locations_for_workspace(workspace: Option<&Path>) -> Result<PackageLocations, String> {
     let global_agent_dir = match std::env::var("PI_CODING_AGENT_DIR") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
         _ => dirs::home_dir()
@@ -128,14 +126,14 @@ enum ParsedSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PiPackageUpdate {
+pub struct PiPackageUpdate {
     pub source: String,
     pub scope: PiPackageScope,
     pub available: bool,
 }
 
 /// Check each installed package against its configured upstream.
-pub(crate) async fn check_available_updates(
+pub async fn check_available_updates(
     records: &[PiPackageRecord],
     locations: &PackageLocations,
 ) -> Vec<PiPackageUpdate> {
@@ -402,7 +400,7 @@ pub(crate) fn inspect_configured_packages(
 /// Parse the embedded Pi CLI's `pi list` output. Pi is authoritative for the
 /// configured sources, scope, and resolved install path; this module only
 /// enriches those host-resolved records with metadata and resources.
-pub(crate) fn inspect_pi_list_output(
+pub fn inspect_pi_list_output(
     output: &str,
     locations: &PackageLocations,
 ) -> Result<Vec<PiPackageRecord>, String> {
@@ -512,7 +510,7 @@ fn enrich_record(record: &mut PiPackageRecord) {
     record.counts = counts_for(&record.resources);
 }
 
-pub(crate) fn set_package_disabled(
+pub fn set_package_disabled(
     locations: &PackageLocations,
     scope: &str,
     source: &str,

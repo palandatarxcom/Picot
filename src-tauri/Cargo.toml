@@ -5,6 +5,14 @@ description = "Pi Agent Desktop - session manager for pi coding agent"
 authors = ["Pi Desktop"]
 edition = "2021"
 
+# Phase 1 (T1): this package is the Tauri app shell (windows, menus, dialogs,
+# updater, admin client). The host stack lives in `picot-host` — zero Tauri at
+# the Cargo level, enforced by scripts/check-daemon-no-tauri.js — and
+# `picot-daemon` is the headless host binary. Members share this target dir.
+[workspace]
+members = ["crates/picot-host", "crates/picot-daemon"]
+resolver = "2"
+
 [[bin]]
 name = "picot"
 path = "src/main.rs"
@@ -18,9 +26,7 @@ tauri-build = { version = "2", features = [] }
 p8-delete-legacy = []
 
 [dependencies]
-# Exact pin: reviewed release; any bump requires a dependency-tree audit and
-# a contract test of every PreviewErrorCode mapping (spec 2026-09-17).
-anydoc = "=0.2.4"
+picot-host = { path = "crates/picot-host" }
 tauri = { version = "2", features = ["image-png", "devtools", "macos-private-api", "unstable"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
@@ -36,32 +42,19 @@ reqwest = { version = "0.12", features = ["json"] }
 dirs = "5"
 log = "0.4"
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
-sha2 = "0.10"
-hmac = "0.12"
+async-trait = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSUserDefaults"] }
-futures-util = "0.3"
-tokio-tungstenite = "0.24"
-percent-encoding = "2"
-semver = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
-hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-axum = { version = "0.8", features = ["ws"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "set-header"] }
 base64 = "0.22"
 rand = "0.8"
-subtle = "2"
 tempfile = "3"
-portable-pty = "0.9"
-libc = "0.2"
-notify-rust = "4"
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
+[dev-dependencies]
+# Enables the host crate's `test-seams` items (in-memory Pi bridge) for this
+# package's tests only; production builds of picot-host stay feature-free.
+picot-host = { path = "crates/picot-host", features = ["test-seams"] }
 
 [profile.dev]
 incremental = true

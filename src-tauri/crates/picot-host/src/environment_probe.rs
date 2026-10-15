@@ -25,7 +25,7 @@ pub(crate) enum ToolTier {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ToolId {
+pub enum ToolId {
     Git,
     Python3,
     Npm,
@@ -44,14 +44,14 @@ pub(crate) enum ProbeStatus {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ToolAction {
+pub enum ToolAction {
     Install,
     Update,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Probe {
+pub struct Probe {
     pub(crate) tool_id: ToolId,
     pub(crate) status: ProbeStatus,
     pub(crate) version: Option<String>,
@@ -170,7 +170,7 @@ impl ToolId {
         }
     }
 
-    pub(crate) fn from_str(raw: &str) -> Option<ToolId> {
+    pub fn from_str(raw: &str) -> Option<ToolId> {
         ORDER.into_iter().find(|tool| tool.as_str() == raw)
     }
 }
@@ -182,7 +182,7 @@ pub(crate) enum Outcome {
     SpawnFailed(String),
 }
 
-pub(crate) fn probe_one(tool: ToolId) -> Probe {
+pub fn probe_one(tool: ToolId) -> Probe {
     let spec = spec(tool);
     for (program, args) in spec.candidates {
         match run(program, args) {
@@ -193,7 +193,7 @@ pub(crate) fn probe_one(tool: ToolId) -> Probe {
     base(spec, ProbeStatus::Missing)
 }
 
-pub(crate) fn probe_all() -> Vec<Probe> {
+pub fn probe_all() -> Vec<Probe> {
     ORDER.into_iter().map(probe_one).collect()
 }
 

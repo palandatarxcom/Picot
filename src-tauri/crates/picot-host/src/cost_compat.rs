@@ -13,7 +13,7 @@ use crate::host_data::{parse_session_metrics, SessionMetrics};
 /// an unchanged `(mtime, len)` pair implies an unchanged parse result — range
 /// switches reuse it instead of re-reading hundreds of MB of jsonl.
 #[derive(Default)]
-pub(crate) struct SessionMetricsCache {
+pub struct SessionMetricsCache {
     entries: HashMap<PathBuf, (std::time::SystemTime, u64, SessionMetrics)>,
 }
 
@@ -794,7 +794,7 @@ mod tests {
             "models": [],
         })
         .to_string();
-        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let script = std::path::PathBuf::from(env!("PICOT_SRC_TAURI_DIR"))
             .join("..")
             .join("scripts")
             .join("p4-cost-parity.mjs");

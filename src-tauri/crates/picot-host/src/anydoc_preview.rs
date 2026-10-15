@@ -135,7 +135,7 @@ mod tests {
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = [
-            env!("CARGO_MANIFEST_DIR"),
+            env!("PICOT_SRC_TAURI_DIR"),
             "../extensions/fixtures/anydoc",
             name,
         ]

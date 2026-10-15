@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+// The URL crate the app framework's URL type re-exports; the host crate links
+// it directly instead of through the framework (plan D1).
+use url::Url;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::rngs::OsRng;
@@ -115,7 +118,7 @@ impl OwnerId {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn from_string(value: String) -> Self {
+    pub fn from_string(value: String) -> Self {
         Self(value)
     }
 }
@@ -256,7 +259,7 @@ impl WindowOwnerRegistry {
         Ok(generation)
     }
 
-    pub fn authorize_navigation(&self, owner: &OwnerId, url: &tauri::Url) -> bool {
+    pub fn authorize_navigation(&self, owner: &OwnerId, url: &Url) -> bool {
         // Wry invokes this delegate for every navigation, including iframe
         // subframes, and does not expose the target frame. Sandboxed `srcdoc`
         // iframes (the HTML file preview) navigate to about:srcdoc, whose
@@ -588,11 +591,11 @@ pub fn capability_initialization_script(capability: &str) -> String {
 }
 
 fn normalize_origin(origin: &str) -> Option<String> {
-    let url: tauri::Url = origin.parse().ok()?;
+    let url: Url = origin.parse().ok()?;
     url_origin(&url)
 }
 
-fn url_origin(url: &tauri::Url) -> Option<String> {
+fn url_origin(url: &Url) -> Option<String> {
     if url.scheme() != "http" {
         return None;
     }
@@ -623,7 +626,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn url(s: &str) -> tauri::Url {
+    fn url(s: &str) -> Url {
         s.parse().expect("valid url")
     }
 

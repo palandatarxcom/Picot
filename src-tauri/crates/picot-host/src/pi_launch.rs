@@ -8,7 +8,7 @@ use base64::Engine;
 
 /// `scripts/pi-version.json` baked into the binary at compile time so the
 /// host can expose the locked Pi version without re-running fetch logic.
-const PI_VERSION_JSON: &str = include_str!("../../scripts/pi-version.json");
+const PI_VERSION_JSON: &str = include_str!("../../../../scripts/pi-version.json");
 
 /// Locked Pi version string (e.g. "0.77.0"). Resolved lazily on first call.
 pub fn locked_pi_version() -> &'static str {
@@ -49,7 +49,7 @@ pub fn locked_pi_version() -> &'static str {
 /// that `npm`, `npx`, and friends are always reachable.
 ///
 /// Directories already present in PATH are not duplicated.
-pub(crate) fn build_augmented_path() -> String {
+pub fn build_augmented_path() -> String {
     use std::path::{Path, PathBuf};
 
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
@@ -138,7 +138,7 @@ pub(crate) fn pi_extension_npm_bin_dir(home: &Path) -> PathBuf {
 /// `--extension` from — a `\\?\`-prefixed path. Passing the plain
 /// `C:\Users\...` form avoids the crash. This is a no-op on non-Windows
 /// platforms and for paths without the prefix.
-pub(crate) fn strip_verbatim_prefix(path: &str) -> String {
+pub fn strip_verbatim_prefix(path: &str) -> String {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         // `\\?\UNC\server\share` -> `\\server\share`
         format!(r"\\{}", rest)
@@ -198,7 +198,7 @@ fn mirror_to_space_free_dir(src: &Path) -> std::io::Result<PathBuf> {
 /// user's home directory is used as the parent of `.pi/agent`. The directory
 /// is created before canonicalization so the child always receives a stable,
 /// existing absolute path.
-pub(crate) fn resolve_pi_agent_root() -> Result<PathBuf, String> {
+pub fn resolve_pi_agent_root() -> Result<PathBuf, String> {
     let root = match std::env::var("PI_CODING_AGENT_DIR") {
         Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
         _ => {
@@ -237,7 +237,7 @@ pub(crate) fn resolve_pi_agent_root() -> Result<PathBuf, String> {
 }
 
 /// Build native launch inputs without constructing a port-addressed manager.
-pub(crate) fn native_launch_spec(
+pub fn native_launch_spec(
     static_dir: &Path,
     cwd: &str,
     session_path: Option<&str>,
@@ -341,14 +341,14 @@ pub(crate) fn resolve_picot_bridge_extension_path(static_dir: &Path) -> Result<P
     }
     if cfg!(debug_assertions) {
         candidates.push(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            PathBuf::from(env!("PICOT_SRC_TAURI_DIR"))
                 .join("..")
                 .join("extensions")
                 .join("dist")
                 .join("picot-bridge.mjs"),
         );
         candidates.push(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            PathBuf::from(env!("PICOT_SRC_TAURI_DIR"))
                 .join("..")
                 .join("extensions")
                 .join("picot-bridge.ts"),
@@ -374,7 +374,7 @@ pub(crate) fn resolve_picot_bridge_extension_path(static_dir: &Path) -> Result<P
         })
 }
 
-pub(crate) fn resolve_bundled_pi(static_dir: &Path) -> Result<PathBuf, String> {
+pub fn resolve_bundled_pi(static_dir: &Path) -> Result<PathBuf, String> {
     let bin_name = if cfg!(target_os = "windows") {
         "pi.exe"
     } else {
@@ -401,7 +401,7 @@ pub(crate) fn resolve_bundled_pi(static_dir: &Path) -> Result<PathBuf, String> {
     }
 
     if cfg!(debug_assertions) {
-        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let dev_path = PathBuf::from(env!("PICOT_SRC_TAURI_DIR"))
             .join("resources")
             .join("pi")
             .join(bin_name);
@@ -430,7 +430,7 @@ mod launch_spec_tests {
     use super::*;
 
     fn static_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")
+        PathBuf::from(env!("PICOT_SRC_TAURI_DIR")).join("resources")
     }
 
     fn spec_for(runtime_type: NativeRuntimeType, session_path: Option<&Path>) -> NativeLaunchSpec {

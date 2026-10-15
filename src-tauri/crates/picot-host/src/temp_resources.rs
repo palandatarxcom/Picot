@@ -10,7 +10,7 @@ const QUICK_CHAT_TOKEN_BYTES: usize = 16;
 
 /// Ensure Picot's private temp root exists beneath `home`, is owner-only, and
 /// returns one canonical path for all create/cleanup operations.
-pub(crate) fn ensure_picot_tmp_root_in(home: &Path) -> Result<PathBuf, String> {
+pub fn ensure_picot_tmp_root_in(home: &Path) -> Result<PathBuf, String> {
     let dir = home.join(".pi").join("tmp");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {}", dir.display(), e))?;
     #[cfg(unix)]
@@ -41,7 +41,7 @@ pub(crate) fn ensure_picot_tmp_root() -> Result<PathBuf, String> {
         .clone()
 }
 
-pub(crate) fn canonical_temp_root() -> PathBuf {
+pub fn canonical_temp_root() -> PathBuf {
     ensure_picot_tmp_root().unwrap_or_else(|error| {
         log::warn!("[picot-native] temp root unavailable ({error}); using OS temp dir");
         std::env::temp_dir()
@@ -53,7 +53,7 @@ pub(crate) fn create_quick_chat_temp_dir() -> Result<(PathBuf, String), String> 
     create_quick_chat_temp_dir_in(&canonical_temp_root())
 }
 
-pub(crate) fn create_quick_chat_temp_dir_in(root: &Path) -> Result<(PathBuf, String), String> {
+pub fn create_quick_chat_temp_dir_in(root: &Path) -> Result<(PathBuf, String), String> {
     loop {
         let token = random_hex_token();
         let candidate = root.join(format!("{QUICK_CHAT_TEMP_PREFIX}{token}"));
@@ -77,7 +77,7 @@ pub(crate) fn create_quick_chat_temp_dir_in(root: &Path) -> Result<(PathBuf, Str
 }
 
 /// Delete exactly one owner-private directory after validating every boundary.
-pub(crate) fn cleanup_quick_chat_dir(
+pub fn cleanup_quick_chat_dir(
     canonical_temp_root: &Path,
     exact_path: &Path,
     ownership_token: &str,
