@@ -13,3 +13,17 @@ path = "src/main.rs"
 
 [dependencies]
 picot-host = { path = "../picot-host" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+async-trait = "0.1"
+log = "0.4"
+serde_json = "1"
+
+[dev-dependencies]
+# The standalone suite drives the built binary as a real process: signals, the
+# single-instance lock against a second real daemon, and the manager handshake
+# over a real loopback socket.
+tempfile = "3"
+reqwest = { version = "0.12", features = ["json"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+libc = "0.2"

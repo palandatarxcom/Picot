@@ -75,6 +75,28 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `admin_hello` must carry this role; anything else is malformed.
 const MANAGER_ROLE: &str = "manager";
 
+/// Who holds the manager lease, as the daemon needs to publish it (plan D3:
+/// adoption is a daemon-authorized transaction — the daemon rewrites the
+/// instance file's manager record on grant and clears it when the attachment
+/// dies).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagerIdentity {
+    pub pid: Option<u32>,
+    pub app_version: Option<String>,
+    pub build_id: Option<String>,
+}
+
+/// Notified whenever the manager lease changes (grant, supersede, dead
+/// attachment). Implemented by the daemon's instance-file owner
+/// ([`crate::daemon::instance::InstanceStore`]).
+///
+/// Called **without** any admin lock held, so an implementation may do file
+/// I/O; it must not block (it runs on the connection task).
+pub trait LeaseObserver: Send + Sync {
+    /// `Some` after a grant, `None` when the attachment died or was superseded.
+    fn manager_changed(&self, manager: Option<ManagerIdentity>);
+}
+
 /// Configuration for [`AdminServer::start`]. The token comes from the daemon
 /// (instance file, T4); the timeout is injectable so tests do not wait 5s.
 #[derive(Clone, Debug)]
@@ -205,6 +227,10 @@ struct AdminInner {
     op_delays: Mutex<HashMap<String, Duration>>,
     state: Mutex<Weak<DaemonState>>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    /// Manager-record publisher (T4): `None` until the daemon binary installs
+    /// its instance store, so the embedded form (and every T3 test) needs no
+    /// file at all.
+    lease_observer: Mutex<Option<Arc<dyn LeaseObserver>>>,
 }
 
 impl AdminServer {
@@ -226,6 +252,7 @@ impl AdminServer {
             op_delays: Mutex::new(HashMap::new()),
             state: Mutex::new(Weak::new()),
             shutdown: Mutex::new(None),
+            lease_observer: Mutex::new(None),
         });
         let app = Router::new()
             .route(ADMIN_WS_PATH, get(admin_upgrade))
@@ -264,6 +291,14 @@ impl AdminServer {
     /// other, so one direction is a weak back-reference).
     pub fn attach_state(&self, state: &Arc<DaemonState>) {
         *self.inner.state.lock().expect("admin state lock") = Arc::downgrade(state);
+    }
+
+    /// Install the manager-record publisher (plan D3/T4). Idempotent; the last
+    /// installer wins.
+    pub fn set_lease_observer(&self, observer: Arc<dyn LeaseObserver>) {
+        if let Ok(mut slot) = self.inner.lease_observer.lock() {
+            *slot = Some(observer);
+        }
     }
 
     /// True while a live manager attachment holds the lease.
@@ -448,6 +483,20 @@ impl AdminInner {
         };
         if let Some(frame) = frame {
             self.send(conn_id, WsMessage::Text(frame.into()));
+        }
+    }
+
+    /// Publish a lease change. The observer runs outside every lock, and a
+    /// slow observer cannot deadlock the lease state machine: the guard is
+    /// cloned out first (plan R1 timing rules).
+    fn notify_manager(&self, manager: Option<ManagerIdentity>) {
+        let observer = self
+            .lease_observer
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(observer) = observer {
+            observer.manager_changed(manager);
         }
     }
 
@@ -675,8 +724,16 @@ impl AdminInner {
             .manager
             .clone()
             .ok_or(())?;
+        let welcome = self.snapshot_for(epoch, &attachment);
+        // Plan D3: the daemon — not the app — republishes the instance file's
+        // manager record. No lock is held here (R1).
+        self.notify_manager(Some(ManagerIdentity {
+            pid: attachment.pid,
+            app_version: attachment.app_version.clone(),
+            build_id: attachment.build_id.clone(),
+        }));
         Ok(LeaseGrant {
-            welcome: self.snapshot_for(epoch, &attachment),
+            welcome,
             attachment,
         })
     }
@@ -724,6 +781,9 @@ impl AdminInner {
         if !superseded {
             return;
         }
+        // The attachment is gone: the daemon clears the manager record it
+        // published (plan D3), before the owner cleanup below.
+        self.notify_manager(None);
         let owners = match self.state() {
             Some(state) => {
                 state.owner_registry.set_attachment_epoch(0);

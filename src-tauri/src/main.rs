@@ -9,6 +9,16 @@ mod browser_pane;
 // The app-side half of the dispatcher split (Task 2 Step 2): the real
 // `AppHandle` behind `picot_host::daemon::app_surface::AppSurface`.
 mod tauri_app_surface;
+// The app-side daemon client (Task 4 Step 3): probe/spawn/adopt, the
+// confirmed-exit waiter, and the blocked-instance policy.
+//
+// `allow(dead_code)` is deliberate and temporary: T4 delivers the module, T5
+// wires it into startup and T10 through the admin commands. Until then no path
+// in the app calls it, and this task's milestone contract keeps the app on the
+// embedded daemon, so pretending otherwise would be a larger change than the
+// plan asked for. The attribute goes away with the T5 wiring.
+#[allow(dead_code)]
+mod daemon_client;
 
 use picot_host::{
     child_supervision, environment_install, git_service, officecli_watch, window_owner,

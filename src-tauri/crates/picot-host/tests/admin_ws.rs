@@ -503,6 +503,16 @@ async fn daemon_stop_drains_in_order_and_clears_bookkeeping() {
         other => panic!("expected the admin WS to close, got {other:?}"),
     }
 
+    // Steps 3-5 run *after* the close frame above, so this has to wait for the
+    // drain to finish rather than assert instantaneously: the reply is
+    // deliberately sent before the drain starts ("accepted" ≠ "completed",
+    // plan D12), and asserting immediately races a loaded machine.
+    wait_until(
+        Duration::from_secs(10),
+        || steps.steps().len() >= 5,
+        "the drain to reach its file and exit steps",
+    )
+    .await;
     assert_eq!(
         steps.steps(),
         vec![
@@ -857,6 +867,101 @@ async fn malformed_pre_hello_frames_close_with_4410() {
             );
         }
         other => panic!("expected a 4410 close, got {other:?}"),
+    }
+    fixture.state.shutdown_graceful("test").await;
+}
+
+/// Plan Task 4 Step 1: "concurrent adopt — two clients race hello on a
+/// managerless daemon → exactly one lease, one 4409".
+///
+/// The two hellos are sent *before* either frame is read, so the daemon sees
+/// them interleaved on two connections: the lease must be granted exactly once,
+/// and the loser must not disturb the winner.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_manager_hellos_grant_exactly_one_lease() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let mut first = connect(&fixture.admin_ws_url()).await;
+    let mut second = connect(&fixture.admin_ws_url()).await;
+    let hello = json!({
+        "type": "admin_hello",
+        "adminToken": fixture.token,
+        "role": "manager",
+        "appVersion": "0.5.0",
+        "buildId": "test-build",
+        "pid": 11,
+    });
+    send_json(&mut first, hello.clone()).await;
+    send_json(&mut second, hello).await;
+
+    let mut granted = Vec::new();
+    let mut rejected = 0;
+    for (index, socket) in [&mut first, &mut second].into_iter().enumerate() {
+        match next_frame(socket).await {
+            Frame::Json(value) => {
+                assert_eq!(value["type"], "admin_welcome", "client {index}: {value}");
+                assert_eq!(
+                    value["epoch"].as_u64(),
+                    Some(1),
+                    "exactly one epoch was dolled out"
+                );
+                granted.push(index);
+            }
+            Frame::Closed(code, _reason) => {
+                assert_eq!(code, ADMIN_CLOSE_LEASE_HELD, "client {index}");
+                rejected += 1;
+            }
+        }
+    }
+    assert_eq!(granted.len(), 1, "one lease, not two: {granted:?}");
+    assert_eq!(rejected, 1, "the other client is closed 4409");
+    assert_eq!(fixture.admin.epoch(), 1, "a rejected hello adds no epoch");
+    assert_eq!(
+        fixture.admin.connection_count(),
+        1,
+        "the rejected socket is gone; only the winner is attached"
+    );
+
+    // The winner is undisturbed and still holds the lease.
+    let winner = if granted[0] == 0 {
+        &mut first
+    } else {
+        &mut second
+    };
+    let status = request(winner, "r1", "daemon.status", json!({})).await;
+    assert_eq!(status["ok"], true, "{status}");
+    fixture.state.shutdown_graceful("test").await;
+}
+
+/// Plan Task 4 Step 1's last row: a stop without the lease is refused **by the
+/// daemon**, whatever the caller believes. The manager's own version of this
+/// check (`BlockedByOtherApp` / `StopWithoutLease`) is only the app-side half.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_without_the_lease_is_refused_by_the_daemon() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let (mut socket, _welcome) = fixture.attach().await;
+    assert!(fixture.admin.has_manager(), "the lease is held");
+
+    // Drop the lease while the connection stays open: the strongest form of
+    // "this caller does not hold the lease" a live socket can be in (the
+    // production path is a superseded attachment; `clear_bookkeeping` is the
+    // seam that reaches it without a reconnect).
+    fixture.admin.clear_bookkeeping();
+    assert!(!fixture.admin.manager_lease_held(), "the lease is gone");
+
+    for (id, op) in [
+        ("r1", "daemon.stop"),
+        ("r2", "owner.create"),
+        ("r3", "owner.detach"),
+    ] {
+        let response = request(&mut socket, id, op, owner_args("w-leaseless")).await;
+        assert_eq!(response["ok"], false, "{op} must be refused: {response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("manager lease"),
+            "{op} must say why: {response}"
+        );
     }
     fixture.state.shutdown_graceful("test").await;
 }

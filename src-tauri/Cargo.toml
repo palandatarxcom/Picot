@@ -50,6 +50,11 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 rand = "0.8"
 tempfile = "3"
+# The app-side daemon client (plan Task 4): the admin channel is one loopback
+# WS, and the confirmed-exit waiter signals by pid.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 # Enables the host crate's `test-seams` items (in-memory Pi bridge) for this

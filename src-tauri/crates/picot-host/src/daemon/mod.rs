@@ -10,6 +10,8 @@
 //!
 //! - [`admin`] — the loopback admin WS: manager lease, attachment epochs, the
 //!   navigation mirror and the drain order (Task 3).
+//! - [`instance`] — the instance file, the single-instance lock and the daemon
+//!   log path: atomic, owner-only-at-creation, token-redacted (Task 4).
 //! - [`app_surface`] — the exhaustive `AppHandle`/`try_state` inventory of the
 //!   control dispatcher and the object-safe [`app_surface::AppSurface`] seam
 //!   every row maps onto (Task 2 Step 0).
@@ -24,15 +26,16 @@
 //!
 //! Not landed yet (tracked by the plan, not placeholders):
 //!
-//! - `instance` (Task 4) — the instance file, the lock and the confirmed-exit
-//!   accounting that [`DaemonState::shutdown_graceful`] hands to T4 through
-//!   [`DrainStep::DrainFiles`].
+//! - nothing in [`DrainStep::DrainFiles`]: the daemon's file step now removes
+//!   the instance file and the lock (Task 4, [`DaemonState::set_daemon_files`]).
 
 pub mod admin;
 pub mod app_surface;
+pub mod instance;
 
 use crate::daemon::admin::AdminServer;
 use crate::daemon::app_surface::AppSurface;
+use crate::daemon::instance::DaemonFiles;
 use crate::environment_install;
 use crate::ephemeral_registry::EphemeralRegistry;
 use crate::git_service::GitService;
@@ -50,6 +53,7 @@ use crate::terminal_registry::TerminalRegistry;
 use crate::terminal_state_store::TerminalStateStore;
 use crate::window_owner::{OwnerId, WindowOwnerRegistry};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -155,8 +159,22 @@ pub struct DaemonState {
     /// no admin channel exists yet, which is why it is not a constructor
     /// argument: the admin server and the state reference each other.
     admin: Mutex<Option<AdminServer>>,
+    /// The daemon's persisted bookkeeping: the instance file it publishes and
+    /// the single-instance lock it holds (plan D7/T4). `None` in the app's
+    /// embedded form — that process owns no instance file, and
+    /// [`Self::drain_persisted_state`] then has nothing to remove.
+    daemon_files: Mutex<Option<DaemonFiles>>,
+    /// Set when [`Self::drain`] completed, so the daemon binary's main loop can
+    /// exit on the `daemon.stop` path exactly as it does on a signal (T4).
+    drained: AtomicBool,
+    /// Paired with `drained` (`notify_one` keeps a permit, so a signal racing
+    /// the wait cannot be lost).
+    drained_notify: tokio::sync::Notify,
     /// Drain-step observer (test seam; see [`DrainObserver`]).
     drain_observer: Mutex<Option<Arc<dyn DrainObserver>>>,
+    /// Guards the drain itself: a signal arriving while `daemon.stop` drains
+    /// must not tear the runtimes down twice.
+    draining: AtomicBool,
 }
 
 impl DaemonState {
@@ -298,7 +316,11 @@ impl DaemonState {
             officecli_watches,
             app_surface,
             admin: Mutex::new(None),
+            daemon_files: Mutex::new(None),
+            drained: AtomicBool::new(false),
+            drained_notify: tokio::sync::Notify::new(),
             drain_observer: Mutex::new(None),
+            draining: AtomicBool::new(false),
         })
     }
 
@@ -322,6 +344,34 @@ impl DaemonState {
     /// The attached admin channel, when one exists.
     pub fn admin(&self) -> Option<AdminServer> {
         self.admin.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Install the daemon's persisted bookkeeping (plan D7/T4).
+    ///
+    /// Called only by the daemon binary: the app's embedded form has no
+    /// instance file to publish and no single-instance lock to take. The store
+    /// is also handed to the admin channel as its `LeaseObserver`, so the
+    /// manager record is rewritten by the daemon alone (plan D3).
+    pub fn set_daemon_files(&self, files: DaemonFiles) {
+        let store = files.store.clone();
+        if let Ok(mut slot) = self.daemon_files.lock() {
+            *slot = Some(files);
+        }
+        if let Some(admin) = self.admin() {
+            admin.set_lease_observer(Arc::new(store));
+        }
+    }
+
+    /// Resolves once the drain completed (a signal or a `daemon.stop`).
+    ///
+    /// The daemon binary's main loop awaits this so both shutdown triggers
+    /// leave through one exit path; `DAEMON_STOP` is "accepted" first and the
+    /// process is confirmed gone by identity, never by this returning (D12).
+    pub async fn drained(&self) {
+        if self.drained.load(Ordering::SeqCst) {
+            return;
+        }
+        self.drained_notify.notified().await;
     }
 
     /// Install a drain-step observer. Test seam: the production path uses the
@@ -409,12 +459,26 @@ impl DaemonState {
         crate::child_supervision::clear_registry();
     }
 
-    /// Drain step "files": the daemon's persisted bookkeeping.
+    /// Drain step "files": the daemon's persisted bookkeeping — the instance
+    /// file and the single-instance lock (plan D7/T4).
     ///
-    /// T4 plugs the instance file + single-instance lock removal in here; the
-    /// host stack itself owns no file to remove yet, so this is deliberately a
-    /// no-op rather than a placeholder that pretends to remove something.
-    pub fn drain_persisted_state(&self) {}
+    /// This is the single plug point the drain order reserves for files, so
+    /// both shutdown triggers (a signal and `daemon.stop`) leave the same clean
+    /// directory. It runs **after** the runtimes are down and the admin channel
+    /// is closed: unlinking the lock file while this process still holds its
+    /// descriptor is therefore the last thing before exit, which is what keeps
+    /// the unlink race in [`instance::InstanceLock`] narrow.
+    pub fn drain_persisted_state(&self) {
+        let slot = self
+            .daemon_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(files) = slot.as_ref() else {
+            return;
+        };
+        files.store.clear();
+        files.lock.remove_file();
+    }
 
     /// Hand the data plane its control handler.
     ///
@@ -455,6 +519,12 @@ impl DaemonState {
     /// property (an admin frame must not arrive while runtimes are being torn
     /// down) and a second copy would drift from it.
     pub async fn drain(&self) {
+        if self.draining.swap(true, Ordering::SeqCst) {
+            // A second trigger (a signal during `daemon.stop`, or the reverse)
+            // must not stop the runtimes twice; the first drain is the shutdown.
+            log::info!("[picot-daemon] drain already in progress; ignoring the repeat trigger");
+            return;
+        }
         self.observe_drain(DrainStep::StopAcceptingAdminFrames);
         if let Some(admin) = self.admin() {
             admin.stop_accepting();
@@ -472,5 +542,7 @@ impl DaemonState {
             admin.clear_bookkeeping();
         }
         self.host.stop();
+        self.drained.store(true, Ordering::SeqCst);
+        self.drained_notify.notify_one();
     }
 }
