@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 // The URL crate the app framework's URL type re-exports; the host crate links
@@ -17,6 +17,7 @@ use rand::RngCore;
 
 const CAPABILITY_LEN: usize = 32;
 const OWNER_ID_LEN: usize = 16;
+const PERMIT_ID_LEN: usize = 8;
 
 /// Opaque per-window owner identity. Distinct from the bearer capability.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -62,6 +63,66 @@ impl OwnerWorkspaceSnapshot {
     }
 }
 
+/// One navigation-mirror event, emitted by the registry when the daemon's
+/// navigation authority changes state (plan Task 3, R1 server side).
+///
+/// Serialized shape is pinned to the protocol tables: `navigation_permit`,
+/// `permit_revoked`, `owner_binding_changed` — each carrying the granting
+/// attachment `epoch` so the app can drop stale-epoch events (D11).
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OwnerMirrorEvent {
+    /// A permit the app's synchronous navigation delegate must install before
+    /// the WebView can load `origin`. The granting op waits for `mirror_ack`.
+    NavigationPermit {
+        epoch: u64,
+        #[serde(rename = "permitId")]
+        permit_id: String,
+        owner: String,
+        origin: String,
+        #[serde(rename = "expiresAtMs")]
+        expires_at_ms: u64,
+        generation: u64,
+    },
+    /// A permit that will never be usable (cancel, revoke, ack timeout): the
+    /// app removes it from its mirror immediately.
+    PermitRevoked {
+        epoch: u64,
+        #[serde(rename = "permitId")]
+        permit_id: String,
+    },
+    /// An owner's workspace binding/generation changed (transition commit).
+    OwnerBindingChanged {
+        epoch: u64,
+        owner: String,
+        #[serde(rename = "hasWorkspace")]
+        has_workspace: bool,
+        generation: u64,
+    },
+}
+
+/// Receives [`OwnerMirrorEvent`]s. Mirrors [`crate::host_control::HostEventSink`]:
+/// the registry pushes, the admin channel forwards. Always invoked *after* the
+/// registry lock is released, so an implementation may call back into the
+/// registry without deadlocking.
+pub type OwnerMirrorSink = Arc<dyn Fn(OwnerMirrorEvent) + Send + Sync>;
+
+/// One owner row of the attach snapshot (`admin_welcome.mirror.owners`).
+#[derive(Clone, Debug, Serialize)]
+pub struct OwnerMirrorEntry {
+    pub owner: String,
+    pub label: String,
+    #[serde(rename = "currentOrigin")]
+    pub current_origin: String,
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<String>,
+    /// Route path of the owner's current origin (e.g.
+    /// `/workspaces/<wid>/sessions/<sid>`); `None` for the bare origin root.
+    #[serde(rename = "sessionRoute")]
+    pub session_route: Option<String>,
+    pub generation: u64,
+}
+
 /// Shared registry of window owners, their capabilities, and navigation permits.
 #[derive(Clone, Default)]
 pub struct WindowOwnerRegistry {
@@ -75,6 +136,12 @@ struct RegistryState {
     // revoke, so authentication stays constant-time over the owner count.
     capability_index: HashMap<[u8; CAPABILITY_LEN], OwnerId>,
     next_generation: u64,
+    /// Attachment epoch new owners are stamped with (plan D3/D11). The daemon
+    /// sets it when it grants the manager lease; owners created by that
+    /// attachment carry it, so a dead attachment can be revoked as a set.
+    attachment_epoch: u64,
+    /// Owner-mirror event sink, when a manager is attached.
+    mirror_sink: Option<OwnerMirrorSink>,
 }
 
 struct OwnerRecord {
@@ -88,9 +155,16 @@ struct OwnerRecord {
     workspace_id: Option<WorkspaceId>,
     temporary_kind: TemporaryKind,
     workspace_generation: u64,
+    /// The attachment epoch that created this owner (plan D11): the unit the
+    /// daemon revokes when the app attachment dies.
+    attachment_epoch: u64,
+    /// Route path of `current_origin`, when it is not the bare origin root.
+    session_route: Option<String>,
 }
 
 struct PendingNavigation {
+    /// Mirror permit id handed to the app (`navigation_permit.permitId`).
+    permit_id: String,
     origin: String,
     target_session_id: Option<String>,
     #[allow(dead_code)]
@@ -163,6 +237,7 @@ impl WindowOwnerRegistry {
             return Err("window label is already owned".to_string());
         }
 
+        let attachment_epoch = state.attachment_epoch;
         let mut capability_bytes = [0u8; CAPABILITY_LEN];
         OsRng.fill_bytes(&mut capability_bytes);
         let mut id_bytes = [0u8; OWNER_ID_LEN];
@@ -186,6 +261,8 @@ impl WindowOwnerRegistry {
                 workspace_id,
                 temporary_kind,
                 workspace_generation: 0,
+                attachment_epoch,
+                session_route: None,
             },
         );
         Ok((owner_id, capability))
@@ -213,6 +290,21 @@ impl WindowOwnerRegistry {
         origin: String,
         ttl: Duration,
     ) -> Result<u64, String> {
+        self.prepare_navigation_with_permit(owner, port, canonical_cwd, origin, ttl)
+            .map(|(generation, _permit_id)| generation)
+    }
+
+    /// Same as [`Self::prepare_navigation`], but also returns the mirror permit
+    /// id the naviation-mirror event carries, so the caller can await the app's
+    /// `mirror_ack` for exactly this permit (plan Task 3, R1).
+    pub fn prepare_navigation_with_permit(
+        &self,
+        owner: &OwnerId,
+        port: u16,
+        canonical_cwd: PathBuf,
+        origin: String,
+        ttl: Duration,
+    ) -> Result<(u64, String), String> {
         let target_session_id = origin
             .split_once("/sessions/")
             .and_then(|(_, session_id)| session_id.trim_end_matches('/').split('/').next())
@@ -242,21 +334,41 @@ impl WindowOwnerRegistry {
                 state.next_generation += 1;
                 state.next_generation
             };
+        let permit_id = random_id(PERMIT_ID_LEN);
+        let epoch = state.attachment_epoch;
+        let expires_at = Instant::now() + ttl;
+        let expires_at_ms = now_ms() + ttl.as_millis() as u64;
+        let permit_origin = origin.clone();
         let record = state
             .owners
             .get_mut(owner)
             .ok_or_else(|| "unknown owner".to_string())?;
         record.pending = Some(PendingNavigation {
+            permit_id: permit_id.clone(),
             origin,
             target_session_id,
             target_port: port,
             target_cwd: canonical_cwd,
             transition_generation: generation,
-            expires_at: Instant::now() + ttl,
+            expires_at,
             consumed: false,
             created_instance: None,
         });
-        Ok(generation)
+        let sink = state.mirror_sink.clone();
+        // Emitted after the lock is released: the sink forwards over the admin
+        // channel and must never run under the registry mutex.
+        drop(state);
+        if let Some(sink) = sink {
+            sink(OwnerMirrorEvent::NavigationPermit {
+                epoch,
+                permit_id: permit_id.clone(),
+                owner: owner.as_str().to_string(),
+                origin: permit_origin,
+                expires_at_ms,
+                generation,
+            });
+        }
+        Ok((generation, permit_id))
     }
 
     pub fn authorize_navigation(&self, owner: &OwnerId, url: &Url) -> bool {
@@ -349,7 +461,9 @@ impl WindowOwnerRegistry {
     ) -> Result<(), String> {
         let target = normalize_origin(&target_origin)
             .ok_or_else(|| "commit origin must be an http loopback host origin".to_string())?;
+        let target_origin_for_route = Some(target_origin.clone());
         let mut state = self.inner.lock().expect("owner registry lock poisoned");
+        let epoch = state.attachment_epoch;
         let record = state
             .owners
             .get_mut(owner)
@@ -382,8 +496,20 @@ impl WindowOwnerRegistry {
         record.temporary_kind = temporary_kind;
         record.current_origin = target;
         record.workspace_generation = transition_generation;
+        record.session_route = session_route_for(target_origin_for_route.as_deref());
         record.pending = None;
         record.transition = None;
+        let event = OwnerMirrorEvent::OwnerBindingChanged {
+            epoch,
+            owner: owner.as_str().to_string(),
+            has_workspace: record.workspace_id.is_some(),
+            generation: transition_generation,
+        };
+        let sink = state.mirror_sink.clone();
+        drop(state);
+        if let Some(sink) = sink {
+            sink(event);
+        }
         Ok(())
     }
 
@@ -560,15 +686,142 @@ impl WindowOwnerRegistry {
         {
             return Err("transition generation mismatch".to_string());
         }
+        let revoked_permit_id = record.pending.as_ref().map(|p| p.permit_id.clone());
         record.pending = None;
         record.transition = None;
+        let epoch = state.attachment_epoch;
+        let sink = state.mirror_sink.clone();
+        drop(state);
+        if let Some(sink) = sink {
+            if let Some(permit_id) = revoked_permit_id {
+                sink(OwnerMirrorEvent::PermitRevoked { epoch, permit_id });
+            }
+        }
         Ok(())
+    }
+
+    /// Drop an unconsumed pending permit without touching the transition, and
+    /// tell the mirror to revoke it. Used as the fail-safe when a granting op
+    /// never got its `mirror_ack` (plan Task 3, R1): the WebView delegate must
+    /// never keep a permit the app did not install.
+    pub fn cancel_pending_permit(&self, owner: &OwnerId) -> Option<String> {
+        let mut state = self.inner.lock().expect("owner registry lock poisoned");
+        let record = state.owners.get_mut(owner)?;
+        let permit_id = record.pending.take()?.permit_id;
+        let epoch = state.attachment_epoch;
+        let sink = state.mirror_sink.clone();
+        drop(state);
+        if let Some(sink) = sink {
+            sink(OwnerMirrorEvent::PermitRevoked {
+                epoch,
+                permit_id: permit_id.clone(),
+            });
+        }
+        Some(permit_id)
+    }
+
+    /// The unconsumed pending permit's mirror id, when one is prepared.
+    pub fn pending_permit_id(&self, owner: &OwnerId) -> Option<String> {
+        let state = self.inner.lock().expect("owner registry lock poisoned");
+        state
+            .owners
+            .get(owner)
+            .and_then(|record| record.pending.as_ref())
+            .filter(|pending| !pending.consumed)
+            .map(|pending| pending.permit_id.clone())
+    }
+
+    /// Install the owner-mirror event sink (set by the daemon once an admin
+    /// channel exists; plan Task 3 Step 2).
+    pub fn set_mirror_sink(&self, sink: OwnerMirrorSink) {
+        let mut state = self.inner.lock().expect("owner registry lock poisoned");
+        state.mirror_sink = Some(sink);
+    }
+
+    /// The attachment epoch new owners are stamped with.
+    pub fn attachment_epoch(&self) -> u64 {
+        let state = self.inner.lock().expect("owner registry lock poisoned");
+        state.attachment_epoch
+    }
+
+    /// Stamp subsequent owners with `epoch`. Called when the manager lease is
+    /// granted (plan D3/D11); owners already created keep their own epoch.
+    pub fn set_attachment_epoch(&self, epoch: u64) {
+        let mut state = self.inner.lock().expect("owner registry lock poisoned");
+        state.attachment_epoch = epoch;
+    }
+
+    /// Revoke every owner created by `epoch` — capabilities included — and
+    /// return them so the caller can run the per-owner detach cleanup. Labels
+    /// are freed with the records, so a later attachment can recreate them
+    /// (plan D11). Pending permits of the revoked owners are reported to the
+    /// mirror as `permit_revoked`.
+    pub fn revoke_attachment(&self, epoch: u64) -> Vec<OwnerId> {
+        let mut state = self.inner.lock().expect("owner registry lock poisoned");
+        let revoked: Vec<OwnerId> = state
+            .owners
+            .iter()
+            .filter(|(_, record)| record.attachment_epoch == epoch)
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        let mut events = Vec::new();
+        for owner in &revoked {
+            if let Some(record) = state.owners.remove(owner) {
+                state.capability_index.remove(&record.capability_bytes);
+                if let Some(pending) = record.pending {
+                    events.push(OwnerMirrorEvent::PermitRevoked {
+                        epoch,
+                        permit_id: pending.permit_id,
+                    });
+                }
+            }
+        }
+        let sink = state.mirror_sink.clone();
+        drop(state);
+        if let Some(sink) = sink {
+            for event in events {
+                sink(event);
+            }
+        }
+        revoked
+    }
+
+    /// The full attach snapshot (`admin_welcome.mirror`): one row per live
+    /// owner, taken under a single lock so the app sees a coherent picture.
+    pub fn mirror_snapshot(&self) -> Vec<OwnerMirrorEntry> {
+        let state = self.inner.lock().expect("owner registry lock poisoned");
+        state
+            .owners
+            .iter()
+            .map(|(owner, record)| OwnerMirrorEntry {
+                owner: owner.as_str().to_string(),
+                label: record.window_label.clone(),
+                current_origin: record.current_origin.clone(),
+                workspace_id: record.workspace_id.clone(),
+                session_route: record.session_route.clone(),
+                generation: record.workspace_generation,
+            })
+            .collect()
     }
 
     pub fn revoke_owner(&self, owner: &OwnerId) {
         let mut state = self.inner.lock().expect("owner registry lock poisoned");
+        let mut events = Vec::new();
         if let Some(record) = state.owners.remove(owner) {
             state.capability_index.remove(&record.capability_bytes);
+            if let Some(pending) = record.pending {
+                events.push(OwnerMirrorEvent::PermitRevoked {
+                    epoch: record.attachment_epoch,
+                    permit_id: pending.permit_id,
+                });
+            }
+        }
+        let sink = state.mirror_sink.clone();
+        drop(state);
+        if let Some(sink) = sink {
+            for event in events {
+                sink(event);
+            }
         }
     }
 }
@@ -620,6 +873,34 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// Random hex id for mirror permits (plan Task 3 protocol table).
+fn random_id(len: usize) -> String {
+    let mut bytes = vec![0u8; len];
+    OsRng.fill_bytes(&mut bytes);
+    hex_encode(&bytes)
+}
+
+/// Wall-clock milliseconds since the Unix epoch; the mirror's `expiresAtMs`
+/// unit (the app only compares it against its own clock).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Owner-record route path for the mirror snapshot: the path component of the
+/// raw navigation origin, or `None` when it is the bare origin root.
+fn session_route_for(origin: Option<&str>) -> Option<String> {
+    let url: Url = origin?.parse().ok()?;
+    let path = url.path().to_string();
+    if path.is_empty() || path == "/" {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 #[cfg(test)]

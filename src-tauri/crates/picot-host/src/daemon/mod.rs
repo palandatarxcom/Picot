@@ -8,6 +8,8 @@
 //!
 //! Landed so far:
 //!
+//! - [`admin`] — the loopback admin WS: manager lease, attachment epochs, the
+//!   navigation mirror and the drain order (Task 3).
 //! - [`app_surface`] — the exhaustive `AppHandle`/`try_state` inventory of the
 //!   control dispatcher and the object-safe [`app_surface::AppSurface`] seam
 //!   every row maps onto (Task 2 Step 0).
@@ -22,11 +24,14 @@
 //!
 //! Not landed yet (tracked by the plan, not placeholders):
 //!
-//! - `admin` (Task 3) and `instance` (Task 4) — the instance file, the lock and
-//!   the confirmed-exit accounting that `shutdown_graceful` hands to T4.
+//! - `instance` (Task 4) — the instance file, the lock and the confirmed-exit
+//!   accounting that [`DaemonState::shutdown_graceful`] hands to T4 through
+//!   [`DrainStep::DrainFiles`].
 
+pub mod admin;
 pub mod app_surface;
 
+use crate::daemon::admin::AdminServer;
 use crate::daemon::app_surface::AppSurface;
 use crate::environment_install;
 use crate::ephemeral_registry::EphemeralRegistry;
@@ -43,9 +48,30 @@ use crate::skill_source_registry::SkillSourceRegistry;
 use crate::terminal_manager::TerminalManager;
 use crate::terminal_registry::TerminalRegistry;
 use crate::terminal_state_store::TerminalStateStore;
-use crate::window_owner::WindowOwnerRegistry;
+use crate::window_owner::{OwnerId, WindowOwnerRegistry};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// One step of the drain sequence, reported to a [`DrainObserver`].
+///
+/// The order is fixed by plan Task 3: stop accepting admin frames → close the
+/// admin WS → drain runtimes → files → exit. `DrainFiles` is where T4 removes
+/// the instance file and lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainStep {
+    StopAcceptingAdminFrames,
+    CloseAdminWs,
+    DrainRuntimes,
+    DrainFiles,
+    Exit,
+}
+
+/// Observes drain steps so the sequence is assertable (fakes in tests) without
+/// weakening the production path. Test seam, not a plugin point.
+pub trait DrainObserver: Send + Sync {
+    fn step(&self, step: DrainStep);
+}
 
 /// The app package no longer holds the per-process skill-install secret: its
 /// only readers were dispatcher rows D2, which now read this field.
@@ -124,6 +150,13 @@ pub struct DaemonState {
     /// The app-process surface (rows A2–A12). A headless daemon supplies the
     /// admin-channel forwarding realization (T3/T5).
     pub app_surface: Arc<dyn AppSurface>,
+    /// The admin channel, once [`Self::install_admin`] ran (T4 starts it in the
+    /// daemon binary; embedded mode starts it in the app process). `None` means
+    /// no admin channel exists yet, which is why it is not a constructor
+    /// argument: the admin server and the state reference each other.
+    admin: Mutex<Option<AdminServer>>,
+    /// Drain-step observer (test seam; see [`DrainObserver`]).
+    drain_observer: Mutex<Option<Arc<dyn DrainObserver>>>,
 }
 
 impl DaemonState {
@@ -264,8 +297,124 @@ impl DaemonState {
             terminals,
             officecli_watches,
             app_surface,
+            admin: Mutex::new(None),
+            drain_observer: Mutex::new(None),
         })
     }
+
+    /// Attach the admin channel: set the daemon back-reference, feed the owner
+    /// registry's mirror events into it, and remember it for the drain order.
+    ///
+    /// Mirrors [`Self::install_control_handler`]: the admin server holds a weak
+    /// back-reference to this state and this state holds the server, so neither
+    /// needs the other at construction time.
+    pub fn install_admin(self: &Arc<Self>, admin: AdminServer) {
+        admin.attach_state(self);
+        let mirror = admin.clone();
+        self.owner_registry.set_mirror_sink(Arc::new(move |event| {
+            mirror.push_owner_event(event);
+        }));
+        if let Ok(mut slot) = self.admin.lock() {
+            *slot = Some(admin);
+        }
+    }
+
+    /// The attached admin channel, when one exists.
+    pub fn admin(&self) -> Option<AdminServer> {
+        self.admin.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Install a drain-step observer. Test seam: the production path uses the
+    /// same sequence with no observer installed.
+    pub fn set_drain_observer(&self, observer: Arc<dyn DrainObserver>) {
+        if let Ok(mut slot) = self.drain_observer.lock() {
+            *slot = Some(observer);
+        }
+    }
+
+    /// Report one drain step (no-op without an observer).
+    pub fn observe_drain(&self, step: DrainStep) {
+        let observer = self
+            .drain_observer
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(observer) = observer {
+            observer.step(step);
+        }
+    }
+
+    /// Prepare a navigation permit **and** wait for the app's `mirror_ack`
+    /// before the granting op completes (plan Task 3, R1).
+    ///
+    /// Fails safe: when no manager is attached, or the ack does not arrive
+    /// within [`admin::MIRROR_ACK_TIMEOUT`], the permit is revoked so the
+    /// WebView's synchronous navigation delegate can never hit a permit the
+    /// app's mirror has not installed.
+    pub async fn prepare_navigation_with_mirror_ack(
+        &self,
+        owner: &OwnerId,
+        port: u16,
+        canonical_cwd: PathBuf,
+        origin: String,
+        ttl: Duration,
+    ) -> Result<u64, String> {
+        let (generation, permit_id) = self.owner_registry.prepare_navigation_with_permit(
+            owner,
+            port,
+            canonical_cwd,
+            origin,
+            ttl,
+        )?;
+        let Some(admin) = self.admin() else {
+            self.owner_registry.cancel_pending_permit(owner);
+            return Err(
+                "no admin channel is attached: the navigation mirror cannot be updated".into(),
+            );
+        };
+        match admin.await_mirror_ack(&permit_id).await {
+            Ok(_epoch) => Ok(generation),
+            Err(error) => {
+                self.owner_registry.cancel_pending_permit(owner);
+                Err(format!(
+                    "the navigation mirror did not acknowledge permit {permit_id}: {error}"
+                ))
+            }
+        }
+    }
+
+    /// Owner-scoped detach cleanup (plan D6/D11): capabilities are already
+    /// revoked by the registry, and **no resident workspace runtime is
+    /// stopped** — only owner-scoped process/state is released.
+    ///
+    /// T7 completes this path: temp-dir cleanup, close-approval drops and the
+    /// ephemeral *process* stop (R5) arrive with `detach_owner`; the app-side
+    /// approval map is unreachable from here by design (D4).
+    pub fn detach_owner_scoped_cleanup(&self, owner: &OwnerId) {
+        let _ = self.ephemeral_registry.owner_cleanup(owner);
+        self.terminals.kill_owner(owner);
+        self.git.clear_owner(owner.as_str());
+        self.skill_sources.revoke_owner(owner);
+    }
+
+    /// Drain step "runtimes": stop what this process owns, in the order the
+    /// app's `RunEvent::Exit` uses today.
+    pub async fn drain_runtimes(&self) {
+        if let Ok(installer) = self.environment_installer.as_ref() {
+            installer.stop_for_app_exit();
+        }
+        self.runtimes.stop_for_app_exit();
+        self.terminals.kill_all();
+        self.officecli_watches.stop_all();
+        crate::child_supervision::clear_registry();
+    }
+
+    /// Drain step "files": the daemon's persisted bookkeeping.
+    ///
+    /// T4 plugs the instance file + single-instance lock removal in here; the
+    /// host stack itself owns no file to remove yet, so this is deliberately a
+    /// no-op rather than a placeholder that pretends to remove something.
+    pub fn drain_persisted_state(&self) {}
 
     /// Hand the data plane its control handler.
     ///
@@ -286,22 +435,42 @@ impl DaemonState {
         &self.host_origin
     }
 
-    /// Stop everything the process owns, in the order the app's `RunEvent::Exit`
-    /// uses: installer, runtimes, terminals, officecli watches, the child
-    /// supervision registry, then the host listener itself.
+    /// Stop everything the process owns, in the drain order the plan fixes:
+    /// stop accepting admin frames → close the admin WS → drain runtimes →
+    /// files → exit.
     ///
     /// T4 extends this with the instance file + lock. "Accepted" is not
     /// "completed" (plan D12): signalling the listener is a request; callers
     /// that need the process gone confirm by identity, not by this returning.
-    pub async fn shutdown_graceful(self, reason: &str) {
+    pub async fn shutdown_graceful(&self, reason: &str) {
         log::info!("[picot-daemon] graceful shutdown: {reason}");
-        if let Ok(installer) = self.environment_installer.as_ref() {
-            installer.stop_for_app_exit();
+        self.drain().await;
+    }
+
+    /// The one drain sequence, shared by the signal/exit path
+    /// ([`Self::shutdown_graceful`]) and the `daemon.stop` op: stop accepting
+    /// admin frames → close the admin WS → drain runtimes → files → exit.
+    ///
+    /// Deliberately one implementation, not two: the order is a correctness
+    /// property (an admin frame must not arrive while runtimes are being torn
+    /// down) and a second copy would drift from it.
+    pub async fn drain(&self) {
+        self.observe_drain(DrainStep::StopAcceptingAdminFrames);
+        if let Some(admin) = self.admin() {
+            admin.stop_accepting();
         }
-        self.runtimes.stop_for_app_exit();
-        self.terminals.kill_all();
-        self.officecli_watches.stop_all();
-        crate::child_supervision::clear_registry();
+        self.observe_drain(DrainStep::CloseAdminWs);
+        if let Some(admin) = self.admin() {
+            admin.close_connections();
+        }
+        self.observe_drain(DrainStep::DrainRuntimes);
+        self.drain_runtimes().await;
+        self.observe_drain(DrainStep::DrainFiles);
+        self.drain_persisted_state();
+        self.observe_drain(DrainStep::Exit);
+        if let Some(admin) = self.admin() {
+            admin.clear_bookkeeping();
+        }
         self.host.stop();
     }
 }
