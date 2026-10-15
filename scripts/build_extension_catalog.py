@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import sys
+import subprocess
 import time
 from datetime import UTC, datetime
 from http.client import HTTPException
@@ -62,7 +63,24 @@ def fetch_json(url: str) -> Any:
                 return json.load(response)
         except (HTTPError, HTTPException, URLError, TimeoutError, json.JSONDecodeError) as error:
             if delay is None:
-                raise RuntimeError(f"request failed for {url}: {error}") from error
+                # Cloudflare truncates/challenges responses from some Python
+                # TLS fingerprints (urllib gets IncompleteRead where curl
+                # succeeds), so fall back to curl before giving up.
+                try:
+                    # pi-lens-ignore: S603,S607
+                    out = subprocess.run(
+                        ["curl", "--silent", "--show-error", "--fail", "--max-time", "120",
+                         "--retry", "3", "--retry-all-errors",
+                         "--header", "Accept: application/json",
+                         "--header", f"User-Agent: {USER_AGENT}",
+                         url],
+                        check=True, capture_output=True, text=True, timeout=180,
+                    ).stdout
+                    return json.loads(out)
+                except (subprocess.SubprocessError, json.JSONDecodeError) as curl_error:
+                    raise RuntimeError(
+                        f"request failed for {url}: {error}; curl fallback: {curl_error}"
+                    ) from curl_error
             print(
                 f"request attempt {attempt} failed; retrying in {delay}s: {error}",
                 file=sys.stderr,
