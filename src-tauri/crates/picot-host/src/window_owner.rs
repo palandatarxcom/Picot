@@ -91,12 +91,28 @@ pub enum OwnerMirrorEvent {
         #[serde(rename = "permitId")]
         permit_id: String,
     },
-    /// An owner's workspace binding/generation changed (transition commit).
+    /// An owner record appeared or changed: its full mirror row plus the
+    /// attachment `epoch`.
+    ///
+    /// Emitted on **owner creation** and on **transition commit**, because the
+    /// app's navigation mirror is the delegate's authority (plan D4/Task 5): a
+    /// workspace owner is minted daemon-side by the `open_workspace` dispatcher,
+    /// so without this event the app would know nothing about the new window's
+    /// origin and would deny its first load. The row therefore carries the
+    /// daemon-normalized `currentOrigin`, the label (the app's label↔owner map)
+    /// and the route, exactly like an `admin_welcome` snapshot row.
     OwnerBindingChanged {
         epoch: u64,
         owner: String,
+        label: String,
         #[serde(rename = "hasWorkspace")]
         has_workspace: bool,
+        #[serde(rename = "currentOrigin")]
+        current_origin: String,
+        #[serde(rename = "workspaceId")]
+        workspace_id: Option<String>,
+        #[serde(rename = "sessionRoute")]
+        session_route: Option<String>,
         generation: u64,
     },
 }
@@ -245,6 +261,10 @@ impl WindowOwnerRegistry {
 
         let owner_id = OwnerId(hex_encode(&id_bytes));
         let capability = URL_SAFE_NO_PAD.encode(capability_bytes);
+        // The mirror row's values, captured before they move into the record.
+        let mirror_label = window_label.clone();
+        let mirror_origin = origin.clone();
+        let mirror_workspace_id = workspace_id.clone();
         state
             .capability_index
             .insert(capability_bytes, owner_id.clone());
@@ -265,6 +285,26 @@ impl WindowOwnerRegistry {
                 session_route: None,
             },
         );
+        // Publish the new owner's mirror row (plan Task 5). The app's navigation
+        // delegate reads its own mirror, and a workspace owner is minted here
+        // (by the `open_workspace` dispatcher), not by the app: without this
+        // event the new window's first load would be denied fail-closed. Emitted
+        // after the lock is released, like every other mirror event.
+        let event = OwnerMirrorEvent::OwnerBindingChanged {
+            epoch: attachment_epoch,
+            owner: owner_id.as_str().to_string(),
+            label: mirror_label,
+            has_workspace: mirror_workspace_id.is_some(),
+            current_origin: mirror_origin,
+            workspace_id: mirror_workspace_id,
+            session_route: None,
+            generation: 0,
+        };
+        let sink = state.mirror_sink.clone();
+        drop(state);
+        if let Some(sink) = sink {
+            sink(event);
+        }
         Ok((owner_id, capability))
     }
 
@@ -502,7 +542,11 @@ impl WindowOwnerRegistry {
         let event = OwnerMirrorEvent::OwnerBindingChanged {
             epoch,
             owner: owner.as_str().to_string(),
+            label: record.window_label.clone(),
             has_workspace: record.workspace_id.is_some(),
+            current_origin: record.current_origin.clone(),
+            workspace_id: record.workspace_id.clone(),
+            session_route: record.session_route.clone(),
             generation: transition_generation,
         };
         let sink = state.mirror_sink.clone();
@@ -802,6 +846,24 @@ impl WindowOwnerRegistry {
                 generation: record.workspace_generation,
             })
             .collect()
+    }
+
+    /// One owner's mirror row, or `None` for an unknown owner.
+    ///
+    /// The `owner.create` op returns this row (Task 5): owners created *after*
+    /// the attach snapshot are the app's only source for their committed
+    /// origin, and the reply must carry the daemon-normalized values rather
+    /// than the arguments the app sent.
+    pub fn owner_mirror_row(&self, owner: &OwnerId) -> Option<OwnerMirrorEntry> {
+        let state = self.inner.lock().expect("owner registry lock poisoned");
+        state.owners.get(owner).map(|record| OwnerMirrorEntry {
+            owner: owner.as_str().to_string(),
+            label: record.window_label.clone(),
+            current_origin: record.current_origin.clone(),
+            workspace_id: record.workspace_id.clone(),
+            session_route: record.session_route.clone(),
+            generation: record.workspace_generation,
+        })
     }
 
     pub fn revoke_owner(&self, owner: &OwnerId) {

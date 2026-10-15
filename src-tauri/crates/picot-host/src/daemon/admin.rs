@@ -1075,9 +1075,22 @@ async fn run_op_inner(
                 workspace_id,
                 TemporaryKind::DefaultStartup,
             )?;
+            // The sealed owner row travels with the reply (Task 5): the app's
+            // navigation mirror is fed by the `admin_welcome` snapshot plus
+            // these rows, so both carry the daemon-normalized origin — never
+            // the raw arguments the app sent.
+            let row = state
+                .owner_registry
+                .owner_mirror_row(&owner)
+                .ok_or_else(|| "the new owner has no registry record".to_string())?;
             Ok(json!({
-                "owner": owner.as_str(),
+                "owner": row.owner,
                 "capability": capability,
+                "label": row.label,
+                "currentOrigin": row.current_origin,
+                "workspaceId": row.workspace_id,
+                "sessionRoute": row.session_route,
+                "generation": row.generation,
             }))
         }
         "owner.detach" => {

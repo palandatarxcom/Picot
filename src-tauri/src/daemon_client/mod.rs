@@ -20,8 +20,11 @@
 //! silent one. The M2 milestone contract is explicit that the app stays embedded
 //! in this task, so wiring the manager here would be the wrong change.
 
+pub mod admin_client;
 pub mod exit_waiter;
 pub mod manager;
+pub mod navigation_mirror;
+pub mod surface_ops;
 
 /// The exit code of a second instance that is blocked by an already-running
 /// Picot. Non-zero and distinct from the usage error (2) and from a generic

@@ -246,19 +246,41 @@ async fn next_json(socket: &mut Client) -> Value {
     }
 }
 
-/// One request/response round trip; asserts the response id matches.
-async fn request(socket: &mut Client, id: &str, op: &str, args: Value) -> Value {
+/// One request/response round trip; asserts the response id matches, and also
+/// returns the mirror frames the op published before answering.
+///
+/// `owner.create` publishes the new owner's row (Task 5) before its reply, so a
+/// request helper that dropped those frames would silently eat an assertion's
+/// evidence. The caller gets both.
+async fn request_with_events(
+    socket: &mut Client,
+    id: &str,
+    op: &str,
+    args: Value,
+) -> (Value, Vec<Value>) {
     send_json(
         socket,
         json!({"type": "admin_request", "id": id, "op": op, "args": args}),
     )
     .await;
-    let response = next_json(socket).await;
-    assert_eq!(response["type"], "admin_result", "got {response}");
+    let mut events = Vec::new();
+    let response = loop {
+        let frame = next_json(socket).await;
+        if frame["type"] == "admin_result" {
+            break frame;
+        }
+        events.push(frame);
+    };
     assert_eq!(
         response["id"], id,
         "responses are matched by id: {response}"
     );
+    (response, events)
+}
+
+/// One request/response round trip; asserts the response id matches.
+async fn request(socket: &mut Client, id: &str, op: &str, args: Value) -> Value {
+    let (response, _events) = request_with_events(socket, id, op, args).await;
     response
 }
 
@@ -558,8 +580,16 @@ async fn mirror_ack_timeout_fails_the_triggering_op() {
     let fixture = Fixture::boot(Duration::from_millis(300)).await;
     let (mut socket, welcome) = fixture.attach().await;
     let epoch = welcome["epoch"].as_u64().unwrap();
-    let created = request(&mut socket, "r1", "owner.create", owner_args("w1")).await;
+    let (created, events) =
+        request_with_events(&mut socket, "r1", "owner.create", owner_args("w1")).await;
     let owner = OwnerId::from_string(created["result"]["owner"].as_str().unwrap().to_string());
+    // The creation also publishes the owner's mirror row (Task 5): the app's
+    // navigation delegate is fed by these rows, so they must precede the
+    // window's first load.
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["type"], "owner_binding_changed", "{}", events[0]);
+    assert_eq!(events[0]["owner"], owner.as_str());
+    assert_eq!(events[0]["currentOrigin"], "http://127.0.0.1:3001");
 
     let state = Arc::clone(&fixture.state);
     let op_owner = owner.clone();
@@ -669,12 +699,16 @@ async fn responses_are_matched_by_id_when_completions_arrive_out_of_order() {
     .await;
 
     let first = next_json(&mut socket).await;
+    let row = next_json(&mut socket).await;
     let second = next_json(&mut socket).await;
     assert_eq!(first["id"], "r2", "the fast op answers first: {first}");
     assert_eq!(
         first["result"]["pid"].as_u64(),
         Some(u64::from(std::process::id()))
     );
+    // r1 (the delayed op) publishes its owner row, then its own answer.
+    assert_eq!(row["type"], "owner_binding_changed", "{row}");
+    assert!(row["id"].is_null(), "a mirror row is not a reply: {row}");
     assert_eq!(second["id"], "r1", "the slow op still answers its own id");
     assert!(
         second["result"]["capability"].is_string(),
@@ -750,8 +784,35 @@ async fn mirror_event_frames_match_the_protocol_table() {
     let fixture = Fixture::boot(Duration::from_millis(300)).await;
     let (mut socket, welcome) = fixture.attach().await;
     let epoch = welcome["epoch"].as_u64().unwrap();
-    let created = request(&mut socket, "r1", "owner.create", owner_args("w1")).await;
+    let (created, events) =
+        request_with_events(&mut socket, "r1", "owner.create", owner_args("w1")).await;
     let owner = OwnerId::from_string(created["result"]["owner"].as_str().unwrap().to_string());
+    // The owner-creation row (Task 5), then the permit.
+    assert_eq!(events.len(), 1, "{events:?}");
+    let created_row = &events[0];
+    assert_eq!(
+        created_row["type"], "owner_binding_changed",
+        "{created_row}"
+    );
+    assert_eq!(
+        keys(&created_row),
+        vec![
+            "currentOrigin",
+            "epoch",
+            "generation",
+            "hasWorkspace",
+            "label",
+            "owner",
+            "sessionRoute",
+            "type",
+            "workspaceId"
+        ],
+        "the creation row must match the protocol table exactly: {created_row}"
+    );
+    assert_eq!(created_row["label"], "w1");
+    assert_eq!(created_row["hasWorkspace"], false);
+    assert_eq!(created_row["currentOrigin"], "http://127.0.0.1:3001");
+    assert_eq!(created_row["generation"], 0);
 
     // navigation_permit, pushed by the registry itself.
     let (generation, permit_id) = fixture
@@ -829,14 +890,34 @@ async fn mirror_event_frames_match_the_protocol_table() {
     let binding = next_json(&mut socket).await;
     assert_eq!(
         keys(&binding),
-        vec!["epoch", "generation", "hasWorkspace", "owner", "type"],
+        vec![
+            "currentOrigin",
+            "epoch",
+            "generation",
+            "hasWorkspace",
+            "label",
+            "owner",
+            "sessionRoute",
+            "type",
+            "workspaceId"
+        ],
         "{binding}"
     );
+    assert_eq!(binding["label"], "w1");
+    assert_eq!(
+        binding["sessionRoute"], "/workspaces/w1/sessions/s1",
+        "{binding}"
+    );
+    assert_eq!(binding["workspaceId"], "w1");
     assert_eq!(binding["type"], "owner_binding_changed");
     assert_eq!(binding["epoch"], epoch);
     assert_eq!(binding["owner"], owner.as_str());
     assert_eq!(binding["hasWorkspace"], true);
     assert_eq!(binding["generation"], generation);
+    assert_eq!(
+        binding["currentOrigin"], "http://127.0.0.1:3002",
+        "the committed origin is what the app's mirror authorizes: {binding}"
+    );
 
     // The mirror snapshot now carries the committed route.
     let snapshot = fixture.state.owner_registry.mirror_snapshot();
