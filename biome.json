@@ -16,7 +16,8 @@
       "!public/vendor",
       "!community-extensions.json",
       "!coverage",
-      "!skill-install-prototype.html"
+      "!skill-install-prototype.html",
+      "!docs/superpowers/specs/prototypes"
     ]
   },
   "formatter": {

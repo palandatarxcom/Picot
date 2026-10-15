@@ -149,8 +149,8 @@ function validateOAuth(value: unknown): string | undefined {
   if (metadataUrl !== undefined) {
     const url =
       typeof metadataUrl === "string" && URL.canParse(metadataUrl)
-        // pi-lens-ignore: unchecked-throwing-call — canParse is part of the ternary guard itself.
-        ? new URL(metadataUrl)
+        ? // pi-lens-ignore: unchecked-throwing-call — canParse is part of the ternary guard itself.
+          new URL(metadataUrl)
         : undefined;
     if (
       !url ||
