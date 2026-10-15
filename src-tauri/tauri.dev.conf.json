@@ -1,3 +1,6 @@
 {
-  "identifier": "com.palandata.picot.dev"
+  "identifier": "com.palandata.picot.dev",
+  "bundle": {
+    "externalBin": []
+  }
 }

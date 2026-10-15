@@ -360,6 +360,12 @@ After any changes under `src-tauri/`:
 bun run check:rust   # cargo check + clippy + fmt (fast; no full build needed)
 ```
 
+On a fresh checkout (no `src-tauri/resources/pi/`, no
+`src-tauri/binaries/`) run `bun run fetch:pi` and
+`bun run build:daemon:sidecar` once — both are gitignored prebuild artifacts
+that the Rust build scripts require. `bun run build` and
+`./scripts/build.sh mac-*` run them for you.
+
 For the full command reference (tests, lint/format, Rust checks, bumping the embedded pi version), see [`AGENTS.md` → Toolchain & Verification](./AGENTS.md#verification).
 
 ### Project docs

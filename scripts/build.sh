@@ -30,7 +30,13 @@
 #     right-click Open to bypass. Export APPLE_SIGNING_IDENTITY (plus
 #     APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID for notarization) to build with
 #     a real Developer ID cert instead — Tauri picks these up directly.
-#   - Windows: bare .exe + zip. No MSI (requires Windows host tools).
+#   - Windows: bare .exe + zip. No MSI (requires Windows host tools). No
+#     daemon sidecar either: `bundle.externalBin` is macOS-only in Phase 1
+#     (plan D9, src-tauri/tauri.macos.conf.json); a Windows sidecar is a
+#     separately tracked follow-up.
+#   - macOS also builds the daemon sidecar first (scripts/build-daemon-sidecar.sh
+#     via build_sidecar below) and checks the packaged copy in the .app
+#     afterwards (verify_packaged_sidecar).
 
 set -euo pipefail
 
@@ -164,6 +170,89 @@ sign_pi_resources() {
 	bash "$PROJECT_ROOT/scripts/sign-pi-resources.sh"
 }
 
+# Builds the daemon sidecar the bundler packs into
+# Picot.app/Contents/MacOS/: bundle.externalBin resolves
+# `binaries/picot-daemon` as `binaries/picot-daemon-<target-triple>`, and the
+# bundler strips the suffix again when it copies the file next to the app
+# executable — which is exactly the path the app's release branch resolves
+# (daemon_client::manager::resolve_daemon_binary). macOS only in Phase 1 (plan
+# D9); scripts/build-daemon-sidecar.sh is a no-op for other targets, so the
+# shared Tauri hook can call it unconditionally.
+build_sidecar() {
+	local target="$1"
+	log_info "Building the picot-daemon sidecar ($target)..."
+	bash "$PROJECT_ROOT/scripts/build-daemon-sidecar.sh" "$target"
+}
+
+# Detaches the DMG mounted by verify_packaged_sidecar (no-op when the .app was
+# read straight out of the bundle dir).
+detach_verify_dmg() {
+	local mount_point="$1"
+	if [ -n "$mount_point" ]; then
+		hdiutil detach "$mount_point" >/dev/null || log_warn "could not detach $mount_point"
+		rmdir "$mount_point" 2>/dev/null || true
+	fi
+}
+
+# Task 11 Step 3: prove the sidecar actually travelled into the built app, and
+# record its signature. The macOS bundler deletes `bundle/macos/` once the DMG
+# is written (docs/BUILD.md troubleshooting), so the .app usually has to be read
+# out of the DMG with hdiutil. A missing sidecar is a hard failure — that build
+# ships an app that cannot start its daemon. `codesign -dv` runs only for a real
+# identity (APPLE_SIGNING_IDENTITY set and not "-"); ad-hoc builds skip it, per
+# the plan (the bundler ad-hoc signs the app itself).
+verify_packaged_sidecar() {
+	local target="$1"
+	local bundle_dir="src-tauri/target/$target/release/bundle"
+	local sidecar_rel="Picot.app/Contents/MacOS/picot-daemon"
+	local sidecar=""
+	local mount_point=""
+	local dmg=""
+
+	if [ -d "$bundle_dir/macos/Picot.app" ]; then
+		sidecar="$bundle_dir/macos/$sidecar_rel"
+	else
+		dmg=$(ls -t "$bundle_dir"/dmg/Picot_*.dmg 2>/dev/null | head -n 1)
+		if [ -z "$dmg" ]; then
+			log_error "No Picot.app and no DMG under $bundle_dir to verify the sidecar against."
+			exit 1
+		fi
+		mount_point=$(mktemp -d)
+		if ! hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_point" >/dev/null; then
+			log_error "Cannot mount $dmg to verify the packaged sidecar."
+			rmdir "$mount_point" 2>/dev/null || true
+			exit 1
+		fi
+		sidecar="$mount_point/$sidecar_rel"
+	fi
+
+	if [ ! -f "$sidecar" ]; then
+		log_error "The built app has no daemon sidecar: $sidecar is missing."
+		log_error "bundle.externalBin (src-tauri/tauri.macos.conf.json) promised it: run 'bun run build:daemon:sidecar $target' before 'tauri build'."
+		detach_verify_dmg "$mount_point"
+		exit 1
+	fi
+	log_info "Packaged sidecar present: $sidecar"
+
+	if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ "${APPLE_SIGNING_IDENTITY}" != "-" ]; then
+		local signature
+		if ! signature=$(codesign -dv "$sidecar" 2>&1); then
+			log_error "codesign -dv failed for the packaged sidecar (identity: $APPLE_SIGNING_IDENTITY):"
+			echo "$signature"
+			detach_verify_dmg "$mount_point"
+			exit 1
+		fi
+		log_info "codesign -dv $sidecar:"
+		while IFS= read -r line; do
+			echo "    $line"
+		done <<<"$signature"
+	else
+		log_info "APPLE_SIGNING_IDENTITY unset or ad-hoc (\"-\"): skipping codesign -dv, as agreed in T11 Step 3."
+	fi
+
+	detach_verify_dmg "$mount_point"
+}
+
 # ---------- Builders ----------
 
 # Copy the most recently built DMG from a builder's bundle dir to
@@ -194,12 +283,14 @@ build_mac_arm() {
 	log_info "Building for macOS Apple Silicon ($target)..."
 
 	rustup target add "$target" 2>/dev/null || true
+	build_sidecar "$target"
 	PATH="$HOME/.cargo/bin:$PATH" tauri build --target "$target" --bundles dmg
 
 	local bundle_dir="src-tauri/target/$target/release/bundle"
 	log_info "macOS arm64 build completed."
 	log_info "  DMG: $bundle_dir/dmg/Picot_*.dmg  (Picot.app is bundled inside)"
 	log_info "Note: ad-hoc signed. Gatekeeper will block first launch; right-click Open to bypass."
+	verify_packaged_sidecar "$target"
 	copy_dmg_to_root "$bundle_dir" "arm64"
 }
 
@@ -209,12 +300,14 @@ build_mac_intel() {
 	log_info "Building for macOS Intel ($target)..."
 
 	rustup target add "$target" 2>/dev/null || true
+	build_sidecar "$target"
 	PATH="$HOME/.cargo/bin:$PATH" tauri build --target "$target" --bundles dmg
 
 	local bundle_dir="src-tauri/target/$target/release/bundle"
 	log_info "macOS Intel build completed."
 	log_info "  DMG: $bundle_dir/dmg/Picot_*.dmg  (Picot.app is bundled inside)"
 	log_info "Note: ad-hoc signed. Gatekeeper will block first launch; right-click Open to bypass."
+	verify_packaged_sidecar "$target"
 	copy_dmg_to_root "$bundle_dir" "x86_64"
 }
 
@@ -229,12 +322,16 @@ build_mac_universal() {
 	rustup target add aarch64-apple-darwin 2>/dev/null || true
 	rustup target add x86_64-apple-darwin 2>/dev/null || true
 
+	# The universal sidecar is a lipo of both arch daemons (plus the two
+	# per-arch files), so whichever triple the bundler resolves it finds one.
+	build_sidecar "$target"
 	PATH="$HOME/.cargo/bin:$PATH" tauri build --target "$target" --bundles dmg
 
 	local bundle_dir="src-tauri/target/$target/release/bundle"
 	log_info "macOS universal build completed."
 	log_info "  DMG: $bundle_dir/dmg/Picot_*.dmg  (Picot.app is bundled inside, fat binary)"
 	log_info "Note: ad-hoc signed. Gatekeeper will block first launch; right-click Open to bypass."
+	verify_packaged_sidecar "$target"
 	copy_dmg_to_root "$bundle_dir" "universal"
 }
 

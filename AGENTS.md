@@ -122,7 +122,9 @@ The WebView is vanilla JavaScript with no framework.
 ## Verification
 
 - After Rust edits, run `bun run check:rust`; do not use `tauri build` or
-  `cargo build` merely to verify a fix.
+  `cargo build` merely to verify a fix. On a fresh checkout also run
+  `bun run fetch:pi` and `bun run build:daemon:sidecar` once (the Rust build
+  scripts need those gitignored prebuild artifacts).
 - After frontend or extension edits, run `bun run check`; run the focused test
   first, then the relevant broader suite.
 - `bun run test` includes Vitest and Tauri capability validation.

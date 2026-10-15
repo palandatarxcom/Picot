@@ -10,6 +10,12 @@ package-lock.json
 src-tauri/target/
 src-tauri/gen/
 
+# Daemon sidecar staging for Tauri's `bundle.externalBin` (macOS only, plan
+# Task 11 / D9): scripts/build-daemon-sidecar.sh writes
+# picot-daemon-<target-triple> here and the bundler copies it into
+# Picot.app/Contents/MacOS/.
+src-tauri/binaries/
+
 # Pi extension bundles (produced by scripts/build-extensions.js)
 extensions/dist/
 

@@ -48,7 +48,17 @@ or a universal binary that runs on both:
 `x86_64-apple-darwin`, then `lipo`s them into a single fat binary inside
 `Picot.app/Contents/MacOS/picot`. The resulting DMG works natively on
 both Apple Silicon and Intel Macs. Universal builds take roughly 2× as
-long as a single-arch build.
+long as a single-arch build. The daemon sidecar inside the same directory
+(`picot-daemon`) gets the same treatment: arm64 + x86_64 `lipo`ed into one
+fat binary.
+
+**The daemon sidecar** (plan Task 11): `Picot.app/Contents/MacOS/picot-daemon`
+is the app's manager-spawned daemon (the app probes, spawns and attaches to
+it — see `ARCHITECTURE.md`). `src-tauri/tauri.macos.conf.json` declares it as
+`bundle.externalBin`, so the bundler copies it in and signs it with the app,
+and `scripts/build-daemon-sidecar.sh` produces the staged file the bundler
+resolves (`binaries/picot-daemon-<target-triple>`). macOS only: the Windows
+and Linux builds never look for it (plan D9).
 
 **Signing**: ad-hoc (`signingIdentity: "-"`). No Apple Developer
 certificate, no notarization.
@@ -94,8 +104,16 @@ compiled `extensions/`. Unzip and run `Picot.exe` directly.
 3. `bun run fetch:pi` (downloads/verifies embedded `pi` binary)
 4. `bun run build:extensions` (compiles the bridge extensions to `dist/*.mjs`)
 5. `rustup target add <target>` (idempotent)
-6. `tauri build` with the right target / bundler flags
-7. Windows: `zip` the release-dir contents
+6. macOS only: builds the daemon sidecar via
+   `scripts/build-daemon-sidecar.sh` (`cargo build --release -p picot-daemon`
+   → `src-tauri/binaries/picot-daemon-<target-triple>`); a no-op on other
+   targets
+7. `tauri build` with the right target / bundler flags
+8. macOS only: checks that the built `.app` really contains
+   `Contents/MacOS/picot-daemon` (mounting the DMG when the bundler already
+   cleaned `bundle/macos/`), and records `codesign -dv` for that file when
+   `APPLE_SIGNING_IDENTITY` names a real identity (ad-hoc builds skip it)
+9. Windows: `zip` the release-dir contents
 
 It never touches git, never creates tags, never pushes.
 
@@ -136,6 +154,21 @@ brew install mingw-w64
 `scripts/build.sh` adds `node_modules/.bin` to `PATH` automatically. If
 you invoke `tauri` directly in a fresh shell, either use `bunx tauri …`
 or run from `bun run` (which adds `.bin` to PATH automatically).
+
+### "resource path 'binaries/picot-daemon-\<triple\>' doesn't exist"
+
+The daemon sidecar is missing. `bundle.externalBin` (macOS:
+`src-tauri/tauri.macos.conf.json`) is copied by the app's `build.rs` on
+**every** cargo invocation, so `bun run check:rust`, `bun run test` and IDE
+builds need the file on disk — the same class of prerequisite as
+`src-tauri/resources/pi` (`bun run fetch:pi`). Stage it once:
+
+```bash
+bun run build:daemon:sidecar        # = scripts/build-daemon-sidecar.sh
+```
+
+`bun run build` and `./scripts/build.sh mac-*` do this for you (the file is
+gitignored: it is a build artifact, never committed).
 
 ### DMG is empty / `.app` not found
 

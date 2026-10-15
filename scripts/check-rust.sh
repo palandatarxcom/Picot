@@ -16,6 +16,22 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 echo "==> cargo check (workspace, all targets)"
+
+# The app package's build.rs (tauri-build) copies `bundle.externalBin` into the
+# target dir on every cargo invocation and fails hard when it is missing
+# ("resource path `binaries/picot-daemon-<triple>` doesn't exist"). That file is
+# a prebuild artifact — like `src-tauri/resources/pi` — so point at the
+# one-liner instead of letting the tauri-build error be the first hint.
+if [ "$(uname -s)" = "Darwin" ]; then
+  HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+  SIDECAR="$SCRIPT_DIR/../src-tauri/binaries/picot-daemon-$HOST_TRIPLE"
+  if [ ! -f "$SIDECAR" ]; then
+    echo "error: missing daemon sidecar $SIDECAR" >&2
+    echo "       (bundle.externalBin, plan Task 11); run: bun run build:daemon:sidecar" >&2
+    exit 1
+  fi
+fi
+
 cargo check --manifest-path "$MANIFEST" --workspace --all-targets
 
 echo "==> cargo clippy (workspace, warnings as errors)"

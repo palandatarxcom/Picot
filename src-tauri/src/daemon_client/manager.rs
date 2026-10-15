@@ -36,8 +36,12 @@
 //!   is that file.
 //! - **Spawn shape:** `std::process::Command` + `process_group(0)` on Unix, all
 //!   three stdio streams null (the daemon writes `<data_dir>/picot-daemon.log`).
-//!   T11 owns the release sidecar path; the dev path resolves the workspace
-//!   `target/<profile>/picot-daemon` next to this app's manifest.
+//!   The process is not registered with anything the app tears down: Tauri's
+//!   `RunEvent::Exit` handlers, `tauri_plugin_shell`'s child store and the quit
+//!   policy all leave it alone. Release builds resolve the sidecar beside the
+//!   app executable, dev builds the workspace `target/debug/picot-daemon` next
+//!   to this app's manifest (both in [`resolve_daemon_binary`], which carries
+//!   the reasoning for not using the plugin's sidecar API).
 //! - **`wait_ready` also resolves the startup race:** when two apps start at
 //!   once, both spawn, the single-instance lock lets exactly one daemon live,
 //!   and the loser's `wait_ready` finds the winner's live manager record → the
@@ -143,19 +147,57 @@ impl ManagerConfig {
 /// The daemon binary this app should start.
 ///
 /// Dev builds resolve the workspace artifact next to this manifest
-/// (`src-tauri/target/<profile>/picot-daemon`); release builds resolve the
-/// sidecar the bundler places beside the app executable (T11 owns the
-/// packaging step that puts it there).
+/// (`src-tauri/target/debug/picot-daemon`); release builds resolve the sidecar
+/// the bundler places **beside the app executable** — for a macOS bundle
+/// `Picot.app/Contents/MacOS/picot-daemon` (plan Task 11 Steps 1-2: the
+/// staging path `src-tauri/binaries/picot-daemon-<target-triple>` loses its
+/// triple suffix when the bundler copies it in, which is why the bare name is
+/// right here).
+///
+/// ## Implementation-time decision: `current_exe().parent()` over the
+/// `tauri_plugin_shell` sidecar API
+///
+/// Both can locate the packaged file, so the deciding factor is the plan's
+/// hard requirement that the daemon "detaches the process group and never
+/// joins an app-exit kill list". `tauri_plugin_shell` keeps every child it
+/// spawns in a store and kills them all on `RunEvent::Exit` (v2.3.5,
+/// `src/lib.rs`: the `on_event` handler that drains `shell.children` and calls
+/// `child.kill()`), i.e. membership in exactly the list this daemon must stay
+/// out of: `kill -9` on the app and ⌘Q with `keepRunningAfterQuit=true` both
+/// rely on the daemon outliving the app. Its sidecar API would additionally
+/// require an ACL entry (`shell:allow-execute` scoped to the sidecar), which
+/// would hand the WebView permission to launch the daemon — the manager's spawn
+/// is app-internal and must stay outside the WebView's reachable surface.
+///
+/// With `current_exe().parent()` the launch stays a plain
+/// `std::process::Command` with `process_group(0)`, no stdio, and no registry:
+/// nothing the app can reach owns the daemon's lifetime (plan Task 4 Step 3,
+/// D11).
 pub fn resolve_daemon_binary() -> PathBuf {
-    if cfg!(debug_assertions) {
+    resolve_daemon_binary_in(
+        std::env::current_exe().ok().as_deref(),
+        cfg!(debug_assertions),
+    )
+}
+
+/// The pure half of [`resolve_daemon_binary`], so both profiles' paths are
+/// testable in one binary (the dev path cannot be reached at runtime from a
+/// release test and vice versa).
+///
+/// `exe_dir` is the directory holding the running app executable
+/// (`std::env::current_exe()`). When it cannot be read — a stripped-down
+/// environment — the bare file name is the last resort, resolved through
+/// `PATH`; that lookup failing surfaces as a spawn error naming the binary
+/// rather than as silence.
+fn resolve_daemon_binary_in(exe_dir: Option<&Path>, dev: bool) -> PathBuf {
+    if dev {
         return PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("debug")
             .join(DAEMON_BINARY_NAME);
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(DAEMON_BINARY_NAME)))
+    exe_dir
+        .map(|dir| dir.join(DAEMON_BINARY_NAME))
         .unwrap_or_else(|| PathBuf::from(DAEMON_BINARY_NAME))
 }
 
@@ -1540,5 +1582,67 @@ mod tests {
             resolved.file_name().and_then(|name| name.to_str()),
             Some(DAEMON_BINARY_NAME)
         );
+    }
+
+    /// The release sidecar (plan Task 11 Step 2): the bundler copies
+    /// `binaries/picot-daemon-<target-triple>` next to the app executable and
+    /// drops the triple suffix, so the sidecar is `Contents/MacOS/picot-daemon`.
+    #[test]
+    fn the_release_daemon_binary_is_the_sidecar_beside_the_app_executable() {
+        let resolved = resolve_daemon_binary_in(
+            Some(Path::new("/Applications/Picot.app/Contents/MacOS")),
+            false,
+        );
+        assert_eq!(
+            resolved,
+            PathBuf::from("/Applications/Picot.app/Contents/MacOS/picot-daemon")
+        );
+    }
+
+    /// An unreadable `current_exe()` must not invent a bundle path: the bare
+    /// name (a `PATH` lookup) is the last resort, and its failure surfaces as a
+    /// spawn error naming the binary.
+    #[test]
+    fn the_release_path_without_an_exe_dir_falls_back_to_the_bare_name() {
+        assert_eq!(
+            resolve_daemon_binary_in(None, false),
+            PathBuf::from(DAEMON_BINARY_NAME)
+        );
+    }
+
+    /// The launch shape that makes "`kill -9` the app, the daemon keeps running"
+    /// true rather than hoped for: the daemon leads its **own** process group
+    /// (a signal aimed at Picot's group cannot reach it) and the launcher keeps
+    /// no registry the app tears down on exit. Real process, real `getpgid`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_launcher_detaches_the_daemon_into_its_own_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        // A stand-in "daemon": ProcessLauncher passes the daemon's argv, which
+        // the script ignores.
+        let stand_in = temp.path().join("stand-in-daemon");
+        std::fs::write(&stand_in, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut permissions = std::fs::metadata(&stand_in).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&stand_in, permissions).unwrap();
+
+        let mut config = cfg(temp.path());
+        config.daemon_binary = stand_in;
+        let spawned = ProcessLauncher
+            .spawn(&config)
+            .expect("spawn the stand-in daemon");
+        let pid = spawned.pid as libc::pid_t;
+
+        let pgid = unsafe { libc::getpgid(pid) };
+        assert_eq!(
+            pgid, pid,
+            "the daemon must lead its own process group, not the app's"
+        );
+
+        // The test owns this process; it is not the app's to kill.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        if let Some(mut child) = spawned.child {
+            let _ = child.wait();
+        }
     }
 }
