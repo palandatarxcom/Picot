@@ -52,6 +52,7 @@ pub mod search_env_config;
 #[allow(dead_code)]
 pub mod command_policy;
 pub mod cost_compat;
+pub mod daemon;
 #[allow(dead_code)]
 pub mod ephemeral_registry;
 pub mod git_pi_runner;
