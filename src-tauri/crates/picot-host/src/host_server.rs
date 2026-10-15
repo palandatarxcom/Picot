@@ -91,41 +91,15 @@ const MAX_CONCURRENT_SESSION_SCANS: usize = 2;
 /// scan permits would let keystrokes stall the sidebar.
 const MAX_CONCURRENT_MENTION_SCANS: usize = 3;
 
-/// D4/LAN preference gate for the mobile entry. Stored in the shared
-/// metadata store so the Settings toggle, the bind decision, and the pairing
-/// controls all observe one value.
-fn mobile_lan_access_enabled(metadata: &crate::metadata_store::SharedMetadataStore) -> bool {
-    metadata
-        .lock()
-        .ok()
-        .and_then(|store| store.pref_get("mobile.lanAccessEnabled").ok())
-        .flatten()
-        .and_then(|value| value.as_bool())
-        // Absent preference must mean loopback-only: the LAN bind is an
-        // opt-in mobile feature (D4). This briefly defaulted to `true`
-        // (8bd24c8, 2026-09-03; reverted 2026-09-20) — a default-on
-        // 0.0.0.0 bind contradicts the loopback promise above and
-        // ARCHITECTURE.md's security boundary.
-        .unwrap_or(false)
-}
-
-/// Best-effort primary LAN URL for the running host, discovered with a
-/// Best-effort primary LAN URL for the running host, discovered with a
-/// routing-table probe (a UDP `connect` sends no packets). Returns `None` on
-/// machines without a default route so the UI falls back to manual entry.
-fn primary_lan_url(port: u16) -> Option<String> {
-    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let local = socket.local_addr().ok()?;
-    if local.ip().is_loopback() {
-        return None;
-    }
-    Some(format!("http://{}:{port}", local.ip()))
-}
-
-fn bind_is_loopback(address: std::net::IpAddr) -> bool {
-    address.is_loopback()
-}
+/// The address every listener binds: loopback, unconditionally.
+///
+/// Phase 1 makes the bind policy a constant (plan B5, spec §3.1/§4.4): the
+/// host must never listen on LAN or the public internet, so the retired
+/// `mobile.lanAccessEnabled` opt-in is not read at all — a row left in SQLite by
+/// an older install is ignored, never migrated (no backward compatibility).
+/// Remote access in Phase 2 goes through the daemon's **outbound** relay +
+/// E2EE (§4.4), never through a widened bind.
+const BIND_ADDRESS: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// Fingerprints the static bundle by (path, size, mtime) of every file under
 /// `static_dir`, without reading file contents — cheap enough to run once on
@@ -199,10 +173,6 @@ struct HostState {
     /// D8: anonymous client-class hit counts for the retired `/api/rpc`
     /// surface (no per-user/per-token dimensions).
     legacy_rpc_gone_hits: Mutex<HashMap<String, u64>>,
-    /// D4/LAN bind decision for this process, read once at start from the
-    /// `mobile.lanAccessEnabled` preference. Pairing controls re-check it so a
-    /// runtime-disabled host never mints tokens even if the pref flips later.
-    lan_access: bool,
     /// Test seam: pins the agent root so subagents scans stay inside the test
     /// fixture instead of the real Pi agent directory. Production never sets it.
     agent_root_override: Mutex<Option<PathBuf>>,
@@ -213,6 +183,15 @@ struct HostState {
 
 pub struct HostServer {
     origin: String,
+    /// The listener's **real** bound address.
+    ///
+    /// Kept next to `origin` because the two differ under a widened bind: the
+    /// retired LAN branch put `0.0.0.0` in this field but normalized `origin`
+    /// to `127.0.0.1` (window URLs must never carry an unspecified host), so
+    /// `origin` alone cannot tell the two bind policies apart. This field is
+    /// where the policy is observable — the Task 6 regression test asserts it
+    /// is loopback (`plan B5`).
+    bound_addr: std::net::SocketAddr,
     /// The serve task's stop signal. Behind a mutex (not a plain `Option`) so a
     /// `&self` caller can request shutdown: the daemon owns `Arc<HostServer>`
     /// and cannot consume it (`daemon::DaemonState::shutdown_graceful`).
@@ -280,11 +259,9 @@ impl HostServer {
         metadata: SharedMetadataStore,
         session_root: Option<PathBuf>,
     ) -> Result<Self, String> {
-        // D4/LAN policy: loopback by default; LAN interfaces only when the user
-        // explicitly enabled mobile access. Reading the preference here means
-        // the Settings toggle and the bind decision observe one value, and a
-        // flip takes effect on the next host start.
-        let lan_access = mobile_lan_access_enabled(&metadata);
+        // D4/LAN policy: removed in Task 6 — the bind is a loopback constant
+        // (`BIND_ADDRESS`) and no preference is consulted. The shared metadata
+        // store is still the data plane's, exactly as before.
         let mut data = HostDataPlane::new(metadata);
         if let Some(session_root) = session_root {
             data = data.with_session_root(session_root);
@@ -319,7 +296,6 @@ impl HostServer {
                 std::time::Duration::from_secs(300),
             ),
             legacy_rpc_gone_hits: Mutex::new(HashMap::new()),
-            lan_access,
             agent_root_override: Mutex::new(None),
             host_port: std::sync::atomic::AtomicU16::new(0),
         });
@@ -486,18 +462,11 @@ impl HostServer {
             .fallback_service(static_service)
             .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
             .with_state(Arc::clone(&state));
-        // D4/LAN policy: see the `lan_access` field. Loopback unless the user
-        // explicitly turned mobile access on; `0.0.0.0` covers every interface
-        // including loopback, so the desktop window keeps working unchanged.
-        let bind_host = if state.lan_access {
-            log::warn!(
-                "[picot-host] mobile/LAN access enabled: the host is reachable from LAN devices"
-            );
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        } else {
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        };
-        let listener = tokio::net::TcpListener::bind((bind_host, 0))
+        // Loopback-only, unconditionally (plan B5): a persisted
+        // `mobile.lanAccessEnabled=true` from the retired feature is ignored,
+        // and the old `0.0.0.0` branch is gone. Remote access is Phase 2's
+        // outbound relay (spec §4.4), never a widened bind.
+        let listener = tokio::net::TcpListener::bind((BIND_ADDRESS, 0))
             .await
             .map_err(|error| format!("Cannot bind Picot Host: {error}"))?;
         let address = listener
@@ -517,19 +486,12 @@ impl HostServer {
                 log::error!("[picot-host] server stopped unexpectedly: {error}");
             }
         });
-        // Desktop windows keep talking to 127.0.0.1 even when the host is also
-        // reachable on LAN: an UNSPECIFIED bind would otherwise put `0.0.0.0`
-        // into the window URL and the capability origin.
-        let display_address = if address.ip().is_unspecified() {
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                address.port(),
-            )
-        } else {
-            address
-        };
+        // The bind is loopback, so the listener address is already the one
+        // window URLs and capability origins must use (no unspecified alias to
+        // normalize away).
         Ok(Self {
-            origin: format!("http://{display_address}"),
+            origin: format!("http://{address}"),
+            bound_addr: address,
             shutdown: Mutex::new(Some(shutdown_tx)),
             state,
         })
@@ -537,6 +499,12 @@ impl HostServer {
 
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// The listener's real bound address — the bind policy is only observable
+    /// here (see the `bound_addr` field).
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.bound_addr
     }
 
     /// Bind window-owner authority after host bind, before any desktop window connects.
@@ -2892,34 +2860,31 @@ async fn dispatch(
                     json!({ "type": "host_response", "requestId": request_id, "operation": operation, "response": response.map_err(|error| ("mcp_operation_failed", error))? }),
                 );
             }
-            // D4 mobile entry: the desktop mints pairing tokens for phones on
-            // the same LAN. Gated on the same preference that drove the bind
-            // decision, so a loopback-only host never mints tokens.
+            // Mobile entry: the host binds loopback only (Task 6 / plan B5), so
+            // there is no LAN URL to hand out and `enabled` is the wire-level
+            // truth — `false` — not a toggle. The op stays because the pairing
+            // machinery it fronts (RemoteAuth, `/v2/auth/exchange`, `/pair.html`)
+            // is Phase 2's relay input (spec §4.3/§4.4).
             if operation == "mobile_access_info" {
                 let port = state.host_port.load(std::sync::atomic::Ordering::Relaxed);
-                let lan_urls = if state.lan_access {
-                    primary_lan_url(port).into_iter().collect()
-                } else {
-                    Vec::new()
-                };
                 return Ok(json!({
                     "type": "host_response",
                     "requestId": request_id,
                     "operation": operation,
                     "response": {
-                        "enabled": state.lan_access,
+                        "enabled": false,
                         "port": port,
-                        "lanUrls": lan_urls,
+                        "lanUrls": Vec::<String>::new(),
                     },
                 }));
             }
             if operation == "mobile_pairing_create" {
-                if !state.lan_access {
-                    return Err((
-                        "mobile_access_disabled",
-                        "Enable mobile/LAN access before pairing a device".into(),
-                    ));
-                }
+                // No LAN gate any more: the retired `mobile.lanAccessEnabled`
+                // preference is not read (Task 6). A pairing token is only
+                // usable by a transport that can reach the daemon, and the
+                // loopback bind guarantees none can until the Phase 2 relay
+                // carries it (§4.4) — the token itself is minted by an
+                // authenticated desktop owner either way.
                 let pairing = state
                     .auth
                     .lock()
@@ -4357,8 +4322,8 @@ mod tests {
     }
 
     use super::{
-        bind_is_loopback, dialog_response_allowed, outbound_message, outbound_payload_kind,
-        read_bounded_utf8, retained_session_refresh_required, HostServer,
+        dialog_response_allowed, outbound_message, outbound_payload_kind, read_bounded_utf8,
+        retained_session_refresh_required, HostServer,
     };
     use crate::host_router::HostClientContext;
     use crate::metadata_store::MetadataStore;
@@ -6984,33 +6949,13 @@ mod tests {
     }
 
     #[test]
-    fn bind_policy_rejects_non_loopback_addresses() {
-        assert!(bind_is_loopback("127.0.0.1".parse().unwrap()));
-        assert!(bind_is_loopback("::1".parse().unwrap()));
-        assert!(!bind_is_loopback("192.168.1.10".parse().unwrap()));
-    }
-
-    #[test]
-    fn absent_lan_preference_defaults_to_loopback() {
-        // The LAN bind is opt-in: a fresh install with no stored preference
-        // must stay loopback-only (see `mobile_lan_access_enabled`).
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let temp = std::env::temp_dir().join(format!("picot-lan-default-{nonce}"));
-        fs::create_dir_all(&temp).unwrap();
-        let metadata = Arc::new(Mutex::new(
-            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
-        ));
-        assert!(!super::mobile_lan_access_enabled(&metadata));
-        metadata
-            .lock()
-            .unwrap()
-            .pref_set("mobile.lanAccessEnabled", &serde_json::json!(true))
-            .unwrap();
-        assert!(super::mobile_lan_access_enabled(&metadata));
-        let _ = fs::remove_dir_all(temp);
+    fn host_bind_address_is_loopback_only() {
+        // Task 6 / plan B5: the bind policy is a loopback constant, not a
+        // preference. The end-to-end proof lives in
+        // `tests/daemon_boot.rs::persisted_lan_preference_leaves_both_listeners_loopback_only`
+        // (a real listener, real bound address); this is the cheap guard that
+        // fails the moment someone edits the constant.
+        assert!(super::BIND_ADDRESS.is_loopback());
     }
 
     #[tokio::test]
@@ -7670,7 +7615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mobile_pairing_create_refuses_while_lan_access_is_disabled() {
+    async fn persisted_lan_preference_leaves_mobile_info_loopback_only() {
         use tokio_tungstenite::tungstenite::Message;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7683,16 +7628,22 @@ mod tests {
         let metadata = Arc::new(Mutex::new(
             MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
         ));
+        // The retired feature's persisted row, still set to `true`: Task 6
+        // removed every reader, so it must change nothing (no migration).
         metadata
             .lock()
             .unwrap()
-            .pref_set("mobile.lanAccessEnabled", &json!(false))
+            .pref_set("mobile.lanAccessEnabled", &json!(true))
             .unwrap();
         let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
         let registry = Arc::new(crate::window_owner::WindowOwnerRegistry::default());
         let host = HostServer::start(public, NativePiManager::new(8), auth, Arc::clone(&metadata))
             .await
             .unwrap();
+        // The window URL is loopback even though the stored preference says
+        // LAN; `tests/daemon_boot.rs` pins the socket-level bind.
+        assert!(host.origin().starts_with("http://127.0.0.1"));
+        assert!(host.local_addr().ip().is_loopback());
         let (_owner, capability) = registry
             .create_owner_with_workspace(
                 "mobile-disabled-window".into(),
@@ -7737,6 +7688,9 @@ mod tests {
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(info["response"]["enabled"], false);
         assert_eq!(info["response"]["lanUrls"], json!([]));
+        // The op itself stays: it fronts the pairing machinery Phase 2's relay
+        // reuses (spec §4.4), and the token is unusable without a transport that
+        // can reach the loopback-only daemon.
         socket
             .send(Message::Text(
                 json!({
@@ -7747,10 +7701,15 @@ mod tests {
             ))
             .await
             .unwrap();
-        let error: Value =
+        let pairing: Value =
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(error["type"], "error");
-        assert_eq!(error["error"]["code"], "mobile_access_disabled");
+        assert_eq!(pairing["type"], "host_response");
+        assert!(
+            pairing["response"]["pairingToken"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty()),
+            "pairing tokens are still minted for the desktop owner: {pairing}"
+        );
         let _ = socket.close(None).await;
         host.stop();
         let _ = fs::remove_dir_all(temp);
@@ -7780,8 +7739,10 @@ mod tests {
         let host = HostServer::start(public, NativePiManager::new(8), auth, Arc::clone(&metadata))
             .await
             .unwrap();
-        // Desktop windows keep using the loopback alias even on a LAN bind.
+        // Desktop windows keep using the loopback alias; the persisted LAN
+        // preference is inert after Task 6.
         assert!(host.origin().starts_with("http://127.0.0.1"));
+        assert!(host.local_addr().ip().is_loopback());
         let (_owner, capability) = registry
             .create_owner_with_workspace(
                 "mobile-pair-window".into(),
@@ -7824,7 +7785,9 @@ mod tests {
             .unwrap();
         let info: Value =
             serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(info["response"]["enabled"], true);
+        // Loopback-only host: no LAN URLs, whatever the stored preference says.
+        assert_eq!(info["response"]["enabled"], false);
+        assert_eq!(info["response"]["lanUrls"], json!([]));
         socket
             .send(Message::Text(
                 json!({

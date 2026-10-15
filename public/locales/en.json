@@ -1228,14 +1228,6 @@
       "connect": "Connect",
       "model": "Model"
     },
-    "mobile": {
-      "title": "Mobile Access",
-      "enable": "Allow phones on this network to pair",
-      "pair": "Pair device",
-      "pairAction": "Generate token",
-      "pairHint": "Open the address on the phone, then enter the token within 5 minutes.",
-      "restartHint": "Restart Picot to apply."
-    },
     "terminal": {
       "title": "Terminal",
       "theme": "Terminal theme",

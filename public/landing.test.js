@@ -145,7 +145,6 @@ vi.mock("./sidebar/index.js", () => ({
 function makeTransportStub() {
   return {
     capabilities: { native: true },
-    mobileAccessInfo: async () => ({ enabled: false, lanUrls: [] }),
     listSkillInventory: async () => ({ skills: [] }),
     setSkillEnabled: async () => ({}),
     // The install entry opens straight into the native picker; a forever-
@@ -207,16 +206,8 @@ function installDom() {
         <button id="refresh-sessions-btn"></button>
         <div class="session-list" id="session-list"></div>
         <button id="settings-btn"></button>
-        <button id="toggle-mobile-access"></button>
         <button id="toggle-pi-path"></button>
         <span id="pi-path-note"></span>
-        <div id="mobile-access-details"></div>
-        <div id="mobile-access-pairing">
-          <button id="mobile-pair-btn"></button>
-          <canvas id="mobile-qr-canvas"></canvas>
-          <span id="mobile-pair-token"></span>
-          <span id="mobile-restart-hint"></span>
-        </div>
       </div>
       <div class="workspace"><div class="main">
         <div id="quick-chat-dialog-root"></div>

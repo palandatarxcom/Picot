@@ -98,7 +98,6 @@ import { createConfigReadiness } from "./settings/config-readiness.js";
 import { setupEnvironmentPage } from "./settings/environment-page.js";
 import { setupExtensionsTabShell } from "./settings/extensions-tab-shell.js";
 import { createMcpHostOps, setupMcpPage } from "./settings/mcp-page.js";
-import { setupMobileAccess } from "./settings/mobile-access.js";
 import { setupModelsPage } from "./settings/models-page.js";
 import { createOauthGateway } from "./settings/oauth-gateway.js";
 import { setupPackageBrowse } from "./settings/package-browse.js";
@@ -7893,7 +7892,6 @@ async function openSettings(tabKey = "general", options = {}) {
     if (!settingsPanel.classList.contains("hidden")) loadPiVersion();
   }, 300);
   void refreshLanUrl();
-  void mobileAccessCard.refresh();
   void piPathToggle.refresh();
   // Fetch current state for toggles
   try {
@@ -8037,16 +8035,6 @@ const piPathToggle = setupPiPathToggle({
   note: document.getElementById("pi-path-note"),
 });
 
-const mobileAccessCard = setupMobileAccess({
-  transport,
-  toggle: document.getElementById("toggle-mobile-access"),
-  details: document.getElementById("mobile-access-details"),
-  pairBtn: document.getElementById("mobile-pair-btn"),
-  pairing: document.getElementById("mobile-access-pairing"),
-  qrCanvas: document.getElementById("mobile-qr-canvas"),
-  tokenEl: document.getElementById("mobile-pair-token"),
-  restartHint: document.getElementById("mobile-restart-hint"),
-});
 ({ loadInlineConfigEditor, loadAgentsMdEditor, loadAppendSystemMdEditor } = setupSettingsConfig({
   configGateway,
   clearSettingsSaveMessage,

@@ -165,6 +165,34 @@ describe("settings page split", () => {
     }
   });
 
+  test("removes the Mobile Access settings surface (loopback-only)", () => {
+    const dom = new JSDOM(html, { url: "http://localhost" });
+    const { document } = dom.window;
+
+    // Phase 1 keeps every listener on loopback, so the LAN opt-in has no
+    // behaviour behind it: a card that cannot change anything is a dead
+    // control and must be gone (Task 6, plan B5).
+    expect(document.querySelector("#setting-mobile-section")).toBeNull();
+    expect(document.querySelector("#toggle-mobile-access")).toBeNull();
+    expect(document.querySelector("#mobile-access-details")).toBeNull();
+    expect(document.querySelector("#mobile-access-pairing")).toBeNull();
+    expect(document.querySelector("#mobile-pair-btn")).toBeNull();
+    expect(appJs).not.toContain("setupMobileAccess(");
+    expect(appJs).not.toContain("mobile-access.js");
+    const landingJs = readFileSync(join(process.cwd(), "public/landing.js"), "utf8");
+    expect(landingJs).not.toContain("setupMobileAccess(");
+    expect(landingJs).not.toContain("mobile-access.js");
+
+    // No locale keeps the card's copy: an orphaned key is how a removed
+    // surface comes back half-alive.
+    for (const locale of ["en", "es", "ja", "zh"]) {
+      const messages = JSON.parse(
+        readFileSync(join(process.cwd(), `public/locales/${locale}.json`), "utf8"),
+      );
+      expect(messages.settings.mobile).toBeUndefined();
+    }
+  });
+
   test("resolves the Models navigation title in every locale", () => {
     for (const locale of ["en", "es", "ja", "zh"]) {
       const messages = JSON.parse(

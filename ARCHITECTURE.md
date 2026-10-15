@@ -136,7 +136,7 @@ fn native_runtime_enabled(app) -> bool {
 
 删除前置条件不变：D10 Stage 2+ 遥测需显示这些条目在两个稳定 release 周期内零命中。
 
-**LAN 边界（Phase 1）**：`HostServer` 与 admin listener 一律只绑 `127.0.0.1`（loopback-only），**与任何持久化偏好无关**——旧的「设置 → Mobile Access」（`mobile.lanAccessEnabled`）已随 Phase 1 移除，残留偏好行被忽略、不生效。配对与 device token 机制（`RemoteAuth`、`/v2/auth/exchange`、`/pair.html`）保留在 host 侧，但在 loopback-only 下没有远程可达路径：它们是 Phase 2 relay 复用的既有资产（§4.4）。远程访问一律走 daemon **出站** relay + E2EE，daemon 永不监听 LAN 与公网。
+**LAN 边界（Phase 1）**：`HostServer` 与 admin listener 一律只绑 `127.0.0.1`（loopback-only），**与任何持久化偏好无关**——旧的「设置 → Mobile Access」（`mobile.lanAccessEnabled`）已随 Phase 1 移除，残留偏好行被忽略、不生效。配对与 device token 机制（`RemoteAuth`、`/v2/auth/exchange`、`/pair.html`）保留在 host 侧，但在 loopback-only 下没有远程可达路径：它们是 Phase 2 relay 复用的既有资产（§4.4）。远程访问一律走 daemon **出站** relay + E2EE，daemon 永不监听 LAN 与公网。**落地细节（T6）**：设置页的 Mobile Access 卡片与 `public/settings/mobile-access.js` 一并删除；`mobile_access_info` 恒返回 `enabled:false` + 空 `lanUrls`（`enabled` 是事实陈述而非开关），因此工具栏「Open on Mobile」QR 入口（`public/lan-qr.js`）恒隐；`mobile_pairing_create` 不再有 LAN 偏好门禁（它由 desktop owner 授权，token 在 relay 到来前无可达路径）。回归测试：`src-tauri/crates/picot-host/tests/daemon_boot.rs` 以旧偏好 `mobile.lanAccessEnabled=true` 启动，断言 host 与 admin **双** listener 的绑定地址均为 loopback 且非 loopback 地址不可达。
 
 ## 授权模型
 

@@ -1228,14 +1228,6 @@
       "connect": "Conectar",
       "model": "Modelo"
     },
-    "mobile": {
-      "title": "Acceso móvil",
-      "enable": "Permitir que los teléfonos de esta red se vinculen",
-      "pair": "Vincular dispositivo",
-      "pairAction": "Generar token",
-      "pairHint": "Abre la dirección en el teléfono e introduce el token en 5 minutos.",
-      "restartHint": "Reinicia Picot para aplicar."
-    },
     "terminal": {
       "title": "Terminal",
       "theme": "Tema del terminal",

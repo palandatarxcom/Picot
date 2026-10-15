@@ -46,7 +46,6 @@ import { QuickChatDialog } from "./quick-chat-dialog.js";
 import { setupEnvironmentPage } from "./settings/environment-page.js";
 import { setupExtensionsTabShell } from "./settings/extensions-tab-shell.js";
 import { createMcpHostOps, setupMcpPage } from "./settings/mcp-page.js";
-import { setupMobileAccess } from "./settings/mobile-access.js";
 import { setupModelsPage } from "./settings/models-page.js";
 import { setupPackageBrowse } from "./settings/package-browse.js";
 import { setupPackageManager } from "./settings/package-manager.js";
@@ -403,7 +402,6 @@ function openLandingSettings(tabKey = "general") {
   buildLandingLanguageSelector();
   buildLandingAppearanceSelectors();
   void loadLandingPiVersion();
-  void mobileAccessCard.refresh();
   void piPathToggle.refresh();
 }
 
@@ -431,23 +429,10 @@ async function loadLandingPiVersion() {
   }
 }
 
-// Mobile pairing is entirely host-side control ops (pairing tokens,
-// access info, the LAN-access preference).
 const piPathToggle = setupPiPathToggle({
   transport,
   toggle: document.getElementById("toggle-pi-path"),
   note: document.getElementById("pi-path-note"),
-});
-
-const mobileAccessCard = setupMobileAccess({
-  transport,
-  toggle: document.getElementById("toggle-mobile-access"),
-  details: document.getElementById("mobile-access-details"),
-  pairBtn: document.getElementById("mobile-pair-btn"),
-  pairing: document.getElementById("mobile-access-pairing"),
-  qrCanvas: document.getElementById("mobile-qr-canvas"),
-  tokenEl: document.getElementById("mobile-pair-token"),
-  restartHint: document.getElementById("mobile-restart-hint"),
 });
 
 const landingSubagents = setupSubagentsTab({

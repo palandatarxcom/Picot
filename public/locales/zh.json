@@ -1228,14 +1228,6 @@
       "connect": "连接",
       "model": "模型"
     },
-    "mobile": {
-      "title": "移动端访问",
-      "enable": "允许同一网络内的手机配对",
-      "pair": "配对设备",
-      "pairAction": "生成令牌",
-      "pairHint": "在手机上打开该地址，并在 5 分钟内输入令牌。",
-      "restartHint": "重启 Picot 后生效。"
-    },
     "terminal": {
       "title": "终端",
       "theme": "终端主题",
