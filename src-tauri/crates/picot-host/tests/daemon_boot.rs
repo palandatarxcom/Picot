@@ -69,7 +69,7 @@ impl AppSurface for RecordingSurface {
         self.record("open_devtools")
     }
 
-    async fn close_window(&self, _label: &str) -> Result<(), String> {
+    async fn close_window(&self, _label: &str, _request_id: &str) -> Result<(), String> {
         self.record("close_window")
     }
 
@@ -95,12 +95,9 @@ impl AppSurface for RecordingSurface {
         Ok(None)
     }
 
-    async fn pick_image_files(
-        &self,
-        _initial_dir: Option<String>,
-    ) -> Result<Option<Vec<String>>, String> {
+    async fn pick_image_files(&self, _initial_dir: Option<String>) -> Result<Value, String> {
         self.record("pick_image_files")?;
-        Ok(None)
+        Ok(Value::Null)
     }
 
     async fn save_session_export(

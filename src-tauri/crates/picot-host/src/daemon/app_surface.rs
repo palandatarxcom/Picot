@@ -95,6 +95,29 @@
 //! - `main.rs:4901` and `:4719` — window-focus hooks reading
 //!   `OwnerRegistryState` before calling `update_new_session_menu_state`.
 //!
+//! ## Step-2 trait corrections (signature-level; recorded, not silently absorbed)
+//!
+//! Two Step-0 signatures could not carry today's behavior, so Step 2 sharpened
+//! them instead of writing a silent regression. No row was added or removed.
+//!
+//! 1. **A10 `close_window(label, request_id)`** (Step 0: `close_window(label)`).
+//!    The pending-close map is app state under D4, so the approve settlement —
+//!    including the `no pending window close` and `request id mismatch`
+//!    results the control response already returns — has to happen app-side.
+//!    Without the request id the app-side impl could not tell an approval from
+//!    a replay, which is exactly what those results exist for.
+//! 2. **A4 `pick_image_files(...) -> Result<Value, String>`** (Step 0:
+//!    `Option<Vec<String>>`). The picker returns image objects carrying the
+//!    base64 bytes (`PickedImageFile { name, mimeType, data }`, main.rs:281);
+//!    a `Vec<String>` would have dropped the payload. The JSON pass-through
+//!    shape matches row A5's `save_session_export`.
+//!
+//! A third finding, not a signature change: row T1's grep was scoped to the
+//! dispatcher function, so it missed the three framework async-runtime
+//! `spawn_blocking` calls inside `dispatch_git_host_operation` (pre-move
+//! main.rs:2528, 2581, 2639) — same op, same replacement, six sites in total
+//! now on plain `tokio`.
+//!
 //! ## Deviations from the plan text (recorded, not silently absorbed)
 //!
 //! 1. `save_session_export` keeps `initial_dir` (see A5) — the sketch's three
@@ -193,9 +216,15 @@ pub trait AppSurface: Send + Sync {
     /// Row A6 — `open_devtools` op for the owner's window label.
     async fn open_devtools(&self, label: &str) -> Result<(), String>;
 
-    /// Row A10 — close the window that a `window_close_approve` settlement
-    /// released.
-    async fn close_window(&self, label: &str) -> Result<(), String>;
+    /// Row A10 — settle the pending close that `window_close_approve`
+    /// approves (the pending map lives app-side, D4) and close the window.
+    ///
+    /// `request_id` is part of the settlement, not decoration: the approve
+    /// path validates it against the pending request (`no pending window
+    /// close` / `request id mismatch`) exactly as the in-process dispatcher
+    /// did before the split. Row A11 carries the same pair for the cancel
+    /// direction.
+    async fn close_window(&self, label: &str, request_id: &str) -> Result<(), String>;
 
     /// Row A11 — clear the app's pending close for `label`/`request_id` when a
     /// `window_close_cancel` arrives.
@@ -214,11 +243,16 @@ pub trait AppSurface: Send + Sync {
     /// Row A3 — native folder picker; `Ok(None)` on cancel.
     async fn pick_folder(&self) -> Result<Option<String>, String>;
 
-    /// Row A4 — native image picker; `Ok(None)` on cancel.
-    async fn pick_image_files(
-        &self,
-        initial_dir: Option<String>,
-    ) -> Result<Option<Vec<String>>, String>;
+    /// Row A4 — native image picker; `Ok(Null)` on cancel, otherwise the
+    /// selected image objects (`name` / `mimeType` / base64 `data`).
+    ///
+    /// The payload is opaque JSON on purpose: the picker reads and
+    /// base64-encodes the files app-side, and the dispatcher forwards the
+    /// array to the client unchanged. (Step 0 sketched `Option<Vec<String>>`,
+    /// which cannot carry the encoded bytes — the images would be silently
+    /// dropped, so Step 2 corrected the type to the pass-through shape row A5
+    /// already uses.)
+    async fn pick_image_files(&self, initial_dir: Option<String>) -> Result<Value, String>;
 
     /// Row A5 — fetch the granted export over `host_origin`, then show the
     /// native save dialog. `Ok(Null)` when the user cancels, otherwise the

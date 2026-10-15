@@ -33,6 +33,7 @@ pub mod host_capability;
 pub mod host_config;
 #[allow(dead_code)]
 pub mod host_control;
+pub mod host_control_dispatch;
 pub mod host_data;
 pub mod host_files;
 pub mod host_router;
