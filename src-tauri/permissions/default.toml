@@ -1,8 +1,3 @@
-[[permission]]
-identifier = "allow-cmd-retry-startup"
-description = "Allow retrying startup after a failed embedded pi launch (used by the bootstrap error window)"
-commands.allow = ["cmd_retry_startup"]
-
 # The three daemon admin commands (plan D8/T10). Their identifiers must stay in
 # step with `daemon_client::commands::COMMAND_*` and the `generate_handler!`
 # block: scripts/check-tauri-permissions.js fails when a registered command is
@@ -31,7 +26,6 @@ commands.allow = ["daemon_restart"]
 [default]
 description = "Default permissions bundle for Pi Desktop custom commands"
 permissions = [
-  "allow-cmd-retry-startup",
   "allow-daemon-status",
   "allow-daemon-set-keep-running",
   "allow-daemon-restart",

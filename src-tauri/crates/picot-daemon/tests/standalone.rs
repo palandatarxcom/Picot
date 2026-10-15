@@ -10,6 +10,7 @@
 //! | [`the_real_binary_boots_serves_health_and_a_sigterm_clears_its_files`] | Step 2 (ready → instance file), Step 4's `/health` + graceful exit |
 //! | [`two_daemons_racing_the_single_instance_lock_yield_one_daemon_and_one_exit_3`] | Step 1's "simultaneous startup: the single-instance lock yields one daemon, one winner" |
 //! | [`a_killed_daemon_leaves_orphan_evidence_and_the_next_daemon_takes_over`] | Step 4's `kill -9` → re-run sweep, and D12's "an unconfirmed exit keeps the orphan evidence" |
+//! | [`a_booting_daemon_sweeps_the_orphan_runtime_registry`] | spec row 4 (review finding R2): the daemon itself sweeps the child registry a killed predecessor left |
 //! | [`a_second_manager_is_refused_and_the_lease_holder_can_stop_the_real_daemon`] | Step 1's "no lease → the daemon refuses the stop", over the real socket |
 //! | [`the_argv_and_usage_contract_is_enforced_by_the_real_binary`] | Step 2's argv surface + the documented exit codes |
 //!
@@ -38,6 +39,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use picot_host::child_supervision::{pid_is_alive, process_start_time};
 use picot_host::daemon::admin::ADMIN_WS_PATH;
 use picot_host::daemon::instance::{self, InstanceFile};
 use serde_json::{json, Value};
@@ -117,6 +119,25 @@ impl Standalone {
 
     fn instance_path(&self) -> PathBuf {
         instance::instance_path(&self.data_dir)
+    }
+
+    /// The daemon with `HOME` redirected to `home`. `child_supervision`'s
+    /// registry lives under `$HOME/.pi/picot-runtimes`, so an isolated home is
+    /// what keeps this suite's orphan sweep away from the developer's real
+    /// runtimes — and what lets the test *plant* an orphan to be swept.
+    fn command_in_home(&self, home: &Path) -> Command {
+        let mut command = self.command();
+        command.env("HOME", home);
+        command
+    }
+
+    /// Same stdio posture as [`Self::start`], with a redirected `HOME`.
+    fn start_in_home(&self, home: &Path) -> Child {
+        self.command_in_home(home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the daemon binary spawns")
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -478,6 +499,97 @@ async fn a_killed_daemon_leaves_orphan_evidence_and_the_next_daemon_takes_over()
         http_status(&fresh.host_origin, "/health").await,
         Some(200),
         "the successor is usable"
+    );
+
+    signal(second.id(), SIGTERM);
+    assert_eq!(exit_code(wait_exit(&mut second, EXIT_DEADLINE).await), 0);
+    world.wait_for_files_removed().await;
+}
+
+/// Spec row 4 / review finding R2, over the real binary: a daemon booted with no
+/// Picot process alive to sweep must collect the runtime a `kill -9`ed
+/// predecessor left in the child registry. Before this commit only the app swept
+/// (`src/main.rs`), so a crash followed by a daemon-only restart left the wedged
+/// `pi` children running forever.
+///
+/// The shape is the review's: daemon #1 is `kill -9`ed holding a registry entry
+/// for a live runtime, and daemon #2 `SIGKILL`s that runtime and removes the
+/// file. Both processes are real, the registry document is the one
+/// `child_supervision` writes, and `HOME` is isolated so the sweep can never
+/// touch the developer's own runtimes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_booting_daemon_sweeps_the_orphan_runtime_registry() {
+    let world = Standalone::new();
+    let home = world._temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("isolated home");
+
+    let mut first = world.start_in_home(&home);
+    let killed_pid = world.wait_for_instance().await.pid;
+    assert_eq!(killed_pid, first.id());
+
+    // The runtime daemon #1 leaves behind: a real process with a pid + start
+    // time the successor's sweep can verify before it kills anything.
+    let mut orphan = Command::new("sleep")
+        .arg("300")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the orphan runtime spawns");
+    let orphan_pid = orphan.id();
+    let started_at = process_start_time(orphan_pid).expect("ps reports the orphan's start time");
+
+    // The registry document a spawn records under the supervisor's own pid.
+    let registry_dir = home.join(".pi").join("picot-runtimes");
+    std::fs::create_dir_all(&registry_dir).expect("registry dir");
+    let registry_path = registry_dir.join(format!("{killed_pid}.json"));
+    std::fs::write(
+        &registry_path,
+        json!({
+            "supervisor_pid": killed_pid,
+            "entries": [{ "pid": orphan_pid, "started_at": started_at }],
+        })
+        .to_string(),
+    )
+    .expect("the orphan registry is planted");
+
+    // `kill -9`: no teardown runs, so the registry file (and the runtime) outlive
+    // the daemon — exactly the state the successor has to clean up.
+    signal(first.id(), SIGKILL);
+    assert_eq!(
+        exit_code(wait_exit(&mut first, EXIT_DEADLINE).await),
+        -SIGKILL
+    );
+    assert!(
+        registry_path.exists(),
+        "the killed daemon left its orphan evidence"
+    );
+    assert!(
+        pid_is_alive(orphan_pid),
+        "the orphan is still running when the successor boots"
+    );
+
+    let mut second = world.start_in_home(&home);
+    let fresh = world.wait_for_republish(killed_pid).await;
+    assert_eq!(fresh.pid, second.id(), "the successor republished");
+
+    // The sweep runs after the lock and before the instance file is published,
+    // so by the time the app's invitation exists the orphan is already claimed.
+    assert!(
+        world.log().contains("orphaned pi runtime"),
+        "the sweep is traced in the daemon log:\n{}",
+        world.log()
+    );
+    let status = wait_exit(&mut orphan, EXIT_DEADLINE).await;
+    assert_eq!(
+        exit_code(status),
+        -SIGKILL,
+        "the sweep SIGKILLs the orphan runtime"
+    );
+    assert!(!pid_is_alive(orphan_pid), "the orphan is gone once reaped");
+    assert!(
+        !registry_path.exists(),
+        "the swept registry file {} is removed",
+        registry_path.display()
     );
 
     signal(second.id(), SIGTERM);

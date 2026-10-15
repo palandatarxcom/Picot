@@ -261,6 +261,13 @@ struct AdminInner {
     /// `HostServer::set_agent_root_for_tests` — it lets the protocol tests prove
     /// responses are matched by id when completions arrive out of order.
     op_delays: Mutex<HashMap<String, Duration>>,
+    /// Test seam (B2): when set, `grant_lease` sleeps 1ms at its single
+    /// scheduler-interleaving point. Off in production. It is the place the
+    /// *old* four-fragment grant was preempted between "check the incumbent"
+    /// and "install the new attachment"; the refactored grant keeps that point
+    /// **outside** the critical section, so the stress test can engage it and
+    /// still observe exactly one winner.
+    lease_gap_yield: AtomicBool,
     state: Mutex<Weak<DaemonState>>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     /// Manager-record publisher (T4): `None` until the daemon binary installs
@@ -289,6 +296,7 @@ impl AdminServer {
             permit_waiters: Mutex::new(HashMap::new()),
             surface_channels: Mutex::new(HashMap::new()),
             op_delays: Mutex::new(HashMap::new()),
+            lease_gap_yield: AtomicBool::new(false),
             state: Mutex::new(Weak::new()),
             shutdown: Mutex::new(None),
             lease_observer: Mutex::new(None),
@@ -361,6 +369,12 @@ impl AdminServer {
             .lock()
             .expect("op delay lock")
             .insert(op.to_string(), delay);
+    }
+
+    /// Test seam (B2): engage the scheduler interleaving point of
+    /// [`AdminInner::grant_lease`]. Only the concurrency stress test uses it.
+    pub fn set_lease_gap_yield_for_tests(&self, enabled: bool) {
+        self.inner.lease_gap_yield.store(enabled, Ordering::SeqCst);
     }
 
     /// Forward one owner-mirror event to the manager (a no-op with no
@@ -761,7 +775,7 @@ async fn handle_socket(inner: Arc<AdminInner>, socket: WebSocket) {
                         outbound.send(close_frame(ADMIN_CLOSE_MALFORMED, "unsupported admin role"));
                     break;
                 }
-                match inner.grant_lease(conn_id, pid, app_version, build_id) {
+                match inner.grant_lease(conn_id, pid, app_version, build_id).await {
                     Err(()) => {
                         let _ = outbound
                             .send(close_frame(ADMIN_CLOSE_LEASE_HELD, "manager lease held"));
@@ -800,6 +814,18 @@ async fn handle_socket(inner: Arc<AdminInner>, socket: WebSocket) {
                 });
             }
             AdminInbound::MirrorAck { permit_id, epoch } => {
+                // Every inbound frame requires the hello (plan Task 3 close-code
+                // table). `mirror_ack` used to be the one exception: a
+                // pre-hello ack was processed against whatever permit slot it
+                // named — an unauthenticated peer's only way into the state
+                // machine. It closes 4410 like every other pre-hello frame (R1).
+                if attachment.is_none() {
+                    let _ = outbound.send(close_frame(
+                        ADMIN_CLOSE_MALFORMED,
+                        "mirror_ack before admin_hello",
+                    ));
+                    break;
+                }
                 inner.note_mirror_ack(&permit_id, epoch);
             }
             AdminInbound::SurfaceResponse { id, ok, result } => {
@@ -852,46 +878,62 @@ struct LeaseGrant {
 }
 
 impl AdminInner {
-    /// Atomic lease grant (plan B6). A competing *live* manager is rejected;
-    /// a lease whose connection is already gone is superseded (the dead
-    /// attachment's epoch is revoked first).
-    fn grant_lease(
+    /// Atomic lease grant (plan B6, review finding B2). A competing *live*
+    /// manager is rejected; a lease whose connection is already gone is
+    /// superseded (the dead attachment's epoch is cleaned up first).
+    ///
+    /// **One critical section** (B2): the incumbent-liveness check, the
+    /// stale-epoch decision and the installation of the new attachment all
+    /// happen under a single `lease` guard. The previous four-fragment version
+    /// released the guard between the check and the grant, so two concurrent
+    /// `admin_hello`s could both read "no live incumbent" and both be welcomed
+    /// (the review's 300-round PoC saw it 10 times).
+    ///
+    /// The cleanup of a superseded epoch is a *side effect* — owner revocation,
+    /// label release, `notify_manager` — driven by the values the critical
+    /// section returns and run after the guard is dropped, so no lock is ever
+    /// held across the observer call (R1) and no other lock can be taken in the
+    /// opposite order. Lock order stays `lease → connections`: `is_connected`
+    /// takes only the connections lock, the order every other path already
+    /// uses (`manager_conn`, `clear_bookkeeping`).
+    async fn grant_lease(
         &self,
         conn_id: u64,
         pid: Option<u32>,
         app_version: Option<String>,
         build_id: Option<String>,
     ) -> Result<LeaseGrant, ()> {
-        let stale = {
-            let lease = self.lease.lock().expect("admin lease lock");
-            match lease.manager.as_ref() {
+        // Test seam: the one scheduler interleaving point. It sits *outside*
+        // the critical section below (it cannot be inside it — the guard is a
+        // `std::sync::Mutex`), which is exactly the property B2 is about.
+        if self.lease_gap_yield.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let (stale_epoch, epoch, attachment) = {
+            let mut lease = self.lease.lock().expect("admin lease lock");
+            let stale = match lease.manager.as_ref() {
                 Some(manager) if self.is_connected(manager.conn_id) => return Err(()),
                 Some(manager) => Some(manager.epoch),
                 None => None,
-            }
-        };
-        if let Some(epoch) = stale {
-            self.mark_attachment_dead(epoch, 0);
-        }
-        let epoch = {
-            let mut lease = self.lease.lock().expect("admin lease lock");
+            };
             lease.epoch += 1;
-            lease.manager = Some(ManagerAttachment {
+            let attachment = ManagerAttachment {
                 conn_id,
                 epoch: lease.epoch,
                 pid,
                 app_version,
                 build_id,
-            });
-            lease.epoch
+            };
+            lease.manager = Some(attachment.clone());
+            (stale, lease.epoch, attachment)
         };
-        let attachment = self
-            .lease
-            .lock()
-            .expect("admin lease lock")
-            .manager
-            .clone()
-            .ok_or(())?;
+        if let Some(epoch) = stale_epoch {
+            // The superseded attachment is gone: clear the manager record it
+            // published (plan D3) and revoke its epoch's owners, *before* the
+            // new grant announces itself, so the file never briefly names a
+            // dead manager once the successor is known.
+            self.clear_dead_attachment(epoch);
+        }
         let welcome = self.snapshot_for(epoch, &attachment);
         // Plan D3: the daemon — not the app — republishes the instance file's
         // manager record. No lock is held here (R1).
@@ -928,9 +970,8 @@ impl AdminInner {
         .to_string()
     }
 
-    /// Mark a dead attachment: revoke its epoch's owners, free their labels,
-    /// release the lease and run the per-owner detach cleanup (D11/D6). No
-    /// resident workspace runtime is stopped.
+    /// Mark a dead attachment: release the lease and clean up the epoch
+    /// (D11/D6). No resident workspace runtime is stopped.
     fn mark_attachment_dead(&self, epoch: u64, conn_id: u64) {
         let superseded = {
             let mut lease = self.lease.lock().expect("admin lease lock");
@@ -949,8 +990,16 @@ impl AdminInner {
         if !superseded {
             return;
         }
-        // The attachment is gone: the daemon clears the manager record it
-        // published (plan D3), before the owner cleanup below.
+        self.clear_dead_attachment(epoch);
+    }
+
+    /// The lock-free half of [`mark_attachment_dead`]: publish the "no manager"
+    /// record (plan D3), revoke the dead epoch's owners and free their labels
+    /// (D11/D6), so a reopened window can re-create them. No lock is held when
+    /// this runs — it is called by the grace-window path above and, since B2,
+    /// by [`Self::grant_lease`]'s supersede path, which has already installed
+    /// the successor under the `lease` guard.
+    fn clear_dead_attachment(&self, epoch: u64) {
         self.notify_manager(None);
         let owners = match self.state() {
             Some(state) => {

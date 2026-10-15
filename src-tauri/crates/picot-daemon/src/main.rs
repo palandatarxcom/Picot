@@ -11,7 +11,10 @@
 //!
 //! 1. logging — a detached process must leave a trace before anything can fail;
 //! 2. single-instance lock — before the host stack binds anything, so two
-//!    simultaneous starters cannot both come up (plan Task 4 Step 1);
+//!    simultaneous starters cannot both come up (plan Task 4 Step 1); then the
+//!    **orphan sweep** (spec row 4, review finding R2): the child registry a
+//!    `kill -9`ed predecessor left behind is collected once this process is the
+//!    data dir's only daemon — and before anything can adopt a runtime;
 //! 3. `DaemonState::start` — the host server binds its loopback origin;
 //! 4. `AdminServer::start` on `127.0.0.1:0` + `install_admin` (lease/epoch);
 //! 5. `install_control_handler` — the data plane's dispatcher;
@@ -202,6 +205,18 @@ async fn run(paths: ResolvedPaths) -> Result<u8, String> {
         );
         return Ok(EXIT_ALREADY_RUNNING);
     };
+
+    // Spec row 4 / review finding R2: a daemon booted by the app *alone* (no
+    // Picot process alive to sweep) must collect the runtimes a `kill -9`ed
+    // predecessor left behind. The app does this for its own registry
+    // (`src/main.rs`); until now the daemon never did, so a crash + daemon-only
+    // restart left wedged `pi` children forever. After the lock (single daemon
+    // per data dir) and before the listeners and the instance file, so no
+    // runtime can be adopted after the sweep has claimed it.
+    let swept = picot_host::child_supervision::sweep_orphans();
+    if swept > 0 {
+        log::info!("[picot-daemon] cleaned up {swept} orphaned pi runtime(s) from a previous run");
+    }
 
     let token = instance::generate_admin_token();
     // The daemon's app surface is the admin-channel forwarding one (T5, plan

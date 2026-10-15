@@ -1045,22 +1045,112 @@ async fn mirror_event_frames_match_the_protocol_table() {
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_pre_hello_frames_close_with_4410() {
     let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
-    let mut socket = connect(&fixture.admin_ws_url()).await;
-    send_raw(
-        &mut socket,
+    // Every inbound frame type requires the hello. The table is exhaustive on
+    // purpose (R1): `mirror_ack` used to be the one frame the connection loop
+    // processed *before* `admin_hello`, which let an unauthenticated peer poke
+    // a live permit slot by name.
+    let frames = [
         r#"{"type":"admin_request","id":"r1","op":"daemon.status"}"#,
-    )
-    .await;
-    match next_frame(&mut socket).await {
-        Frame::Closed(code, reason) => {
-            assert_eq!(
-                code,
-                picot_host::daemon::admin::ADMIN_CLOSE_MALFORMED,
-                "close reason: {reason}"
-            );
+        r#"{"type":"surface_response","id":"s1","ok":true,"result":{}}"#,
+        r#"{"type":"surface_progress","ackId":"s1","event":{}}"#,
+        r#"{"type":"mirror_ack","permitId":"p1","epoch":1}"#,
+    ];
+    for frame in frames {
+        let mut socket = connect(&fixture.admin_ws_url()).await;
+        send_raw(&mut socket, frame).await;
+        match next_frame(&mut socket).await {
+            Frame::Closed(code, reason) => {
+                assert_eq!(
+                    code,
+                    picot_host::daemon::admin::ADMIN_CLOSE_MALFORMED,
+                    "{frame} → close reason: {reason}"
+                );
+            }
+            other => panic!("{frame} → expected a 4410 close, got {other:?}"),
         }
-        other => panic!("expected a 4410 close, got {other:?}"),
     }
+    assert!(
+        !fixture.admin.manager_lease_held(),
+        "no pre-hello frame may acquire the lease"
+    );
+    fixture.state.shutdown_graceful("test").await;
+}
+
+/// B2 regression (the review's PoC, made deterministic). Ten times the review's
+/// 300-round race: two clients hello concurrently while the scheduler
+/// interleaving seam is engaged, round after round. With the old four-fragment
+/// `grant_lease` both racers read "no live incumbent" across the released guard
+/// and both were welcomed; with the single critical section at most one welcome
+/// is ever issued, the loser reads 4409, and the epoch advances exactly once per
+/// round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_hellos_never_double_grant_the_lease_under_interleaving() {
+    const ROUNDS: usize = 200;
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    // The interleaving point sits *before* the grant's critical section, so
+    // engaging it cannot make the refactored grant racy — that is the property
+    // under test. Against the old fragment-per-guard grant the same point was
+    // between the liveness check and the install (see the review's B2 PoC).
+    fixture.admin.set_lease_gap_yield_for_tests(true);
+    let hello = json!({
+        "type": "admin_hello",
+        "adminToken": fixture.token,
+        "role": "manager",
+        "appVersion": "0.5.0",
+        "buildId": "test-build",
+        "pid": 11,
+    });
+
+    for round in 0..ROUNDS {
+        let mut first = connect(&fixture.admin_ws_url()).await;
+        let mut second = connect(&fixture.admin_ws_url()).await;
+        send_json(&mut first, hello.clone()).await;
+        send_json(&mut second, hello.clone()).await;
+
+        let mut granted = 0;
+        let mut rejected = 0;
+        for (index, socket) in [&mut first, &mut second].into_iter().enumerate() {
+            match next_frame(socket).await {
+                Frame::Json(value) => {
+                    assert_eq!(
+                        value["type"], "admin_welcome",
+                        "round {round} client {index}: {value}"
+                    );
+                    granted += 1;
+                }
+                Frame::Closed(code, reason) => {
+                    assert_eq!(
+                        code, ADMIN_CLOSE_LEASE_HELD,
+                        "round {round} client {index}: {reason}"
+                    );
+                    rejected += 1;
+                }
+            }
+        }
+        assert_eq!(
+            granted, 1,
+            "round {round}: exactly one welcome, got {granted}"
+        );
+        assert_eq!(rejected, 1, "round {round}: the loser closed 4409");
+        assert_eq!(
+            fixture.admin.epoch(),
+            (round + 1) as u64,
+            "round {round}: a lost race adds no epoch"
+        );
+
+        // Drop both sockets and wait until the daemon has unregistered them:
+        // the next round must start from a lease whose connection is gone (the
+        // supersede path), which is where the old grant was non-atomic.
+        drop(first);
+        drop(second);
+        wait_until(
+            Duration::from_secs(5),
+            || fixture.admin.connection_count() == 0,
+            "both round sockets to be unregistered",
+        )
+        .await;
+    }
+    assert_eq!(fixture.admin.epoch(), ROUNDS as u64);
     fixture.state.shutdown_graceful("test").await;
 }
 

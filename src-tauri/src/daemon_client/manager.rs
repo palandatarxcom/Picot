@@ -853,6 +853,18 @@ impl DaemonManager {
     /// Version/build mismatch: attach the lease **first**, then stop, then
     /// confirm the exit by identity before anything replaces it (plan D10/D12).
     async fn stop_stale_daemon(&self, file: &InstanceFile) -> Result<(), DaemonManagerError> {
+        // Review finding R3: this path used to be silent, so a user whose app
+        // "restarted" the daemon saw nothing about *why* — the answer is the
+        // version+build identity mismatch, and both halves belong in the log.
+        log::info!(
+            "[picot] stopping stale picot-daemon pid={} (file version={} buildId={}) for app \
+             version={} buildId={}",
+            file.pid,
+            file.version,
+            file.build_id,
+            self.cfg.app_version,
+            self.cfg.build_id
+        );
         let endpoint = self.cfg.endpoint(file);
         match self.admin.stop(&endpoint, &self.cfg.identity()).await {
             Ok(LeaseOutcome::Granted { .. }) => {}
@@ -870,7 +882,15 @@ impl DaemonManager {
             .confirm_exit(&identity, None, STOP_CONFIRM_DEADLINE)
             .await
         {
-            ExitOutcome::Confirmed | ExitOutcome::Escalated { .. } => Ok(()),
+            ExitOutcome::Confirmed | ExitOutcome::Escalated { .. } => {
+                log::info!(
+                    "[picot] stale picot-daemon pid={} confirmed exited (file version={} buildId={})",
+                    file.pid,
+                    file.version,
+                    file.build_id
+                );
+                Ok(())
+            }
             ExitOutcome::Unconfirmed => Err(DaemonManagerError::NotReady {
                 deadline: STOP_CONFIRM_DEADLINE,
                 log_path: self.cfg.log_path(),
