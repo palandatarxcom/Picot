@@ -14,6 +14,9 @@
 //!   requests, the read pump, the surface pump) and [`admin_client::CreatedOwner`];
 //! - [`surface_ops`] — the app-side execution of forwarded `app_surface_request`
 //!   frames on the real `AppSurface`;
+//! - [`quit_policy`] — the app-private `keepRunningAfterQuit` file and the
+//!   quit transaction (accepted ≠ completed: app exit blocks on a *confirmed*
+//!   daemon death, plan D12/T8);
 //! - [`present_blocked_by_other_app`] — the localized dialog + non-zero exit for
 //!   a second Picot instance while another app manages the daemon.
 //!
@@ -21,11 +24,12 @@
 //!
 //! Wired (T5): `main.rs::setup_native_runtime` boots either mode, attaches
 //! through [`admin_client::AdminClient`], mints the landing owner over the admin
-//! channel and opens the landing window against the daemon's host origin;
-//! `RunEvent::Exit` branches on the mode. Still unwired: the three admin
-//! commands and their UI (T10), the quit policy (T8) and the restart transaction
-//! (T9) — items those tasks own, marked `#[allow(dead_code)]` where they exist
-//! already and documented at their definitions.
+//! channel and opens the landing window against the daemon's host origin.
+//! Wired (T8): app exit runs [`quit_policy`]'s transaction from
+//! `RunEvent::ExitRequested`, `RunEvent::Exit` and the SIGTERM/SIGINT/SIGHUP
+//! handlers. Still unwired: the three admin commands and their UI (T10) and the
+//! restart transaction (T9) — items those tasks own, marked `#[allow(dead_code)]`
+//! where they exist already and documented at their definitions.
 //!
 //! [`navigation_mirror`] is the app-side half of the daemon's authorization
 //! mirror: the WebView's synchronous `on_navigation` delegate reads it, and it
@@ -35,6 +39,7 @@ pub mod admin_client;
 pub mod exit_waiter;
 pub mod manager;
 pub mod navigation_mirror;
+pub mod quit_policy;
 pub mod surface_ops;
 
 /// The exit code of a second instance that is blocked by an already-running

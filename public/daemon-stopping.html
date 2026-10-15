@@ -1,0 +1,96 @@
+<!doctype html>
+<!-- ABOUTME: The quit splash Picot shows while the daemon is being stopped (plan Task 8 Step 2). -->
+<!-- ABOUTME: Prebuilt and single-file on purpose: it must paint while the daemon it describes is gone. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Picot</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 0 24px;
+        background: #1c1c1e;
+        color: #f5f5f7;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      .spinner {
+        width: 16px;
+        height: 16px;
+        flex: 0 0 auto;
+        border: 2px solid rgba(245, 245, 247, 0.25);
+        border-top-color: #f5f5f7;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      main {
+        line-height: 1.4;
+      }
+      h1 {
+        margin: 0 0 2px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        font-size: 12px;
+        opacity: 0.7;
+      }
+      @media (prefers-color-scheme: light) {
+        body {
+          background: #f2f2f7;
+          color: #1c1c1e;
+        }
+        .spinner {
+          border-color: rgba(28, 28, 30, 0.2);
+          border-top-color: #1c1c1e;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="spinner"></div>
+    <main id="copy">
+      <h1>Stopping Picot daemon…</h1>
+      <p>Saving session state and stopping running agents.</p>
+    </main>
+    <script>
+      // The quit path is native-side and runs before any locale bundle exists,
+      // so the splash localizes itself from the OS language (same four locales
+      // the app ships: public/locales/{en,zh,ja,es}.json).
+      (() => {
+        const COPY = {
+          en: ["Stopping Picot daemon…", "Saving session state and stopping running agents."],
+          zh: ["正在停止 Picot 守护进程…", "正在保存会话状态并停止正在运行的代理。"],
+          ja: ["Picot デーモンを停止しています…", "セッション状態を保存し、実行中のエージェントを停止しています。"],
+          es: ["Deteniendo el daemon de Picot…", "Guardando el estado de la sesión y deteniendo los agentes."],
+        };
+        const lang = (navigator.language || "en").toLowerCase();
+        const key = Object.keys(COPY).find(
+          (locale) => lang === locale || lang.indexOf(`${locale}-`) === 0,
+        );
+        const copy = COPY[key] || COPY.en;
+        document.documentElement.lang = key || "en";
+        document.querySelector("#copy h1").textContent = copy[0];
+        document.querySelector("#copy p").textContent = copy[1];
+      })();
+    </script>
+  </body>
+</html>

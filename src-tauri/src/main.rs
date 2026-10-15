@@ -15,8 +15,10 @@ mod tauri_app_surface;
 mod daemon_client;
 
 use daemon_client::admin_client::{AdminClient, SurfaceExecutor};
+use daemon_client::exit_waiter::{ExitWaiter, ProcessIdentity};
 use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
 use daemon_client::navigation_mirror::NavigationMirror;
+use daemon_client::quit_policy::{self, QuitOutcome};
 use daemon_client::surface_ops::ForwardedSurfaceOps;
 use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::daemon::DaemonState;
@@ -24,12 +26,13 @@ use picot_host::{child_supervision, officecli_watch, window_owner};
 
 use picot_host::host_control::ProgressSink;
 use picot_host::host_server::HostServer;
-use picot_host::native_pi_manager::NativePiManager;
 use picot_host::runtime_coordinator::RuntimeTarget;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Manager, TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
@@ -37,7 +40,8 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_window_state::StateFlags;
 
 type HostServerState = Arc<HostServer>;
-type NativePiManagerState = NativePiManager;
+// (T8) The managed `NativePiManager` alias is gone: the signal and exit paths no
+// longer reach for an in-app manager copy, they run `DaemonLink`'s quit flow.
 
 // ─── Tauri Commands ───────────────────────────────────────────────────────────
 
@@ -1491,10 +1495,19 @@ pub struct DaemonLink {
     /// `Some` in embedded mode only: the in-process daemon this app runs.
     pub embedded: Option<Arc<DaemonState>>,
     /// `Some` in external mode only: how this app started/adopted the daemon.
-    #[allow(dead_code)]
     pub manager: Option<Arc<DaemonManager>>,
     /// The daemon's HTTP origin (the WebView's page origin in both modes).
     pub host_origin: String,
+    /// The daemon's private data directory: `instance_path`/`log_path` below
+    /// are derived from it (the quit flow names both).
+    pub data_dir: PathBuf,
+    /// `app_config_dir`: the app-private quit policy (`keepRunningAfterQuit`)
+    /// lives here and is read *at exit*, never by the daemon (spec §3.2.2).
+    pub config_dir: PathBuf,
+    /// The daemon process identity captured at attach (external mode):
+    /// pid + process start time, the only thing the quit flow is allowed to
+    /// signal (plan D12). `None` in embedded mode — there is no other process.
+    pub daemon: Option<ProcessIdentity>,
 }
 
 impl DaemonLink {
@@ -1504,23 +1517,36 @@ impl DaemonLink {
             .map(|link| Arc::clone(&link.mirror))
     }
 
-    /// The app-process half of app exit.
+    /// The daemon's instance file (`<data_dir>/picot-daemon.json`).
+    pub fn instance_path(&self) -> PathBuf {
+        picot_host::daemon::instance::instance_path(&self.data_dir)
+    }
+
+    /// The daemon's log file (`<data_dir>/picot-daemon.log`).
+    fn log_path(&self) -> PathBuf {
+        picot_host::daemon::instance::log_path(&self.data_dir)
+    }
+
+    /// The app-process half of app exit (plan Task 8 Step 2 / D12).
     ///
-    /// External: disconnect the admin channel only — the daemon keeps running,
-    /// and dropping the socket is exactly what makes the daemon run its
-    /// dead-attachment cleanup (plan D11). The quit *policy* (keepRunning,
-    /// confirmed exit, signal tiers) arrives with T8; this interim behaviour is
-    /// recorded in ARCHITECTURE.
+    /// External: `keepRunningAfterQuit=true` releases the admin channel only —
+    /// dropping the socket is what triggers the daemon's dead-attachment
+    /// cleanup, and the daemon plus its resident runtimes keep running. With the
+    /// default `false`, the daemon is stopped and the app waits for a
+    /// **confirmed** death (pid + start time; SIGTERM → SIGKILL on the ladder)
+    /// before it lets the process go.
     ///
-    /// Embedded: the daemon is this process, so exit drains it through the same
-    /// `shutdown_graceful` the standalone binary's signal path uses.
-    fn on_app_exit(&self) {
-        match self.mode {
-            DaemonMode::External => {
-                log::info!("[picot] exiting: detaching from the Picot daemon (it keeps running)");
-                self.client.disconnect();
-            }
-            DaemonMode::Embedded => {
+    /// Embedded: the daemon *is* this process, so it drains here through the
+    /// same `shutdown_graceful` the standalone binary's signal path uses.
+    fn shutdown(&self) -> QuitOutcome {
+        let action = quit_policy::quit_action(
+            // Read *at exit* (spec §3.2.2): a toggle flipped during the session
+            // applies to the next quit, never to the daemon's current life.
+            quit_policy::keep_running_after_quit(&self.config_dir),
+            self.mode == DaemonMode::Embedded,
+        );
+        match action {
+            quit_policy::QuitAction::EmbeddedDrain => {
                 if let Some(state) = self.embedded.as_ref() {
                     // The exit path runs on the main thread; the drain is async
                     // (runtimes, terminals, watches, the child registry, the
@@ -1528,8 +1554,49 @@ impl DaemonLink {
                     // as startup drives the async boot.
                     tauri::async_runtime::block_on(state.shutdown_graceful("app exit"));
                 }
+                QuitOutcome::EmbeddedShutdown
             }
+            quit_policy::QuitAction::DetachOnly => {
+                log::info!(
+                    "[picot] exiting: keepRunningAfterQuit — detaching; the daemon and its agents keep running"
+                );
+                self.client.disconnect();
+                QuitOutcome::Detached
+            }
+            quit_policy::QuitAction::StopAndConfirm => self.stop_and_confirm(),
         }
+    }
+
+    /// Default external exit: stop the daemon, then block on a **confirmed**
+    /// death (plan D12). Only a verified identity is waited on or signalled.
+    fn stop_and_confirm(&self) -> QuitOutcome {
+        let Some(identity) = self.daemon.clone() else {
+            // No verified process identity was captured (the daemon is not this
+            // app's to signal): releasing the channel is all that is safe.
+            log::warn!(
+                "[picot] exiting: no verified daemon identity; releasing the admin channel only"
+            );
+            self.client.disconnect();
+            return QuitOutcome::Detached;
+        };
+        let flow = quit_policy::QuitFlow::new(
+            Arc::new(quit_policy::AdminStopRequester::new(Arc::clone(
+                &self.client,
+            ))),
+            ExitWaiter::new(),
+            identity,
+            self.manager
+                .as_ref()
+                .and_then(|manager| manager.take_child()),
+            self.instance_path(),
+            self.log_path(),
+            quit_policy::QUIT_CONFIRM_DEADLINE,
+        );
+        let outcome = tauri::async_runtime::block_on(flow.run());
+        // The daemon is gone (or unconfirmed): either way the app's channel is
+        // done, and closing it deliberately keeps the next attach clean.
+        self.client.disconnect();
+        outcome
     }
 }
 
@@ -1572,6 +1639,9 @@ enum AttachedDaemon {
         embedded: Option<Arc<DaemonState>>,
         client: Arc<AdminClient>,
         host_origin: String,
+        /// The daemon process identity (external mode): what the quit flow is
+        /// allowed to wait on and signal. `None` in embedded mode.
+        daemon: Option<ProcessIdentity>,
     },
     /// Another live Picot app manages this daemon (plan Task 4 policy).
     BlockedByOtherApp,
@@ -1611,11 +1681,16 @@ async fn attach_external_daemon(
         file.host_origin,
         file.admin_origin
     );
+    // The identity the quit path will wait on and (worst case) signal: pid plus
+    // the start time the daemon itself published, so a reused pid is never
+    // mistaken for this daemon (plan D12).
+    let daemon = ProcessIdentity::new(file.pid, file.process_start_time.clone());
     Ok(AttachedDaemon::Ready {
         manager: Some(manager),
         embedded: None,
         client,
         host_origin: file.host_origin,
+        daemon: Some(daemon),
     })
 }
 
@@ -1672,6 +1747,9 @@ async fn start_embedded_daemon(
         embedded: Some(state),
         client,
         host_origin,
+        // Embedded: the daemon is this process, so there is no second process
+        // for the quit flow to confirm or signal.
+        daemon: None,
     })
 }
 
@@ -1732,8 +1810,8 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
     log::info!("[picot] daemon mode {mode:?} (PICOT_DAEMON)");
     let attached = match mode {
         DaemonMode::External => tauri::async_runtime::block_on(attach_external_daemon(
-            data_dir,
-            config_dir,
+            data_dir.clone(),
+            config_dir.clone(),
             static_dir,
             bundle_identifier,
             executor,
@@ -1741,15 +1819,15 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         ))?,
         DaemonMode::Embedded => tauri::async_runtime::block_on(start_embedded_daemon(
             app,
-            data_dir,
-            config_dir,
+            data_dir.clone(),
+            config_dir.clone(),
             static_dir,
             bundle_identifier,
             executor,
             Arc::clone(&mirror),
         ))?,
     };
-    let (manager, embedded, client, host_origin) = match attached {
+    let (manager, embedded, client, host_origin, daemon) = match attached {
         AttachedDaemon::BlockedByOtherApp => {
             // The dialog blocks and the process exits non-zero: a second Picot
             // must not fight the first for the daemon's lease. `None` resolves
@@ -1761,7 +1839,8 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
             embedded,
             client,
             host_origin,
-        } => (manager, embedded, client, host_origin),
+            daemon,
+        } => (manager, embedded, client, host_origin, daemon),
     };
     // The landing owner: no registered workspace, placeholder home cwd. Minted
     // over the admin channel in both modes, so the mirror learns its origin
@@ -1788,6 +1867,9 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         embedded,
         manager,
         host_origin: host_origin.clone(),
+        data_dir,
+        config_dir,
+        daemon,
     });
     // Startup default is disabled (the first window is the landing); recompute
     // once now that the window exists. No-op wherever no menu bar is installed.
@@ -2351,33 +2433,165 @@ fn main() {
         .invoke_handler(tauri::generate_handler![])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle: &tauri::AppHandle, event| {
-            if let tauri::RunEvent::Ready = event {
-                install_termination_handlers(app_handle.clone());
-            }
-            if let tauri::RunEvent::Exit = event {
-                // The mode decides what app exit means (plan Task 5 Step 3): the
-                // embedded daemon is this process and drains here; the external
-                // one owns its own lifetime, so the app only detaches. The
-                // accepted/completed separation and the keepRunning policy are
-                // T8's.
-                match app_handle.try_state::<DaemonLink>() {
-                    Some(link) => link.on_app_exit(),
-                    // No daemon link (boot failed before startup finished):
-                    // nothing daemon-side to tear down.
-                    None => child_supervision::clear_registry(),
+        .run(|app_handle: &tauri::AppHandle, event| match event {
+            tauri::RunEvent::Ready => install_termination_handlers(app_handle.clone()),
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                if code == Some(tauri::RESTART_EXIT_CODE) {
+                    // An app restart (the updater's relaunch surface op) is not a
+                    // quit: the daemon is left alone — the replacement app
+                    // instance adopts it, or version-stops it — and the state
+                    // machine is resolved so the `RunEvent::Exit` that follows
+                    // does not stop it either. `prevent_exit` would be a no-op
+                    // here anyway (tauri ignores it for this code).
+                    log::info!(
+                        "[picot] app restart requested; detaching without stopping the daemon"
+                    );
+                    if let Some(link) = app_handle.try_state::<DaemonLink>() {
+                        link.client.disconnect();
+                    }
+                    QUIT_STATE.store(2, Ordering::SeqCst);
+                    return;
+                }
+                // The "all windows closed" / explicit `app.exit` path (plan Task 8
+                // Step 2): hold the exit while the daemon is stopped, and show the
+                // "stopping" splash — which requires the run loop to stay alive,
+                // so the transaction itself runs on a detached thread that exits
+                // the app when it is done.
+                //
+                // NOTE: macOS ⌘Q does *not* arrive here. The predefined Quit menu
+                // item is a nil-targeted `terminate:` selector (muda), so AppKit
+                // terminates the app and tauri only ever sees `RunEvent::Exit`
+                // (tao's `applicationWillTerminate` → `LoopDestroyed`). Both paths
+                // run the same idempotent flow; only this one can paint.
+                if !quit_flow_started() {
+                    api.prevent_exit();
+                    show_quit_splash(app_handle);
+                    spawn_quit_flow(app_handle.clone());
                 }
             }
+            tauri::RunEvent::Exit => {
+                // ⌘Q, and the re-entered exit the splash path triggers. The mode
+                // decides what app exit means: the embedded daemon is this
+                // process and drains here; the external one is stopped and its
+                // death *confirmed* by pid + start time, or only detached when
+                // `keepRunningAfterQuit` is on (plan D12/T8).
+                run_app_exit_flow(app_handle);
+            }
+            _ => {}
         });
+}
+
+/// The quit flow's process-global state (plan Task 8 Step 2's "idempotent"
+/// requirement): `0` idle, `1` running, `2` resolved. Two triggers arriving at
+/// once — ⌘Q racing `RunEvent::ExitRequested`, or a signal racing either — must
+/// produce exactly one drain.
+static QUIT_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// `true` once the flow has been started (running or resolved): the splash path
+/// must not `prevent_exit` a second time, or the app could never leave.
+fn quit_flow_started() -> bool {
+    QUIT_STATE.load(Ordering::SeqCst) != 0
+}
+
+/// How long a signal-triggered teardown may take before the app gives up and
+/// exits anyway: the waiter's 10s deadline plus two 2s escalation steps, with
+/// slack. The registry is deliberately **not** cleared on this path: whatever
+/// the teardown never reached must stay recorded for the next launch's sweep.
+const SIGNAL_TEARDOWN_GRACE: Duration = Duration::from_secs(20);
+
+/// Run the quit transaction on a detached thread, then exit. Used by the
+/// splash path, which keeps the run loop servicing the splash window while the
+/// daemon is being stopped.
+fn spawn_quit_flow(app_handle: AppHandle) {
+    if QUIT_STATE
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        // The exit was already prevented, so a panic in here would leave Picot
+        // showing the splash until it is force-quit: resolve and exit whatever
+        // the flow did.
+        let ran =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_shutdown(&app_handle)));
+        if ran.is_err() {
+            log::error!("[picot] the app exit flow panicked; exiting anyway");
+        }
+        QUIT_STATE.store(2, Ordering::SeqCst);
+        app_handle.exit(0);
+    });
+}
+
+/// The app-exit flow, idempotent across every trigger (plan Task 8 Step 2).
+fn run_app_exit_flow(app_handle: &AppHandle) {
+    if QUIT_STATE
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        run_shutdown(app_handle);
+        QUIT_STATE.store(2, Ordering::SeqCst);
+        return;
+    }
+    // Already running elsewhere (the splash path) or done: wait for the resolved
+    // state instead of draining twice.
+    let started = std::time::Instant::now();
+    while QUIT_STATE.load(Ordering::SeqCst) != 2 {
+        if started.elapsed() > SIGNAL_TEARDOWN_GRACE {
+            log::warn!("[picot] app exit flow did not resolve in time; exiting anyway");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// One shutdown, whatever the trigger. A boot failure (no `DaemonLink`) still
+/// clears the pi runtime registry, exactly as the pre-T8 exit path did.
+fn run_shutdown(app_handle: &AppHandle) {
+    match app_handle.try_state::<DaemonLink>() {
+        Some(link) => log::info!("[picot] app exit resolved: {:?}", link.shutdown()),
+        None => child_supervision::clear_registry(),
+    }
+}
+
+/// The borderless "stopping" splash (plan Task 8 Step 2 implementation-time
+/// decision: a prebuilt single-file page, so nothing has to load from the daemon
+/// that is being stopped). Best effort: a failure to show it must never block or
+/// break the quit flow.
+fn show_quit_splash(app_handle: &AppHandle) {
+    if let Some(existing) = app_handle.get_webview_window("quit-splash") {
+        let _ = existing.show();
+        return;
+    }
+    let built = WebviewWindowBuilder::new(
+        app_handle,
+        "quit-splash",
+        WebviewUrl::App("daemon-stopping.html".into()),
+    )
+    .title("Picot")
+    .inner_size(360.0, 132.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .center()
+    .build();
+    if let Err(error) = built {
+        log::warn!("[picot] could not show the stopping splash: {error}");
+    }
 }
 
 /// Tear runtimes down on the signals that otherwise skip `RunEvent::Exit`
 /// entirely: Ctrl-C under `tauri dev`, a logout or shutdown (SIGTERM), and a
 /// closing terminal (SIGHUP). SIGKILL cannot be caught — the startup sweep
-/// exists for that case.
+/// exists for that case (spec §3.5's signal tiers).
+///
+/// All three signals run the **same** app-exit flow as ⌘Q (plan Task 8 Step 2):
+/// external + `keepRunningAfterQuit=false` stops the daemon and waits for a
+/// confirmed death, external + `true` only detaches, embedded drains in place.
 #[cfg(unix)]
 fn install_termination_handlers(app_handle: tauri::AppHandle) {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
@@ -2395,23 +2609,25 @@ fn install_termination_handlers(app_handle: tauri::AppHandle) {
             if stream.recv().await.is_none() {
                 return;
             }
-            // Tear down on a detached thread and put a deadline on this
-            // handler: `stop_for_app_exit` waits on children that ignore
-            // SIGTERM, and the default disposition of these signals is already
-            // taken over — blocking here would leave Picot answering nothing but
-            // SIGKILL. The registry is intentionally NOT cleared on the timeout
-            // path: any runtime the teardown never reached must stay recorded so
-            // the next launch can sweep it.
+            // Run the exit flow on a detached thread and put a deadline on this
+            // handler: the flow waits on a daemon that may ignore SIGTERM, and
+            // the default disposition of these signals is already taken over —
+            // blocking here would leave Picot answering nothing but SIGKILL.
+            // The registry is intentionally NOT cleared on the timeout path: any
+            // runtime the teardown never reached must stay recorded so the next
+            // launch can sweep it.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             let teardown = app_handle.clone();
             std::thread::spawn(move || {
-                if let Some(manager) = teardown.try_state::<NativePiManagerState>() {
-                    manager.stop_for_app_exit();
-                }
-                child_supervision::clear_registry();
-                std::process::exit(0);
+                run_app_exit_flow(&teardown);
+                let _ = done_tx.send(());
             });
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            log::warn!("[picot-native] teardown exceeded its grace period; exiting");
+            if tokio::time::timeout(SIGNAL_TEARDOWN_GRACE, done_rx)
+                .await
+                .is_err()
+            {
+                log::warn!("[picot-native] teardown exceeded its grace period; exiting");
+            }
             std::process::exit(0);
         });
     }

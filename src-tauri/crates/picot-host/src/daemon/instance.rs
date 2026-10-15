@@ -201,6 +201,27 @@ pub fn write_atomic_with(
     file: &InstanceFile,
     on_temp_created: impl FnOnce(&Path),
 ) -> Result<(), String> {
+    let encoded = serde_json::to_vec(file)
+        .map_err(|error| format!("cannot encode the instance file: {error}"))?;
+    publish_atomic(path, &encoded, on_temp_created)
+}
+
+/// Publish already-encoded private bytes atomically, with the same discipline
+/// as [`write_atomic`]: temp created 0600 **at creation**, parent forced 0700,
+/// synced, renamed over the destination, no `.tmp` survives a failure.
+///
+/// The app's own private state files (e.g. its quit policy in `app_config_dir`)
+/// use this, so the owner-only / atomic-publish discipline has exactly one
+/// implementation.
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    publish_atomic(path, bytes, |_| {})
+}
+
+fn publish_atomic(
+    path: &Path,
+    encoded: &[u8],
+    on_temp_created: impl FnOnce(&Path),
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
@@ -219,9 +240,7 @@ pub fn write_atomic_with(
         Err(error) => return Err(format!("cannot create {}: {error}", temp.display())),
     };
     on_temp_created(&temp);
-    let encoded = serde_json::to_vec(file)
-        .map_err(|error| format!("cannot encode the instance file: {error}"))?;
-    let written = handle.write_all(&encoded).and_then(|()| handle.sync_all());
+    let written = handle.write_all(encoded).and_then(|()| handle.sync_all());
     if let Err(error) = written {
         drop(handle);
         let _ = std::fs::remove_file(&temp);
@@ -850,5 +869,31 @@ mod tests {
             .read_to_string(&mut raw)
             .expect("read");
         assert!(raw.contains("\"adminToken\":\"token-eight\""), "{raw}");
+    }
+
+    /// The generic bytes writer (added for the app's private quit-policy file)
+    /// holds the very same discipline: owner-only at creation, no `.tmp`
+    /// left behind, and the exact bytes published.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_bytes_publishes_owner_only_and_leaves_no_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("config");
+        let path = dir.join("app-private-settings.json");
+        write_atomic_bytes(&path, br#"{"someAppSetting":true}"#).expect("publish");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"someAppSetting":true}"#,
+            "the published bytes are the encoded document"
+        );
+        assert_eq!(mode_of(&path), 0o600, "the document is owner-only");
+        assert_eq!(mode_of(&dir), 0o700, "the parent directory is owner-only");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .tmp may survive: {leftovers:?}");
     }
 }
