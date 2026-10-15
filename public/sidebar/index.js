@@ -1279,7 +1279,12 @@ export class SessionSidebar {
     }
     // The stopped runtime drops out of the inventory, so this reload clears the
     // row's live sessions; the notice names what was stopped.
-    await this.refresh({ workspacePath: workspace.path });
+    try {
+      await this.refresh({ workspacePath: workspace.path });
+    } catch (error) {
+      // A reload failure must not swallow the outcome the user just confirmed.
+      console.error("[Sidebar] refresh after workspace stop failed:", error);
+    }
     this.onSessionNotice?.(
       t("sidebar.stopWorkspaceStopped", { workspace: workspaceName, count: live.length }),
     );

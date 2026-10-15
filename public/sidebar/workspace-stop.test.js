@@ -236,6 +236,25 @@ describe("sidebar workspace stop entry", () => {
     expect(notices).toContain(EN_SIDEBAR_STOP.stopWorkspaceFailed);
   });
 
+  test("a reload failure after the stop still reports what was stopped", async () => {
+    const { sidebar, notices } = await makeSidebar({ instances: [RUNNING_ON_BETA] });
+    await sidebar.loadSessions();
+    const beta = sidebar.projects.find((project) => project.workspaceId === "ws:uuid-2");
+    sidebar.refresh = vi.fn(async () => {
+      throw new Error("reload failed");
+    });
+
+    stopItem(sidebar, beta).click();
+    await flush();
+    document.querySelector(".sidebar-confirm-yes").click();
+    await flush();
+    await flush();
+
+    expect(notices).toContain(
+      "Stopped 1 running runtime(s) in “beta”. Reopen the session to start a new one.",
+    );
+  });
+
   test("a workspace with no runtime offers no stop entry even from a direct call", async () => {
     const { sidebar, transport } = await makeSidebar({ instances: [] });
     await sidebar.loadSessions();
