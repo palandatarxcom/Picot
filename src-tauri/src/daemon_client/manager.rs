@@ -184,19 +184,29 @@ pub fn resolve_daemon_binary() -> PathBuf {
 /// testable in one binary (the dev path cannot be reached at runtime from a
 /// release test and vice versa).
 ///
-/// `exe_dir` is the directory holding the running app executable
-/// (`std::env::current_exe()`). When it cannot be read — a stripped-down
-/// environment — the bare file name is the last resort, resolved through
-/// `PATH`; that lookup failing surfaces as a spawn error naming the binary
-/// rather than as silence.
-fn resolve_daemon_binary_in(exe_dir: Option<&Path>, dev: bool) -> PathBuf {
+/// `exe` is the running app **executable** (`std::env::current_exe()`), the same
+/// value the caller passes — taking the file rather than its directory is what
+/// makes the release path testable against production's argument. The sidecar
+/// sits beside that executable (`<exe dir>/picot-daemon`, the bundler's
+/// `externalBin` destination). When the exe path cannot be read — a stripped-down
+/// environment, or a bare relative name with no directory part — the bare file
+/// name is the last resort, resolved through `PATH`; that lookup failing surfaces
+/// as a spawn error naming the binary rather than as silence.
+///
+/// Regression guard: the first implementation declared this parameter
+/// `exe_dir` and joined the binary onto it, while the caller passed
+/// `current_exe()` *itself*. Release then resolved
+/// `…/Contents/MacOS/picot/picot-daemon` → `Not a directory (os error 20)` on
+/// every spawn. The dev branch never touches `exe`, so only the packaged app
+/// could have caught it — a DMG run did.
+fn resolve_daemon_binary_in(exe: Option<&Path>, dev: bool) -> PathBuf {
     if dev {
         return PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("debug")
             .join(DAEMON_BINARY_NAME);
     }
-    exe_dir
+    exe.and_then(Path::parent)
         .map(|dir| dir.join(DAEMON_BINARY_NAME))
         .unwrap_or_else(|| PathBuf::from(DAEMON_BINARY_NAME))
 }
@@ -1587,15 +1597,32 @@ mod tests {
     /// The release sidecar (plan Task 11 Step 2): the bundler copies
     /// `binaries/picot-daemon-<target-triple>` next to the app executable and
     /// drops the triple suffix, so the sidecar is `Contents/MacOS/picot-daemon`.
+    ///
+    /// The argument is `current_exe()` — the **file** — because that is exactly
+    /// what [`resolve_daemon_binary`] passes. Handing this helper a directory
+    /// instead is what hid the `Not a directory` spawn failure from the suite.
     #[test]
     fn the_release_daemon_binary_is_the_sidecar_beside_the_app_executable() {
         let resolved = resolve_daemon_binary_in(
-            Some(Path::new("/Applications/Picot.app/Contents/MacOS")),
+            Some(Path::new("/Applications/Picot.app/Contents/MacOS/picot")),
             false,
         );
         assert_eq!(
             resolved,
             PathBuf::from("/Applications/Picot.app/Contents/MacOS/picot-daemon")
+        );
+    }
+
+    /// The same resolution when the app runs out of a DMG or a temp copy: no
+    /// dependency on `/Applications`, just the executable's own directory.
+    #[test]
+    fn the_release_sidecar_follows_the_executable_wherever_it_runs_from() {
+        assert_eq!(
+            resolve_daemon_binary_in(
+                Some(Path::new("/tmp/smoke/Picot.app/Contents/MacOS/picot")),
+                false
+            ),
+            PathBuf::from("/tmp/smoke/Picot.app/Contents/MacOS/picot-daemon")
         );
     }
 
@@ -1606,6 +1633,12 @@ mod tests {
     fn the_release_path_without_an_exe_dir_falls_back_to_the_bare_name() {
         assert_eq!(
             resolve_daemon_binary_in(None, false),
+            PathBuf::from(DAEMON_BINARY_NAME)
+        );
+        // A bare relative exe name has no directory part either (`parent()` is
+        // `Some("")`): join the name, not an empty path.
+        assert_eq!(
+            resolve_daemon_binary_in(Some(Path::new(DAEMON_BINARY_NAME)), false),
             PathBuf::from(DAEMON_BINARY_NAME)
         );
     }
