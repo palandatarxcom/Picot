@@ -1,5 +1,5 @@
 // ABOUTME: Boot test for DaemonState::start — a headless daemon with no Tauri objects.
-// ABOUTME: Task 2 Step 1 (red until Step 3 moves setup_native_runtime's construction in).
+// ABOUTME: Task 2 Step 1's red test; green since Step 3 moved setup_native_runtime's construction in.
 
 //! The daemon must be able to run the whole host stack with **no app process
 //! at all**: that is the Phase 1 premise (plan D1/D2, ARCHITECTURE process
@@ -17,8 +17,10 @@
 //! can be constructed. The recording surface makes "boot does not *use* the
 //! app" explicit on top of that.
 //!
-//! RED STATE: `DaemonState`/`DaemonConfig` do not exist yet (Task 2 Steps 2–3
-//! land them, Task 2 Step 0 landed only the `AppSurface` inventory + trait).
+//! GREEN STATE: `DaemonState::start` (Task 2 Step 3) owns the construction, so
+//! this test boots the real host stack from the four argv fields alone. It went
+//! red-to-green in Step 3 without a single change to its assertions — nothing
+//! in it was relaxed to make the move pass.
 //!
 //! The `DaemonConfig` field set is the daemon's argv surface (plan D7:
 //! `--data-dir --config-dir --static-dir --bundle-identifier`); Step 3 may add

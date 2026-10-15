@@ -1,10 +1,10 @@
-// ABOUTME: Daemon-side state ownership: DaemonState, the app-surface seam, and (T3+) admin/instance.
-// ABOUTME: Step 2 of plan Task 2 lands the state object and the dispatcher extraction; `DaemonState::start` follows in Step 3.
+// ABOUTME: Daemon-side state ownership: DaemonState::start, the app-surface seam, and (T3+) admin/instance.
+// ABOUTME: Step 3 of plan Task 2 moved `setup_native_runtime`'s construction in here; the app keeps only app-only state.
 
 //! Phase 1 (2026-10-15) moves the whole host stack out of the Tauri main
 //! process (plan D1/D2). This module owns what `setup_native_runtime`
-//! (main.rs:2049–2264) built in the app process and what the control
-//! dispatcher needs to reach.
+//! (main.rs, pre-T2) built in the app process and what the control dispatcher
+//! needs to reach.
 //!
 //! Landed so far:
 //!
@@ -13,36 +13,64 @@
 //!   every row maps onto (Task 2 Step 0).
 //! - [`DaemonState`] — the explicit Arc set the dispatcher reads, replacing
 //!   every `app.try_state::<T>()` lookup (Task 2 Step 2, inventory rows
-//!   D1–D4). The *construction* still lives in the app package for this step:
-//!   the app builds `DaemonState` in-process and passes a `TauriAppSurface`
-//!   directly (embedded form; the admin channel arrives in T3).
+//!   D1–D4).
+//! - [`DaemonState::start`] + [`DaemonConfig`] + [`DaemonState::shutdown_graceful`]
+//!   (Task 2 Step 3): the whole host stack is constructed here from the argv
+//!   surface alone, so a process with no app at all can boot it. The app still
+//!   calls it in-process and hands over a `TauriAppSurface` (embedded form;
+//!   T3 swaps in the admin-channel realization, T4 makes the binary use it).
 //!
 //! Not landed yet (tracked by the plan, not placeholders):
 //!
-//! - `DaemonConfig` + `DaemonState::start` + `shutdown_graceful` (Task 2
-//!   Steps 3–4): the construction move, the headless boot path, and the
-//!   instance file that the Step-1 red test (`tests/daemon_boot.rs`) pins.
-//! - `admin` (Task 3) and `instance` (Task 4).
+//! - `admin` (Task 3) and `instance` (Task 4) — the instance file, the lock and
+//!   the confirmed-exit accounting that `shutdown_graceful` hands to T4.
 
 pub mod app_surface;
 
 use crate::daemon::app_surface::AppSurface;
 use crate::environment_install;
+use crate::ephemeral_registry::EphemeralRegistry;
 use crate::git_service::GitService;
 use crate::host_control::HostEventSink;
-use crate::host_ephemeral::SharedEphemeralHub;
-use crate::host_server::HostServer;
-use crate::metadata_store::SharedMetadataStore;
+use crate::host_ephemeral::{EphemeralHub, SharedEphemeralHub};
+use crate::host_server::{self, HostServer};
+use crate::metadata_store::{MetadataStore, SharedMetadataStore};
 use crate::native_pi_manager::NativePiManager;
+use crate::officecli_watch::OfficecliWatchRuntime;
+use crate::remote_auth::RemoteAuth;
 use crate::session_ui_profile_store::SessionUiProfileStore;
 use crate::skill_source_registry::SkillSourceRegistry;
+use crate::terminal_manager::TerminalManager;
+use crate::terminal_registry::TerminalRegistry;
+use crate::terminal_state_store::TerminalStateStore;
 use crate::window_owner::WindowOwnerRegistry;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The app package no longer holds the per-process skill-install secret: its
 /// only readers were dispatcher rows D2, which now read this field.
 pub use crate::host_control_dispatch::HostInstallSecret;
+
+/// The daemon's argv surface (plan D7): everything [`DaemonState::start`]
+/// needs that is not the app surface.
+///
+/// Mirrors the `picot-daemon` flags `--data-dir / --config-dir / --static-dir
+/// / --bundle-identifier`, so the embedded (T2) and the external (T4/T5) form
+/// boot the same host stack through one code path.
+pub struct DaemonConfig {
+    /// The daemon's private data directory: the SQLite metadata store, the
+    /// terminal state store, and the session-UI profile file all live here.
+    pub data_dir: PathBuf,
+    /// The daemon's config directory. Part of the argv contract; the host
+    /// stack does not read it yet (T4's instance file lives under `data_dir`).
+    pub config_dir: PathBuf,
+    /// The WebView static bundle (`index.html` + hashed assets) to serve.
+    pub static_dir: PathBuf,
+    /// The running build's bundle identifier, published for OS notifications
+    /// (`host_server::set_notification_bundle_identifier`) because the host
+    /// server cannot see the app's Tauri config.
+    pub bundle_identifier: String,
+}
 
 /// Everything the control dispatcher needs that is *not* the app surface.
 ///
@@ -50,8 +78,9 @@ pub use crate::host_control_dispatch::HostInstallSecret;
 /// lookups it replaces (D1–D4) and the Arc set the dispatcher was already
 /// handed as parameters (`runtimes`, `metadata`, `owner_registry`, `git`,
 /// `session_ui_profiles`, the ephemeral hub, the host server handle, the event
-/// sink). Fields are public on purpose: the app package constructs the object
-/// until Step 3 moves that construction into `DaemonState::start`.
+/// sink). Fields are public because the app package reads them to register its
+/// own managed state (the window-lifecycle and exit paths still look these up
+/// through the app handle — those readers are outside the dispatcher).
 ///
 /// No `AdminServer` field yet — T3 adds it together with the admin channel.
 pub struct DaemonState {
@@ -83,7 +112,196 @@ pub struct DaemonState {
     /// (row A1). `Err` carries the reason every install op reports; the app's
     /// `RunEvent::Exit` keeps its own managed-state copy for teardown.
     pub environment_installer: Result<Arc<environment_install::Installer>, String>,
+    /// Ephemeral runtime records (the app's window-destroyed teardown reads
+    /// this through its app handle).
+    pub ephemeral_registry: Arc<EphemeralRegistry>,
+    /// Owner terminals (the app's window-destroyed teardown and its exit path
+    /// kill them through the app handle).
+    pub terminals: Arc<TerminalManager>,
+    /// The officecli watch subprocess pool behind browser panes (the app's
+    /// exit path stops it through the app handle).
+    pub officecli_watches: Arc<OfficecliWatchRuntime>,
     /// The app-process surface (rows A2–A12). A headless daemon supplies the
     /// admin-channel forwarding realization (T3/T5).
     pub app_surface: Arc<dyn AppSurface>,
+}
+
+impl DaemonState {
+    /// Build the whole host stack headless: metadata, runtimes, git, terminals,
+    /// the host server (which binds its loopback listener here), the owner
+    /// registry, the ephemeral hub and the installer resolver.
+    ///
+    /// This is `setup_native_runtime` minus the three things that are the
+    /// app's by the Step-3 exception list: the browser panes (constructed
+    /// app-side, registered afterwards through
+    /// `host.set_browser_panes`), the landing owner + window, and the
+    /// `app.manage` of app-only state. Nothing here touches the app surface —
+    /// [`AppSurface`] is required by the control dispatcher, never by
+    /// construction (pinned by `tests/daemon_boot.rs`).
+    pub async fn start(
+        cfg: DaemonConfig,
+        app_surface: Arc<dyn AppSurface>,
+    ) -> Result<Self, String> {
+        let data_dir = cfg.data_dir.clone();
+        let metadata_path = data_dir.join("picot.sqlite3");
+        let shared_metadata = Arc::new(Mutex::new(MetadataStore::open(&metadata_path)?));
+        // Q8 self-heal: when the PATH toggle is on, re-verify the managed
+        // marker after upgrades or app moves and refresh a stale path.
+        // Release-only and advisory: a failure logs and never blocks startup.
+        {
+            let metadata = shared_metadata.clone();
+            let static_dir_for_heal = cfg.static_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let enabled = metadata
+                    .lock()
+                    .ok()
+                    .and_then(|store| store.pref_get(crate::pi_path::PREF_KEY).ok().flatten())
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if !enabled || cfg!(debug_assertions) {
+                    return;
+                }
+                match crate::pi_path::bundled_pi_dir(&static_dir_for_heal) {
+                    Ok(pi_dir) => {
+                        #[cfg(target_os = "windows")]
+                        let outcome = crate::pi_path::apply_windows(&pi_dir.to_string_lossy());
+                        #[cfg(not(target_os = "windows"))]
+                        let outcome = std::env::var("SHELL")
+                            .ok()
+                            .and_then(|shell| dirs::home_dir().map(|home| (home, shell)))
+                            .map(|(home, shell)| {
+                                crate::pi_path::apply_posix(
+                                    &home,
+                                    &shell,
+                                    &pi_dir.to_string_lossy(),
+                                )
+                            })
+                            .unwrap_or_else(|| Err("SHELL or home directory unavailable".into()));
+                        if let Err(message) = outcome {
+                            log::warn!("pi path self-heal skipped: {message}");
+                        }
+                    }
+                    Err(message) => log::warn!("pi path self-heal skipped: {message}"),
+                }
+            });
+        }
+        // Cold start creates NO default workspace, NO session target, and NO Pi
+        // runtime. The registry is untouched; the landing page is the first
+        // view (the landing owner is the app's, see the Step-3 exception list).
+        let runtimes = NativePiManager::new(256);
+        let remote_auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&shared_metadata))));
+        let ephemeral_registry = Arc::new(EphemeralRegistry::default());
+        runtimes.set_ephemeral_registry(ephemeral_registry.clone());
+        // Keep one native host-control authority. Host-origin v2 dispatch
+        // invokes this same handler; it must not grow a parallel OS-control
+        // implementation.
+        let skill_sources = Arc::new(SkillSourceRegistry::new());
+        let git = Arc::new(GitService::new());
+        let terminals = Arc::new(TerminalManager::new(
+            TerminalRegistry::new(15),
+            TerminalStateStore::new(data_dir.join("terminal")),
+        ));
+        let session_ui_profiles = Arc::new(SessionUiProfileStore::open(
+            data_dir.join("session-ui-profiles.json"),
+        )?);
+        let host = Arc::new(
+            HostServer::start(
+                cfg.static_dir.clone(),
+                runtimes.clone(),
+                remote_auth,
+                Arc::clone(&shared_metadata),
+            )
+            .await?,
+        );
+        // OS notifications attribute to the running build's own bundle
+        // identifier (picot / picot.dev / picot.internal): the host server
+        // cannot see the Tauri config (or the daemon argv), so publish it here.
+        host_server::set_notification_bundle_identifier(cfg.bundle_identifier.clone());
+        // No host.runtime_started() here: that is the OAuth generation bump
+        // tied to a runtime existing, and the landing has none.
+        host.set_terminal_manager(terminals.clone());
+        host.set_git_service(git.clone());
+        let owner_registry = Arc::new(WindowOwnerRegistry::default());
+        host.set_owner_registry(owner_registry.clone());
+        // The officecli watch subprocess pool the browser panes render from
+        // (the panes themselves are the app's; see the Step-3 exception list).
+        let officecli_watches = Arc::new(OfficecliWatchRuntime::new());
+        host.set_officecli_watches(officecli_watches.clone());
+        let host_events = host.event_sink();
+        terminals.set_event_sink({
+            let host_events = host_events.clone();
+            Arc::new(move |owner, event| {
+                host_events.send_owner_event(owner, event);
+            })
+        });
+        // Native ephemeral chats (Side/Quick): one hub owns render-state
+        // reduction, command forwarding, and owner bootstrap delivery.
+        let ephemeral_hub = Arc::new(EphemeralHub::new(
+            ephemeral_registry.clone(),
+            host_events.clone(),
+            cfg.static_dir.clone(),
+        ));
+        ephemeral_hub.spawn_pump(&runtimes);
+        host.set_ephemeral_hub(ephemeral_hub.clone());
+        let environment_installer = crate::pi_launch::resolve_bundled_pi(&cfg.static_dir)
+            .map(|binary| Arc::new(environment_install::Installer::new(binary)))
+            .map_err(|error| format!("the embedded Pi is unavailable: {error}"));
+        Ok(Self {
+            host_events,
+            runtimes,
+            host_origin: host.origin().to_string(),
+            static_dir: cfg.static_dir,
+            metadata: Arc::clone(&shared_metadata),
+            owner_registry,
+            git,
+            session_ui_profiles,
+            ephemeral_hub,
+            skill_sources,
+            install_secret: Arc::new(HostInstallSecret::generate()),
+            host,
+            environment_installer,
+            ephemeral_registry,
+            terminals,
+            officecli_watches,
+            app_surface,
+        })
+    }
+
+    /// Hand the data plane its control handler.
+    ///
+    /// Deliberately *not* part of [`Self::start`]: the handler holds an
+    /// `Arc<DaemonState>` and `DaemonState` holds the host, so installing it
+    /// needs the state to be inside its `Arc` first. The app package does this
+    /// immediately after `start` (embedded form); T4's daemon main does the
+    /// same.
+    pub fn install_control_handler(self: &Arc<Self>) {
+        self.host
+            .set_control_handler(crate::host_control_dispatch::host_control_dispatch(
+                Arc::clone(self),
+            ));
+    }
+
+    /// The host origin every op resolves against (`http://127.0.0.1:<port>`).
+    pub fn origin(&self) -> &str {
+        &self.host_origin
+    }
+
+    /// Stop everything the process owns, in the order the app's `RunEvent::Exit`
+    /// uses: installer, runtimes, terminals, officecli watches, the child
+    /// supervision registry, then the host listener itself.
+    ///
+    /// T4 extends this with the instance file + lock. "Accepted" is not
+    /// "completed" (plan D12): signalling the listener is a request; callers
+    /// that need the process gone confirm by identity, not by this returning.
+    pub async fn shutdown_graceful(self, reason: &str) {
+        log::info!("[picot-daemon] graceful shutdown: {reason}");
+        if let Ok(installer) = self.environment_installer.as_ref() {
+            installer.stop_for_app_exit();
+        }
+        self.runtimes.stop_for_app_exit();
+        self.terminals.kill_all();
+        self.officecli_watches.stop_all();
+        crate::child_supervision::clear_registry();
+        self.host.stop();
+    }
 }

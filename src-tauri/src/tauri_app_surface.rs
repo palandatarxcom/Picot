@@ -29,15 +29,29 @@ use tauri::{AppHandle, Manager};
 
 pub struct TauriAppSurface {
     app: AppHandle,
-    owner_registry: Arc<WindowOwnerRegistry>,
 }
 
 impl TauriAppSurface {
-    pub fn new(app: AppHandle, owner_registry: Arc<WindowOwnerRegistry>) -> Self {
-        Self {
-            app,
-            owner_registry,
-        }
+    /// Step 3: only the app handle. The owner registry is read from the app's
+    /// managed state at call time instead of being captured here — the registry
+    /// is created inside `DaemonState::start`, which needs this surface as its
+    /// argument, and the app manages the same `Arc` right after the call
+    /// returns (before any window — hence any capability — exists).
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+
+    /// The daemon-owned owner registry, read back from the app's managed state.
+    ///
+    /// Step 3 note: `DaemonState::start` creates it and the app manages the
+    /// same `Arc` immediately after, before any window (and therefore any
+    /// capability or pending close) exists — so this lookup cannot lose a race
+    /// in production. A missing registry is "unavailable", never a panic.
+    fn owner_registry(&self) -> Result<Arc<WindowOwnerRegistry>, String> {
+        self.app
+            .try_state::<Arc<WindowOwnerRegistry>>()
+            .map(|state| state.inner().clone())
+            .ok_or_else(|| "owner registry is not available".to_string())
     }
 }
 
@@ -55,7 +69,7 @@ impl AppSurface for TauriAppSurface {
             &self.app,
             host_origin,
             target,
-            self.owner_registry.clone(),
+            self.owner_registry()?,
             OwnerId::from_string(owner.to_string()),
             capability,
         )
@@ -74,12 +88,12 @@ impl AppSurface for TauriAppSurface {
     }
 
     /// Row A10 — settle the approval, then close. The pending map (D4) is
-    /// keyed by owner, which this side resolves from the label the daemon
-    /// looked up from the same registry; the validation results are the ones
-    /// `window_close_approve` already returned.
+    /// keyed by owner: the label the daemon passes is resolved app-side, where
+    /// the registry lives, exactly as the app's own close delegate does. The
+    /// validation results are the ones `window_close_approve` already returned.
     async fn close_window(&self, label: &str, request_id: &str) -> Result<(), String> {
-        let owner = self
-            .owner_registry
+        let registry = self.owner_registry()?;
+        let owner = registry
             .owner_for_label(label)
             .ok_or_else(|| "no pending window close".to_string())?;
         {

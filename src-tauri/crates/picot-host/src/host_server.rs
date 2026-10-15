@@ -209,7 +209,10 @@ struct HostState {
 
 pub struct HostServer {
     origin: String,
-    shutdown: Option<oneshot::Sender<()>>,
+    /// The serve task's stop signal. Behind a mutex (not a plain `Option`) so a
+    /// `&self` caller can request shutdown: the daemon owns `Arc<HostServer>`
+    /// and cannot consume it (`daemon::DaemonState::shutdown_graceful`).
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
     state: Arc<HostState>,
 }
 
@@ -523,7 +526,7 @@ impl HostServer {
         };
         Ok(Self {
             origin: format!("http://{display_address}"),
-            shutdown: Some(shutdown_tx),
+            shutdown: Mutex::new(Some(shutdown_tx)),
             state,
         })
     }
@@ -634,11 +637,20 @@ impl HostServer {
         self.state.host_events.broadcast_native_event(value)
     }
 
-    pub fn stop(mut self) {
-        let _ = self.runtime_stopped();
-        if let Some(shutdown) = self.shutdown.take() {
+    /// Signal the listener to stop. Idempotent, and deliberately not
+    /// synchronous with the listener actually being gone: "accepted" and
+    /// "completed" are separate concerns (plan D12), so a caller that needs the
+    /// port released polls or confirms by process identity.
+    pub fn request_stop(&self) {
+        let sender = self.shutdown.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(shutdown) = sender {
             let _ = shutdown.send(());
         }
+    }
+
+    pub fn stop(&self) {
+        let _ = self.runtime_stopped();
+        self.request_stop();
     }
 }
 
@@ -650,9 +662,7 @@ impl Drop for HostServer {
             .oauth
             .lock()
             .map(|mut oauth| oauth.runtime_stopped());
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+        self.request_stop();
     }
 }
 

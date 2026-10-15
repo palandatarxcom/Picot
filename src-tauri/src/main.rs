@@ -11,28 +11,22 @@ mod browser_pane;
 mod tauri_app_surface;
 
 use picot_host::{
-    child_supervision, environment_install, git_service, host_ephemeral, host_server,
-    officecli_watch, pi_launch, pi_path, window_owner,
+    child_supervision, environment_install, git_service, officecli_watch, window_owner,
 };
 
 use picot_host::ephemeral_registry::EphemeralRegistry;
 use picot_host::host_control::ProgressSink;
 use picot_host::host_server::HostServer;
-use picot_host::metadata_store::MetadataStore;
 use picot_host::native_pi_manager::NativePiManager;
-use picot_host::remote_auth::RemoteAuth;
 use picot_host::runtime_coordinator::RuntimeTarget;
-use picot_host::session_ui_profile_store::SessionUiProfileStore;
 use picot_host::skill_source_registry::SkillSourceRegistry;
 use picot_host::temp_resources::{canonical_temp_root, cleanup_quick_chat_dir};
 use picot_host::terminal_manager::TerminalManager;
-use picot_host::terminal_registry::TerminalRegistry;
-use picot_host::terminal_state_store::TerminalStateStore;
 use picot_host::window_owner::WindowOwnerRegistry;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Manager, TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
@@ -1472,91 +1466,62 @@ fn canonical_home_dir() -> Result<PathBuf, String> {
     fs::canonicalize(&home).map_err(|error| format!("Cannot canonicalize home directory: {error}"))
 }
 
+/// Build the host stack (in the daemon's terms, see `picot_host::daemon`) and
+/// wire the app-only pieces around it.
+///
+/// Task 2 Step 3 moved the construction into `DaemonState::start`: this
+/// function now only supplies the argv surface, registers the app's managed
+/// state, and creates what is the app's by the Step-3 exception list — the
+/// browser panes (registered through the host's `PaneSurface` slot), the
+/// landing owner + window, and the app-only `manage` calls the window-lifecycle
+/// and exit paths read back through the app handle.
 fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(), String> {
-    let metadata_path = app
+    let data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("Cannot resolve Picot app data directory: {error}"))?
-        .join("picot.sqlite3");
-    let shared_metadata = Arc::new(Mutex::new(MetadataStore::open(&metadata_path)?));
-    // Q8 self-heal: when the PATH toggle is on, re-verify the managed marker
-    // after upgrades or app moves and refresh a stale path. Release-only and
-    // advisory: a failure logs and never blocks startup.
-    {
-        let metadata = shared_metadata.clone();
-        let static_dir_for_heal = static_dir.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let enabled = metadata
-                .lock()
-                .ok()
-                .and_then(|store| store.pref_get(pi_path::PREF_KEY).ok().flatten())
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            if !enabled || cfg!(debug_assertions) {
-                return;
-            }
-            match pi_path::bundled_pi_dir(&static_dir_for_heal) {
-                Ok(pi_dir) => {
-                    #[cfg(target_os = "windows")]
-                    let outcome = pi_path::apply_windows(&pi_dir.to_string_lossy());
-                    #[cfg(not(target_os = "windows"))]
-                    let outcome = std::env::var("SHELL")
-                        .ok()
-                        .and_then(|shell| dirs::home_dir().map(|home| (home, shell)))
-                        .map(|(home, shell)| {
-                            pi_path::apply_posix(&home, &shell, &pi_dir.to_string_lossy())
-                        })
-                        .unwrap_or_else(|| Err("SHELL or home directory unavailable".into()));
-                    if let Err(message) = outcome {
-                        log::warn!("pi path self-heal skipped: {message}");
-                    }
-                }
-                Err(message) => log::warn!("pi path self-heal skipped: {message}"),
-            }
-        });
-    }
-    // Cold start creates NO default workspace, NO session target, and NO Pi
-    // runtime. The registry is untouched; the landing page is the first view.
-    let runtimes = NativePiManager::new(256);
-    let remote_auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&shared_metadata))));
-    let ephemeral_registry = Arc::new(EphemeralRegistry::default());
-    runtimes.set_ephemeral_registry(ephemeral_registry.clone());
-    // Keep one native host-control authority. Host-origin v2 dispatch invokes
-    // this same handler; it must not grow a parallel OS-control implementation.
-    let skill_source_registry = Arc::new(SkillSourceRegistry::new());
-    let git_service = Arc::new(git_service::GitService::new());
-    let terminal_state_dir = app
+        .map_err(|error| format!("Cannot resolve Picot app data directory: {error}"))?;
+    let config_dir = app
         .path()
-        .app_data_dir()
-        .map_err(|error| format!("Cannot resolve Picot app data directory: {error}"))?
-        .join("terminal");
-    let terminal_manager = Arc::new(TerminalManager::new(
-        TerminalRegistry::new(15),
-        TerminalStateStore::new(terminal_state_dir),
+        .app_config_dir()
+        .map_err(|error| format!("Cannot resolve Picot app config directory: {error}"))?;
+    let cfg = picot_host::daemon::DaemonConfig {
+        data_dir,
+        config_dir,
+        static_dir: static_dir.clone(),
+        bundle_identifier: app.config().identifier.clone(),
+    };
+    // Embedded form for this task: the app constructs the daemon state in-process
+    // and hands the dispatcher a surface that executes the app-side rows
+    // directly. T3 replaces the surface with the admin-channel realization and
+    // T5 makes the daemon a separate process; neither changes this call's shape.
+    let app_surface = Arc::new(tauri_app_surface::TauriAppSurface::new(
+        app.handle().clone(),
     ));
-    app.manage(skill_source_registry.clone());
-    app.manage(git_service.clone());
-    app.manage(terminal_manager.clone());
-    let session_ui_profiles = Arc::new(SessionUiProfileStore::open(
-        app.path()
-            .app_data_dir()
-            .map_err(|error| format!("Cannot resolve Picot app data directory: {error}"))?
-            .join("session-ui-profiles.json"),
+    let daemon_state = Arc::new(tauri::async_runtime::block_on(
+        picot_host::daemon::DaemonState::start(cfg, app_surface),
     )?);
-    let host = Arc::new(tauri::async_runtime::block_on(HostServer::start(
-        static_dir.clone(),
-        runtimes.clone(),
-        remote_auth,
-        Arc::clone(&shared_metadata),
-    ))?);
-    // OS notifications attribute to the running build's own bundle identifier
-    // (picot / picot.dev / picot.internal) — the host server cannot see the
-    // Tauri config, so publish it once here.
-    host_server::set_notification_bundle_identifier(app.config().identifier.clone());
-    // No host.runtime_started() here: that is the OAuth generation bump tied to
-    // a runtime existing, and the landing has none.
-    host.set_terminal_manager(terminal_manager.clone());
-    let owner_registry = Arc::new(WindowOwnerRegistry::default());
+    daemon_state.install_control_handler();
+    let host = daemon_state.host.clone();
+    let runtimes = daemon_state.runtimes.clone();
+    let owner_registry = daemon_state.owner_registry.clone();
+    app.manage(daemon_state.skill_sources.clone());
+    app.manage(daemon_state.git.clone());
+    app.manage(daemon_state.terminals.clone());
+    if let Ok(installer) = daemon_state.environment_installer.as_ref() {
+        let _ = app.manage(EnvironmentInstaller(installer.clone()));
+    }
+    // Browser panes (spec 2026-09-22): child webviews keyed by tab id. The
+    // runtime needs the app handle, so it is constructed here and registered
+    // with the host through the `PaneSurface` slot (plan D1/Step-3 exceptions).
+    let browser_panes = std::sync::Arc::new(browser_pane::BrowserPaneRuntime::new(
+        app.handle().clone(),
+        host.origin(),
+    ));
+    host.set_browser_panes(browser_panes.clone());
+    app.manage(browser_pane::BrowserPaneState(browser_panes));
+    app.manage(officecli_watch::OfficecliWatchState(
+        daemon_state.officecli_watches.clone(),
+    ));
     // Landing owner: no registered workspace, no runtime. The canonical home
     // path is an owner-record placeholder only — never a workspace identity,
     // workspace scope, or authorization input. The label stays `native-landing`
@@ -1570,66 +1535,6 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         None,
         window_owner::TemporaryKind::Landing,
     )?;
-    host.set_owner_registry(owner_registry.clone());
-    // Browser panes (spec 2026-09-22): child webviews keyed by tab id, plus
-    // the officecli watch subprocess pool they render from.
-    let browser_panes = std::sync::Arc::new(browser_pane::BrowserPaneRuntime::new(
-        app.handle().clone(),
-        host.origin(),
-    ));
-    let officecli_watches = std::sync::Arc::new(officecli_watch::OfficecliWatchRuntime::new());
-    host.set_browser_panes(browser_panes.clone());
-    host.set_officecli_watches(officecli_watches.clone());
-    app.manage(browser_pane::BrowserPaneState(browser_panes));
-    app.manage(officecli_watch::OfficecliWatchState(officecli_watches));
-    let host_events = host.event_sink();
-    terminal_manager.set_event_sink({
-        let host_events = host_events.clone();
-        Arc::new(move |owner, event| {
-            host_events.send_owner_event(owner, event);
-        })
-    });
-    // Native ephemeral chats (Side/Quick): one hub owns render-state
-    // reduction, command forwarding, and owner bootstrap delivery.
-    let ephemeral_hub = Arc::new(host_ephemeral::EphemeralHub::new(
-        ephemeral_registry.clone(),
-        host_events.clone(),
-        static_dir.clone(),
-    ));
-    ephemeral_hub.spawn_pump(&runtimes);
-    host.set_ephemeral_hub(ephemeral_hub.clone());
-    // Task 2 Step 2: the control dispatcher lives in `picot-host` now and reads
-    // daemon state instead of the app handle. The construction stays here for
-    // this step (embedded form); Step 3 moves it into `DaemonState::start` and
-    // T3 replaces `TauriAppSurface` with the admin-channel realization.
-    let environment_installer = pi_launch::resolve_bundled_pi(&static_dir)
-        .map(|binary| Arc::new(environment_install::Installer::new(binary)))
-        .map_err(|error| format!("the embedded Pi is unavailable: {error}"));
-    if let Ok(installer) = environment_installer.as_ref() {
-        let _ = app.manage(EnvironmentInstaller(installer.clone()));
-    }
-    let daemon_state = Arc::new(picot_host::daemon::DaemonState {
-        host_events,
-        runtimes: runtimes.clone(),
-        host_origin: host.origin().to_string(),
-        static_dir: static_dir.clone(),
-        metadata: Arc::clone(&shared_metadata),
-        owner_registry: owner_registry.clone(),
-        git: git_service.clone(),
-        session_ui_profiles,
-        ephemeral_hub,
-        skill_sources: skill_source_registry.clone(),
-        install_secret: Arc::new(picot_host::daemon::HostInstallSecret::generate()),
-        host: host.clone(),
-        environment_installer,
-        app_surface: Arc::new(tauri_app_surface::TauriAppSurface::new(
-            app.handle().clone(),
-            owner_registry.clone(),
-        )),
-    });
-    let control_handler = picot_host::host_control_dispatch::host_control_dispatch(daemon_state);
-    host.set_control_handler(control_handler);
-    host.set_git_service(git_service.clone());
     open_native_landing_window(
         app.handle(),
         host.origin(),
@@ -1644,7 +1549,7 @@ fn setup_native_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
     app.manage(runtimes);
     app.manage(host.clone());
     app.manage(owner_registry);
-    app.manage(ephemeral_registry);
+    app.manage(daemon_state.ephemeral_registry.clone());
     Ok(())
 }
 
