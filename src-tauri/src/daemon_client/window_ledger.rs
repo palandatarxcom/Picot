@@ -116,16 +116,7 @@ impl WindowLedger {
             .clone()
     }
 
-    pub fn contains_label(&self, label: &str) -> bool {
-        self.rows
-            .lock()
-            .expect("window ledger lock poisoned")
-            .iter()
-            .any(|row| row.label == label)
-    }
-
-    /// Diagnostics and T10's command validation; the restart transaction
-    /// enumerates with [`Self::rows`].
+    /// Diagnostics and the restart transaction's pre-state count.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.rows.lock().expect("window ledger lock poisoned").len()
@@ -201,7 +192,11 @@ mod tests {
             ledger.row_for_label("native-workspace-w1"),
             Some(workspace_row("native-workspace-w1"))
         );
-        assert!(!ledger.contains_label("native-landing"));
+        assert_eq!(
+            ledger.row_for_label("native-landing"),
+            None,
+            "the landing window has no row"
+        );
         assert_eq!(ledger.rows().len(), 1, "creation order is preserved");
     }
 
@@ -211,8 +206,8 @@ mod tests {
         ledger.record(LedgerRow::landing("native-landing", "owner-l", "/Users/x"));
         ledger.record(workspace_row("native-workspace-w1"));
         ledger.forget("native-landing");
-        assert!(!ledger.contains_label("native-landing"));
-        assert!(ledger.contains_label("native-workspace-w1"));
+        assert_eq!(ledger.row_for_label("native-landing"), None);
+        assert!(ledger.row_for_label("native-workspace-w1").is_some());
         assert_eq!(ledger.len(), 1);
         // Forgetting an unknown label is a no-op, not an error.
         ledger.forget("native-landing");

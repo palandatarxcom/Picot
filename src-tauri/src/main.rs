@@ -15,6 +15,7 @@ mod tauri_app_surface;
 mod daemon_client;
 
 use daemon_client::admin_client::{AdminClient, SurfaceExecutor};
+use daemon_client::commands::{daemon_restart, daemon_set_keep_running, daemon_status};
 use daemon_client::exit_waiter::{ExitWaiter, ProcessIdentity};
 use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
 use daemon_client::navigation_mirror::NavigationMirror;
@@ -2986,7 +2987,17 @@ fn main() {
         })
         // The main UI talks to HostServer exclusively over its v2 WebSocket.
         // No legacy broker or Tauri IPC control path remains in production.
-        .invoke_handler(tauri::generate_handler![])
+        // The app's whole Tauri command surface (plan D8/T10): the three daemon
+        // commands. Each validates the Tauri-injected calling window against the
+        // window ledger + the daemon-fed navigation mirror
+        // (`commands::validate_caller`) and each has an explicit permission in
+        // `permissions/default.toml` — `bun run check:permissions` re-parses this
+        // block textually, so the entries stay bare command names.
+        .invoke_handler(tauri::generate_handler![
+            daemon_status,
+            daemon_set_keep_running,
+            daemon_restart
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle: &tauri::AppHandle, event| match event {

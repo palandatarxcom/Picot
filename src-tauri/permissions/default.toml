@@ -3,10 +3,36 @@ identifier = "allow-cmd-retry-startup"
 description = "Allow retrying startup after a failed embedded pi launch (used by the bootstrap error window)"
 commands.allow = ["cmd_retry_startup"]
 
+# The three daemon admin commands (plan D8/T10). Their identifiers must stay in
+# step with `daemon_client::commands::COMMAND_*` and the `generate_handler!`
+# block: scripts/check-tauri-permissions.js fails when a registered command is
+# missing here, or when its allow-* entry is missing from [default] below.
+# The wildcard capability (`windows: ["*"]`, localhost remote urls) is what lets
+# the WebView reach IPC at all; it is *not* the authorization boundary — every
+# command validates the Tauri-injected calling window itself (window ledger +
+# navigation mirror), so a window the app did not create cannot use these.
+[[permission]]
+identifier = "allow-daemon-status"
+description = "Allow reading the daemon's status plus the app-private quit policy (Settings → General → Daemon)"
+commands.allow = ["daemon_status"]
+
+[[permission]]
+identifier = "allow-daemon-set-keep-running"
+description = "Allow changing keepRunningAfterQuit, the app-private quit policy (Settings → General → Daemon)"
+commands.allow = ["daemon_set_keep_running"]
+
+[[permission]]
+identifier = "allow-daemon-restart"
+description = "Allow running the app-managed daemon restart transaction (Settings → General → Daemon)"
+commands.allow = ["daemon_restart"]
+
 # Permission set that bundles all custom command permissions.
 # Referenced from capabilities/default.json as "pi-desktop:default".
 [default]
 description = "Default permissions bundle for Pi Desktop custom commands"
 permissions = [
   "allow-cmd-retry-startup",
+  "allow-daemon-status",
+  "allow-daemon-set-keep-running",
+  "allow-daemon-restart",
 ]

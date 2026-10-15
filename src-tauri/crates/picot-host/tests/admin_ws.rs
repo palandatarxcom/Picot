@@ -406,6 +406,10 @@ async fn daemon_status_reports_version_build_id_and_pid() {
     );
     assert_eq!(response["result"]["hostOrigin"], fixture.state.origin());
     assert_eq!(response["result"]["adminOrigin"], fixture.admin.origin());
+    // T10 amendment: the reply also lists the running agents a restart would
+    // stop. A freshly booted daemon has none — an empty list, never a missing
+    // field (the settings confirm renders it directly).
+    assert_eq!(response["result"]["agents"], json!([]), "{response}");
     fixture.state.shutdown_graceful("test").await;
 }
 

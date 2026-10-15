@@ -95,6 +95,7 @@ import { createScrollOwner } from "./session/scroll-ownership.js";
 import { SessionUiStateStore } from "./session-ui-state.js";
 import { ConfigGateway, consumeConfigResponseFrame } from "./settings/config-gateway.js";
 import { createConfigReadiness } from "./settings/config-readiness.js";
+import { setupDaemonSection } from "./settings/daemon-section.js";
 import { setupEnvironmentPage } from "./settings/environment-page.js";
 import { setupExtensionsTabShell } from "./settings/extensions-tab-shell.js";
 import { createMcpHostOps, setupMcpPage } from "./settings/mcp-page.js";
@@ -7269,6 +7270,11 @@ function selectSettingsTab(tabKey = "general") {
   const targetTabKey = tabKey === "auth" ? "configuration" : tabKey;
   if (targetTabKey !== "subagents" && !subagentsPage.leave()) return false;
   if (targetTabKey !== "environment") environmentPage.leave();
+  // The daemon section polls only while it is the visible page (T10): the
+  // status can change under us (a crash, a restart from another window), so the
+  // row refreshes on open and every 5s afterwards, and stops on leave.
+  if (targetTabKey === "general") void daemonSection.activate();
+  else daemonSection.leave();
   // The MCP nav item stays hidden until the pi-mcp-adapter package is
   // detected; refreshAvailability caches after the first check.
   void mcpPage.refreshAvailability();
@@ -7935,6 +7941,7 @@ async function openSettings(tabKey = "general", options = {}) {
 
 function closeSettings(options = {}) {
   if (!subagentsPage.leave()) return;
+  daemonSection.leave();
   if (options.clearHash !== false) clearSettingsHash();
   settingsPanel.classList.add("hidden");
   messagesContainer.style.display = "";
@@ -8034,6 +8041,13 @@ const piPathToggle = setupPiPathToggle({
   toggle: document.getElementById("toggle-pi-path"),
   note: document.getElementById("pi-path-note"),
 });
+
+// Settings → General → Daemon (plan T10). Its three commands go over Tauri IPC
+// (`window.__TAURI__.core.invoke`), not the host WebSocket: they are app-level
+// facts (the daemon's status, the app-private quit policy, the restart
+// transaction). Polling starts when the General panel opens and stops when it
+// closes — see the selectSettingsTab/closeSettings hooks.
+const daemonSection = setupDaemonSection();
 
 ({ loadInlineConfigEditor, loadAgentsMdEditor, loadAppendSystemMdEditor } = setupSettingsConfig({
   configGateway,

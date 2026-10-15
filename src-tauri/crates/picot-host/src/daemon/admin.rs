@@ -1047,6 +1047,10 @@ async fn run_op_inner(
                 .cloned()
                 .unwrap_or_default(),
             "epoch": epoch,
+            // T10 amendment: the running agents a restart would stop (the
+            // settings confirm lists them). Additive to the Task 3 table, which
+            // this commit updates together with its fixtures.
+            "agents": running_agents(&state),
         })),
         "daemon.stop" => {
             require_lease(inner, conn_id)?;
@@ -1138,6 +1142,47 @@ fn require_lease(inner: &Arc<AdminInner>, conn_id: u64) -> Result<(), String> {
 /// what `daemon_stop_drains_in_order_and_clears_bookkeeping` exists to prevent.
 async fn drain(state: Arc<DaemonState>) {
     state.drain().await;
+}
+
+/// The running agents a `daemon.status` reply lists (T10 amendment, recorded in
+/// the plan): the live Pi runtimes a restart would stop, so the settings confirm
+/// can name them (T10 step 4 / matrix row 10).
+///
+/// This is the daemon's own inventory (`NativePiManager`), not the app's window
+/// list: a runtime whose window was closed still runs, and a restart stops it.
+fn running_agents(state: &Arc<DaemonState>) -> Vec<Value> {
+    state
+        .runtimes
+        .running_targets()
+        .into_iter()
+        .map(|target| {
+            // The workspace root is the human-meaningful half of a row; a
+            // workspace that left the registry simply has none (the row is
+            // still reported — the agent is running either way).
+            let cwd = state.metadata.lock().ok().and_then(|metadata| {
+                metadata
+                    .canonical_root_for_workspace_id(&target.workspace_id)
+                    .ok()
+            });
+            agent_row(&target, cwd.as_deref(), state.runtimes.is_working(&target))
+        })
+        .collect()
+}
+
+/// One agent row of `daemon.status`: the identity a restart stops, with the
+/// workspace root when the registry still knows it.
+pub fn agent_row(
+    target: &crate::runtime_coordinator::RuntimeTarget,
+    cwd: Option<&std::path::Path>,
+    streaming: bool,
+) -> Value {
+    json!({
+        "workspaceId": target.workspace_id,
+        "sessionId": target.session_id,
+        "instanceId": target.instance_id,
+        "cwd": cwd.map(|path| path.to_string_lossy().to_string()),
+        "streaming": streaming,
+    })
 }
 
 fn arg_str(args: &Value, key: &str) -> Result<String, String> {
@@ -1240,6 +1285,36 @@ mod tests {
             }
             other => panic!("wrong frame for mirror_ack: {other:?}"),
         }
+    }
+
+    /// The `daemon.status` reply's `agents` rows (T10 amendment): one row per
+    /// live runtime, carrying the identity a restart stops plus the workspace
+    /// root when the registry still knows it. A runtime in a workspace that left
+    /// the registry is still **running** and therefore still listed — dropping
+    /// it would make a restart's confirm dialog understate what it stops.
+    #[test]
+    fn a_status_agent_row_names_the_running_runtime_and_its_workspace() {
+        let target =
+            crate::runtime_coordinator::RuntimeTarget::with_owner("w1", "s1", "i1", "o1", 7);
+        let row = agent_row(&target, Some(std::path::Path::new("/ws/proj")), true);
+        assert_eq!(row["workspaceId"], "w1");
+        assert_eq!(row["sessionId"], "s1");
+        assert_eq!(row["instanceId"], "i1");
+        assert_eq!(row["cwd"], "/ws/proj");
+        assert_eq!(row["streaming"], true);
+
+        let unregistered = agent_row(&target, None, false);
+        assert_eq!(unregistered["workspaceId"], "w1");
+        assert_eq!(
+            unregistered["cwd"],
+            Value::Null,
+            "an unknown workspace root is null, not a fabricated path: {unregistered}"
+        );
+        assert_eq!(unregistered["streaming"], false);
+        // The row never carries an owner or capability: it is a settings-panel
+        // payload, not authorization state.
+        let encoded = row.to_string();
+        assert!(!encoded.contains("o1"), "{encoded}");
     }
 
     #[test]

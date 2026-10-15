@@ -113,6 +113,34 @@ describe("settings page split", () => {
     expect(appJs).not.toContain('rpcCommand({ type: "get_auth" })');
   });
 
+  test("keeps the daemon section as the last section of General", () => {
+    const dom = new JSDOM(html, { url: "http://localhost" });
+    const { document } = dom.window;
+
+    const panel = document.querySelector('[data-settings-panel="general"]');
+    const section = document.querySelector("#setting-daemon-section");
+    expect(panel).not.toBeNull();
+    expect(section).not.toBeNull();
+    // It lives in General (not a page of its own) and closes the panel: a
+    // section below it would push the daemon's status out of the first screen
+    // for no reason, and the panel's order is the shipping order (Task 10).
+    expect(panel.contains(section)).toBe(true);
+    const sections = [...panel.querySelectorAll(".settings-section")];
+    expect(sections.at(-1)).toBe(section);
+    expect(sections.map((node) => node.id)).toContain("setting-pi-path-section");
+
+    // Both shells render this one Settings panel (the workspace window and the
+    // cold-start landing window), so both must wire the section's lifecycle:
+    // wiring only app.js leaves it dead on the page a user opens first.
+    const landingJs = readFileSync(join(process.cwd(), "public/landing.js"), "utf8");
+    expect(appJs).toContain("setupDaemonSection(");
+    expect(landingJs).toContain("setupDaemonSection(");
+    expect(appJs).toContain("daemonSection.activate()");
+    expect(landingJs).toContain("daemonSection.activate()");
+    expect(appJs).toContain("daemonSection.leave()");
+    expect(landingJs).toContain("daemonSection.leave()");
+  });
+
   test("orders navigation without the retired Agent Inbox entry", () => {
     const dom = new JSDOM(html, { url: "http://localhost" });
     const { document } = dom.window;

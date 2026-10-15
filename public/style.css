@@ -3258,6 +3258,27 @@ body.landing-mode #landing {
   background: var(--bg-glass);
 }
 
+/* Settings → General → Daemon: the restart confirm block and its agent list. */
+.daemon-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.daemon-agent-list {
+  margin: 0;
+  padding-inline-start: var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.daemon-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
 .settings-api-keys {
   display: flex;
   flex-direction: column;

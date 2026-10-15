@@ -109,7 +109,6 @@ pub fn keep_running_after_quit(config_dir: &Path) -> bool {
 /// restart or pause anything; the next quit follows the new value).
 ///
 /// T10's `daemon_set_keep_running` command is the caller.
-#[allow(dead_code)]
 pub fn set_keep_running_after_quit(config_dir: &Path, value: bool) -> Result<(), String> {
     let document = DaemonSettings {
         keep_running_after_quit: value,

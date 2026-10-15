@@ -19,13 +19,16 @@
 //!   daemon death, plan D12/T8);
 //! - [`window_ledger`] — the app's own registry of the windows it created
 //!   (label, owner, owner home, workspace, route): the restart transaction's
-//!   pre-state and T10's caller-validation set;
+//!   pre-state and the three commands' caller-validation set;
 //! - [`restart`] — the app-managed restart transaction (plan D10/T9): stop the
 //!   captured instance, confirm its death **by pid + start time**, spawn exactly
 //!   one replacement, rebuild one owner per captured window, migrate every view
 //!   to the new origin, restore its route;
-//! - [`commands`] — the Tauri commands' daemon half: T9's `daemon_restart`
-//!   (T10 adds the other two commands and all permission wiring);
+//! - [`commands`] — the app's whole Tauri command surface (T10):
+//!   `daemon_status` (the daemon's facts + the app-private quit policy),
+//!   `daemon_set_keep_running` (the policy file and nothing else) and
+//!   `daemon_restart` (T9's transaction) — each validating the Tauri-injected
+//!   calling window against the ledger and the mirror;
 //! - [`present_blocked_by_other_app`] — the localized dialog + non-zero exit for
 //!   a second Picot instance while another app manages the daemon.
 //!
@@ -38,9 +41,11 @@
 //! `RunEvent::ExitRequested`, `RunEvent::Exit` and the SIGTERM/SIGINT/SIGHUP
 //! handlers. Wired (T9): [`restart`]'s transaction behind the `daemon_restart`
 //! command and `crate::run_restart`, with the window ledger feeding the
-//! capture. Still unwired: the three admin commands' permission wiring and UI
-//! (T10) — items that task owns, marked `#[allow(dead_code)]` where they exist
-//! already and documented at their definitions.
+//! capture. Wired (T10): all three commands registered in
+//! `main.rs`'s `invoke_handler` with explicit permissions
+//! (`src-tauri/permissions/default.toml`), and
+//! `public/settings/daemon-section.js` driving them from Settings → General in
+//! both shells.
 //!
 //! [`navigation_mirror`] is the app-side half of the daemon's authorization
 //! mirror: the WebView's synchronous `on_navigation` delegate reads it, and it
@@ -69,8 +74,9 @@ pub const LOCALES: [&str; 4] = ["en", "zh", "ja", "es"];
 /// This is a *native* dialog shown before the WebView exists, so it cannot go
 /// through `public/locales/*.json` (nothing has loaded a locale bundle yet, and
 /// the blocked path is exactly the path where the app should not start a
-/// WebView). The keys are named after the ones T10 adds to the settings section
-/// (`daemon.alreadyRunning.*`) so the copy stays greppable across both.
+/// WebView). The copy therefore lives here; the function name mirrors T10's
+/// `settings.daemon.*` namespace so the daemon lifecycle's copy stays greppable
+/// from either side of the process boundary.
 pub fn blocked_by_other_app_copy(locale: &str) -> (&'static str, &'static str) {
     match locale {
         "zh" => (

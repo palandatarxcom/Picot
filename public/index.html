@@ -1203,6 +1203,100 @@
                 <button class="settings-toggle" id="toggle-pi-path"></button>
               </div>
             </div>
+            <!-- Settings → General → Daemon (plan Task 10). The last section of
+                 this panel: the daemon's status, the app-private quit policy and
+                 the restart transaction's confirm. Shared by both shells
+                 (app.js renders the workspace window, landing.js the cold start),
+                 so both wire setupDaemonSection. -->
+            <div class="settings-section" id="setting-daemon-section">
+              <div class="settings-section-title" data-i18n="settings.daemon.title">
+                Daemon
+              </div>
+              <div class="settings-row" id="setting-daemon-status-row">
+                <span class="settings-label" data-i18n="settings.daemon.status"
+                  >Status</span
+                >
+                <span
+                  class="settings-static-value"
+                  id="setting-daemon-status-value"
+                  data-i18n="status.loading"
+                  >Loading...</span
+                >
+              </div>
+              <p
+                class="settings-help hidden"
+                id="daemon-section-notice"
+                aria-live="polite"
+              ></p>
+              <div class="settings-row" id="setting-daemon-keep-running">
+                <span class="settings-label settings-label-stack">
+                  <span
+                    class="settings-label-main"
+                    data-i18n="settings.daemon.keepRunning"
+                    >Keep agents running after quitting</span
+                  >
+                  <span class="settings-label-sub" id="daemon-keep-running-note"></span>
+                </span>
+                <button
+                  class="settings-toggle"
+                  id="toggle-daemon-keep-running"
+                  aria-pressed="false"
+                  data-i18n-aria-label="settings.daemon.keepRunning"
+                ></button>
+              </div>
+              <div class="settings-row" id="setting-daemon-restart">
+                <span class="settings-label settings-label-stack">
+                  <span class="settings-label-main" data-i18n="settings.daemon.restart"
+                    >Restart daemon</span
+                  >
+                  <span
+                    class="settings-label-sub"
+                    data-i18n="settings.daemon.restartDescription"
+                    >Stops the background daemon and starts a fresh one.</span
+                  >
+                </span>
+                <button
+                  class="settings-value-btn"
+                  id="btn-daemon-restart"
+                  data-i18n="settings.daemon.restartAction"
+                >
+                  Restart
+                </button>
+              </div>
+              <div class="settings-row" id="daemon-restart-confirm" hidden>
+                <div class="daemon-confirm">
+                  <p
+                    class="settings-help"
+                    id="daemon-restart-confirm-text"
+                    data-i18n="settings.daemon.restartConfirm"
+                  >
+                    Restarting stops every running agent. They resume from the
+                    state saved on disk.
+                  </p>
+                  <span
+                    class="settings-label-sub"
+                    id="daemon-restart-agents-label"
+                  ></span>
+                  <ul class="daemon-agent-list" id="daemon-restart-agents"></ul>
+                  <div class="daemon-confirm-actions">
+                    <button
+                      class="settings-value-btn"
+                      id="btn-daemon-restart-cancel"
+                      data-i18n="settings.daemon.restartCancel"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      class="settings-value-btn is-primary"
+                      id="btn-daemon-restart-confirm"
+                      data-i18n="settings.daemon.restartConfirmAction"
+                    >
+                      Restart now
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
