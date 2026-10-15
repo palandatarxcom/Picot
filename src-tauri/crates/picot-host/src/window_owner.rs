@@ -848,6 +848,34 @@ fn normalize_origin(origin: &str) -> Option<String> {
     url_origin(&url)
 }
 
+/// The one navigation-origin rule, shared by the daemon's authorization
+/// registry and the app's mirror-fed delegate (plan D4, Task 5 R1).
+///
+/// Exported because the two sides must not drift: the daemon publishes
+/// `currentOrigin`/`permit.origin` strings it produced with this function, and
+/// the app compares a live navigation URL against them. The app crate sees the
+/// same `url` type (`tauri::Url` re-exports it), so it calls this directly
+/// instead of re-implementing the loopback/port rules.
+///
+/// `None` means "not a loopback http origin": `127.0.0.1`, `::1` and
+/// `localhost` are accepted; everything else (https, credentials in the URL,
+/// `file:`, `data:`, LAN addresses) is not.
+pub fn navigation_origin(url: &Url) -> Option<String> {
+    url_origin(url)
+}
+
+/// The opaque `about:` documents a navigation may always reach: sandboxed
+/// `srcdoc` iframes (the HTML file preview) navigate to `about:srcdoc`, whose
+/// content comes entirely from the embedding document — there is no network
+/// origin to authorize. Top-level navigation to them never occurs in this app.
+///
+/// This is the *only* allow-rule that survives a dropped admin connection (plan
+/// Task 5 R1: the mirror is cleared fail-closed and the delegate still permits
+/// exactly these two strings).
+pub fn is_about_document(url: &Url) -> bool {
+    url.scheme() == "about" && matches!(url.path(), "srcdoc" | "blank")
+}
+
 fn url_origin(url: &Url) -> Option<String> {
     if url.scheme() != "http" {
         return None;

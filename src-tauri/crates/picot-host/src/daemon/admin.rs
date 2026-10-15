@@ -44,6 +44,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::daemon::DaemonState;
+use crate::host_control::ProgressSink;
 use crate::window_owner::{OwnerId, OwnerMirrorEvent, TemporaryKind};
 
 /// The admin WS path (plan D3: a second listener, never LAN-gated).
@@ -63,6 +64,17 @@ pub const ADMIN_CLOSE_MALFORMED: u16 = 4410;
 /// WebView's synchronous delegate can never hit a permit the app never
 /// installed.
 pub const MIRROR_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded wait for the app's `surface_response` after an `app_surface_request`
+/// push (plan D5: "forwarding timeout 5s → typed `app_surface_unavailable`").
+///
+/// Implementation-time decision: this is an **idle** deadline — every
+/// `surface_progress` frame restarts it — because
+/// `download_and_install_update` streams for minutes: a *total* 5s deadline
+/// would make updates impossible in external mode, while the plan's intent (a
+/// forwarding call must not hang, and silence means the app is gone) is exactly
+/// what an idle deadline enforces. See [`AdminServer::request_app_surface`].
+pub const SURFACE_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Grace window between "the manager's socket dropped" and "mark the
 /// attachment dead" (plan D11). A reconnect inside the window keeps the
@@ -98,11 +110,12 @@ pub trait LeaseObserver: Send + Sync {
 }
 
 /// Configuration for [`AdminServer::start`]. The token comes from the daemon
-/// (instance file, T4); the timeout is injectable so tests do not wait 5s.
+/// (instance file, T4); the timeouts are injectable so tests do not wait 5s.
 #[derive(Clone, Debug)]
 pub struct AdminConfig {
     pub token: String,
     pub mirror_ack_timeout: Duration,
+    pub surface_forward_timeout: Duration,
 }
 
 impl AdminConfig {
@@ -110,6 +123,7 @@ impl AdminConfig {
         Self {
             token: token.into(),
             mirror_ack_timeout: MIRROR_ACK_TIMEOUT,
+            surface_forward_timeout: SURFACE_FORWARD_TIMEOUT,
         }
     }
 
@@ -118,6 +132,19 @@ impl AdminConfig {
         self.mirror_ack_timeout = timeout;
         self
     }
+
+    /// Test/dev knob: shorten the app-surface forwarding deadline.
+    pub fn with_surface_forward_timeout(mut self, timeout: Duration) -> Self {
+        self.surface_forward_timeout = timeout;
+        self
+    }
+}
+
+/// What the app sends back for one forwarded surface op: the answer, or one
+/// progress frame that restarts the idle deadline.
+pub enum SurfaceReply {
+    Response { ok: bool, result: Value },
+    Progress(Value),
 }
 
 /// Frames the app sends (`app → daemon` table in plan Task 3).
@@ -211,7 +238,11 @@ struct AdminInner {
     /// (T4). Set once, before the listener starts serving.
     origin: std::sync::OnceLock<String>,
     mirror_ack_timeout: Duration,
+    surface_forward_timeout: Duration,
     next_conn_id: AtomicU64,
+    /// Surface-request ids (`s1`, `s2`, …), distinct from `admin_request` ids so
+    /// the two directions can never be confused for one another.
+    next_surface_id: AtomicU64,
     /// `false` once `daemon.stop` accepted: frames stop being accepted.
     accepting: AtomicBool,
     lease: Mutex<LeaseState>,
@@ -221,6 +252,11 @@ struct AdminInner {
     permit_acks: Mutex<HashMap<String, oneshot::Sender<u64>>>,
     /// Receiver halves of the same slots, handed to the awaiting op.
     permit_waiters: Mutex<HashMap<String, oneshot::Receiver<u64>>>,
+    /// Forwarded app-surface requests awaiting `surface_response`/
+    /// `surface_progress`, keyed by the request id. The awaiting op holds the
+    /// receiver, so the app's frames route through the same channel whatever
+    /// order they arrive in.
+    surface_channels: Mutex<HashMap<String, mpsc::UnboundedSender<SurfaceReply>>>,
     /// Test seam: per-op artificial delay, empty in production. Same posture as
     /// `HostServer::set_agent_root_for_tests` — it lets the protocol tests prove
     /// responses are matched by id when completions arrive out of order.
@@ -240,7 +276,9 @@ impl AdminServer {
             token: config.token,
             origin: std::sync::OnceLock::new(),
             mirror_ack_timeout: config.mirror_ack_timeout,
+            surface_forward_timeout: config.surface_forward_timeout,
             next_conn_id: AtomicU64::new(1),
+            next_surface_id: AtomicU64::new(1),
             accepting: AtomicBool::new(true),
             lease: Mutex::new(LeaseState {
                 epoch: 0,
@@ -249,6 +287,7 @@ impl AdminServer {
             connections: Mutex::new(HashMap::new()),
             permit_acks: Mutex::new(HashMap::new()),
             permit_waiters: Mutex::new(HashMap::new()),
+            surface_channels: Mutex::new(HashMap::new()),
             op_delays: Mutex::new(HashMap::new()),
             state: Mutex::new(Weak::new()),
             shutdown: Mutex::new(None),
@@ -393,6 +432,105 @@ impl AdminServer {
             .lock()
             .expect("permit wait lock")
             .clear();
+        self.inner
+            .surface_channels
+            .lock()
+            .expect("surface channel lock")
+            .clear();
+    }
+
+    /// Forward one op to the manager attachment and await its answer (plan D5).
+    ///
+    /// The deadline is an **idle** deadline (see [`SURFACE_FORWARD_TIMEOUT`]):
+    /// every `surface_progress` frame the app sends while working restarts it, so
+    /// a streaming op (`download_and_install_update`) can run for minutes while
+    /// a silent app still fails the call. Every failure mode — no manager
+    /// attached, a closed channel, the idle deadline — is the typed
+    /// `app_surface_unavailable` error, and the slot is always released so a
+    /// late frame cannot settle a finished call.
+    pub async fn request_app_surface(
+        &self,
+        op: &str,
+        args: Value,
+        progress: Option<ProgressSink>,
+    ) -> Result<Value, String> {
+        let Some(conn_id) = self.inner.manager_conn() else {
+            return Err(crate::daemon::surface_forward::surface_unavailable(
+                op,
+                "no Picot app is attached",
+            ));
+        };
+        let id = format!(
+            "s{}",
+            self.inner.next_surface_id.fetch_add(1, Ordering::SeqCst)
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel::<SurfaceReply>();
+        self.inner
+            .surface_channels
+            .lock()
+            .expect("surface channel lock")
+            .insert(id.clone(), sender);
+        let frame = json!({
+            "type": "app_surface_request",
+            "id": id,
+            "op": op,
+            "args": args,
+        });
+        if !self
+            .inner
+            .send(conn_id, WsMessage::Text(frame.to_string().into()))
+        {
+            self.inner.drop_surface_channel(&id);
+            return Err(crate::daemon::surface_forward::surface_unavailable(
+                op,
+                "the admin channel closed while the op was being forwarded",
+            ));
+        }
+        loop {
+            match tokio::time::timeout(self.inner.surface_forward_timeout, receiver.recv()).await {
+                Ok(Some(SurfaceReply::Response { ok: true, result })) => {
+                    self.inner.drop_surface_channel(&id);
+                    return Ok(result);
+                }
+                Ok(Some(SurfaceReply::Response { ok: false, result })) => {
+                    self.inner.drop_surface_channel(&id);
+                    // The error travels in `result.error` (see the T5 pump): the
+                    // frame's `result` field is opaque JSON here, so the
+                    // protocol table needed no new field for the failure shape.
+                    let message = result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| result.to_string());
+                    return Err(message);
+                }
+                // Progress: hand it to the requester's sink and restart the
+                // idle deadline.
+                Ok(Some(SurfaceReply::Progress(event))) => {
+                    if let Some(sink) = progress.as_ref() {
+                        sink(event);
+                    }
+                }
+                // Sender gone: a drain cleared this slot.
+                Ok(None) => {
+                    self.inner.drop_surface_channel(&id);
+                    return Err(crate::daemon::surface_forward::surface_unavailable(
+                        op,
+                        "the admin channel closed before the app answered",
+                    ));
+                }
+                Err(_) => {
+                    self.inner.drop_surface_channel(&id);
+                    return Err(crate::daemon::surface_forward::surface_unavailable(
+                        op,
+                        &format!(
+                            "the app did not answer within {}ms",
+                            self.inner.surface_forward_timeout.as_millis()
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     /// Release the lease and clear the attachment bookkeeping (drain step 5).
@@ -411,6 +549,11 @@ impl AdminServer {
             .permit_waiters
             .lock()
             .expect("permit wait lock")
+            .clear();
+        self.inner
+            .surface_channels
+            .lock()
+            .expect("surface channel lock")
             .clear();
         epoch
     }
@@ -498,6 +641,27 @@ impl AdminInner {
         if let Some(observer) = observer {
             observer.manager_changed(manager);
         }
+    }
+
+    /// Route one app frame to the forwarded-op slot it belongs to. Unknown ids
+    /// are dropped: a finished call must never be settled by a late frame.
+    fn route_surface_reply(&self, id: &str, reply: SurfaceReply) {
+        let sender = self
+            .surface_channels
+            .lock()
+            .expect("surface channel lock")
+            .get(id)
+            .cloned();
+        if let Some(sender) = sender {
+            let _ = sender.send(reply);
+        }
+    }
+
+    fn drop_surface_channel(&self, id: &str) {
+        self.surface_channels
+            .lock()
+            .expect("surface channel lock")
+            .remove(id);
     }
 
     fn note_mirror_ack(&self, permit_id: &str, epoch: u64) -> bool {
@@ -646,13 +810,17 @@ async fn handle_socket(inner: Arc<AdminInner>, socket: WebSocket) {
                     ));
                     break;
                 }
-                log::debug!("[picot-daemon] surface_response id={id} ok={ok}");
-                // Surface plumbing (pending map, progress replay) is the
-                // client's counterpart (T5); the frame is well-formed here.
-                let _ = (ok, result);
+                inner.route_surface_reply(&id, SurfaceReply::Response { ok, result });
             }
             AdminInbound::SurfaceProgress { ack_id, event } => {
-                log::debug!("[picot-daemon] surface_progress ackId={ack_id} event={event}");
+                if attachment.is_none() {
+                    let _ = outbound.send(close_frame(
+                        ADMIN_CLOSE_MALFORMED,
+                        "surface_progress before admin_hello",
+                    ));
+                    break;
+                }
+                inner.route_surface_reply(&ack_id, SurfaceReply::Progress(event));
             }
         }
     }

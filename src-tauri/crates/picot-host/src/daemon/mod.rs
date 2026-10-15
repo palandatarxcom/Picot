@@ -15,6 +15,9 @@
 //! - [`app_surface`] — the exhaustive `AppHandle`/`try_state` inventory of the
 //!   control dispatcher and the object-safe [`app_surface::AppSurface`] seam
 //!   every row maps onto (Task 2 Step 0).
+//! - [`surface_forward`] — the daemon's realization of that seam: forward the
+//!   row over the admin channel (`app_surface_request` / `surface_response`),
+//!   which is the same surface in both modes (Task 5, plan D2/D5).
 //! - [`DaemonState`] — the explicit Arc set the dispatcher reads, replacing
 //!   every `app.try_state::<T>()` lookup (Task 2 Step 2, inventory rows
 //!   D1–D4).
@@ -32,6 +35,7 @@
 pub mod admin;
 pub mod app_surface;
 pub mod instance;
+pub mod surface_forward;
 
 use crate::daemon::admin::AdminServer;
 use crate::daemon::app_surface::AppSurface;

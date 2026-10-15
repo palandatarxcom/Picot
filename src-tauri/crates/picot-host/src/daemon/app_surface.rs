@@ -141,6 +141,7 @@
 use crate::host_control::ProgressSink;
 use crate::host_server::PaneRect;
 use crate::runtime_coordinator::RuntimeTarget;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Updater progress pushed back to the requester of
@@ -156,36 +157,46 @@ pub type SurfaceProgress = ProgressSink;
 /// One browser-pane operation, mirroring the seven `browser_pane_*` data-plane
 /// ops one-for-one (`host_server.rs:3589+`).
 ///
-/// Wire encoding (serde shape, frame name, ack) belongs to the T3 protocol
-/// tables; this enum only fixes the op set for the seam.
-#[derive(Debug, Clone)]
+/// Wire encoding (Task 5's `pane` op): a tagged value (`kind`) with camelCase
+/// field names, matching the rest of the admin protocol. The tag values are the
+/// data-plane op names minus their `browser_pane_` prefix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PaneOp {
     Create {
+        #[serde(rename = "paneId")]
         pane_id: String,
+        #[serde(rename = "windowLabel")]
         window_label: String,
         url: String,
         rect: PaneRect,
     },
     SetRect {
+        #[serde(rename = "paneId")]
         pane_id: String,
         rect: PaneRect,
     },
     SetVisible {
+        #[serde(rename = "paneId")]
         pane_id: String,
         visible: bool,
     },
     EvalJson {
+        #[serde(rename = "paneId")]
         pane_id: String,
         expression: String,
     },
     Navigate {
+        #[serde(rename = "paneId")]
         pane_id: String,
         url: String,
     },
     Url {
+        #[serde(rename = "paneId")]
         pane_id: String,
     },
     Destroy {
+        #[serde(rename = "paneId")]
         pane_id: String,
     },
 }

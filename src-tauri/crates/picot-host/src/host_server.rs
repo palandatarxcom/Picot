@@ -45,7 +45,11 @@ use tower_http::set_header::SetResponseHeaderLayer;
 const MAX_HTTP_BODY_BYTES: usize = HTTP_DEFAULT_BODY_BYTES;
 
 /// Child-webview pane rectangle, in logical pixels.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Serialize`/`Deserialize` since Task 5: the rectangle travels inside a
+/// forwarded `pane` op, and the two modes must move the same value across the
+/// process boundary (plan D2).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PaneRect {
     pub x: f64,
     pub y: f64,
