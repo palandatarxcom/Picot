@@ -557,7 +557,6 @@ describe("running agents list", () => {
 });
 
 // ── Restart confirm layout ───────────────────────────────────────────────────
-// ── Restart confirm layout ───────────────────────────────────────────────────
 //
 // `.settings-row` sets `display: flex`, which beats the UA `[hidden]` rule: the
 // hidden confirm row rendered anyway, so Restart, Cancel and "Restart now" were

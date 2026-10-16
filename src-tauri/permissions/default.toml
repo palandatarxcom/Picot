@@ -21,6 +21,7 @@ commands.allow = ["daemon_set_keep_running"]
 identifier = "allow-daemon-restart"
 description = "Allow running the app-managed daemon restart transaction (Settings → General → Daemon)"
 commands.allow = ["daemon_restart"]
+
 [[permission]]
 identifier = "allow-daemon-agent-stop"
 description = "Allow stopping one exact Pi runtime by its full identity (closing a session tab)"
