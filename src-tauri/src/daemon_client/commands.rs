@@ -145,6 +145,33 @@ pub async fn daemon_restart(window: tauri::WebviewWindow, app: AppHandle) -> Res
     Ok(report_json(&report))
 }
 
+/// Stop one exact Pi runtime (the single-runtime lifecycle a closed session tab
+/// needs). The three ids are forwarded verbatim: the daemon matches the full
+/// triple and refuses anything it cannot identify exactly, so this command adds
+/// no policy of its own — the caller check is the only gate it owns.
+#[tauri::command]
+pub async fn daemon_agent_stop(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    workspace_id: String,
+    session_id: String,
+    instance_id: String,
+) -> Result<Value, String> {
+    let link = caller_link(&app, &window)?;
+    let reply = link
+        .client()
+        .request(
+            "agent.stop",
+            json!({
+                "workspaceId": workspace_id,
+                "sessionId": session_id,
+                "instanceId": instance_id,
+            }),
+        )
+        .await;
+    agent_stop_payload(reply)
+}
+
 /// Validate the caller against the two injected states and hand back the
 /// daemon link. Every command starts here; none of them trusts an argument for
 /// its own identity.
@@ -186,6 +213,26 @@ pub fn status_payload(keep_running_after_quit: bool, status: Result<Value, Strin
             "keepRunningAfterQuit": keep_running_after_quit,
         }),
     }
+}
+
+/// The `agent.stop` confirmation, forwarded by name like [`status_payload`]:
+/// the exact triple the daemon reports as stopped and nothing else — a reply
+/// that grew authorization state must not reach the WebView. A reply with no
+/// confirmation is a failure, never a silent success the UI would close a tab
+/// on.
+pub fn agent_stop_payload(reply: Result<Value, String>) -> Result<Value, String> {
+    let reply = reply?;
+    let stopped = reply
+        .get("stopped")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "the daemon did not confirm which agent it stopped".to_string())?;
+    Ok(json!({
+        "stopped": {
+            "workspaceId": stopped.get("workspaceId").cloned().unwrap_or(Value::Null),
+            "sessionId": stopped.get("sessionId").cloned().unwrap_or(Value::Null),
+            "instanceId": stopped.get("instanceId").cloned().unwrap_or(Value::Null),
+        }
+    }))
 }
 
 /// The status refresh the UI renders (step 7): the replacement's identity, the
@@ -430,6 +477,47 @@ mod tests {
         assert_eq!(bare["running"], true);
         assert_eq!(bare["agents"], json!([]));
         assert_eq!(bare["pid"], Value::Null);
+    }
+    // ─── The agent.stop confirmation ───────────────────────────────────────
+
+    /// The confirmation the UI acts on: the exact triple, forwarded by name.
+    /// Whatever else the daemon's reply grows stays behind.
+    #[test]
+    fn the_agent_stop_payload_forwards_only_the_stopped_triple() {
+        let payload = agent_stop_payload(Ok(json!({
+            "stopped": {"workspaceId": "w1", "sessionId": "s1", "instanceId": "i1"},
+            // Never forwarded, whatever the daemon happens to add later.
+            "adminToken": "secret-token",
+        })))
+        .expect("a confirmed stop");
+        assert_eq!(payload["stopped"]["workspaceId"], "w1");
+        assert_eq!(payload["stopped"]["sessionId"], "s1");
+        assert_eq!(payload["stopped"]["instanceId"], "i1");
+        assert_eq!(
+            payload
+                .as_object()
+                .expect("an object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["stopped"],
+            "the payload carries the confirmation and nothing else: {payload}"
+        );
+        let encoded = payload.to_string();
+        assert!(!encoded.contains("secret-token"), "{encoded}");
+        assert!(!encoded.contains("adminToken"), "{encoded}");
+    }
+
+    /// A refusal stays a refusal, and an answer that does not say *what* it
+    /// stopped is not a success: the UI must never close a tab on either.
+    #[test]
+    fn an_agent_stop_refusal_or_a_missing_confirmation_is_an_error() {
+        assert_eq!(
+            agent_stop_payload(Err("unknown agent w9/s9/i9".to_string())),
+            Err("unknown agent w9/s9/i9".to_string())
+        );
+        let bare = agent_stop_payload(Ok(json!({"accepted": true})))
+            .expect_err("an unconfirmed stop is a failure");
+        assert!(bare.contains("did not confirm"), "{bare}");
     }
 
     // ─── The restart report ─────────────────────────────────────────────────

@@ -1124,6 +1124,47 @@ async fn run_op_inner(
             require_lease(inner, conn_id)?;
             Ok(json!({ "accepted": true }))
         }
+        // Single-runtime lifecycle (B1): closing one session tab stops **one**
+        // Pi runtime. The caller sends the full identity and it is matched
+        // *exactly* — no wildcard, no workspace-level batch, so a stale or
+        // guessed id can never take down a second agent. A triple with no live
+        // match is a refusal, never a silent no-op. Interception (ask before
+        // killing a `Working` runtime) belongs to the UI layer, exactly as it
+        // does for `daemon.stop`.
+        "agent.stop" => {
+            require_lease(inner, conn_id)?;
+            let workspace_id = arg_str(&args, "workspaceId")?;
+            let session_id = arg_str(&args, "sessionId")?;
+            let instance_id = arg_str(&args, "instanceId")?;
+            let target = state
+                .runtimes
+                .running_targets()
+                .into_iter()
+                .find(|target| {
+                    target.workspace_id == workspace_id
+                        && target.session_id == session_id
+                        && target.instance_id == instance_id
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "unknown agent {workspace_id}/{session_id}/{instance_id}: \
+                         no running runtime matches the full identity"
+                    )
+                })?;
+            // `NativePiManager::stop` is the one ordered teardown path every
+            // lifecycle caller uses: admission closed, child process group
+            // killed and reaped, coordinator set to `Stopped` and unregistered.
+            // It does not special-case `Working` — no interruption logic is
+            // invented here that the daemon does not already have.
+            state.runtimes.stop(&target)?;
+            Ok(json!({
+                "stopped": {
+                    "workspaceId": target.workspace_id,
+                    "sessionId": target.session_id,
+                    "instanceId": target.instance_id,
+                }
+            }))
+        }
         "owner.create" => {
             require_lease(inner, conn_id)?;
             let label = arg_str(&args, "label")?;

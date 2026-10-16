@@ -15,7 +15,9 @@ mod tauri_app_surface;
 mod daemon_client;
 
 use daemon_client::admin_client::{AdminClient, SurfaceExecutor};
-use daemon_client::commands::{daemon_restart, daemon_set_keep_running, daemon_status};
+use daemon_client::commands::{
+    daemon_agent_stop, daemon_restart, daemon_set_keep_running, daemon_status,
+};
 use daemon_client::exit_waiter::{ExitWaiter, ProcessIdentity};
 use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
 use daemon_client::navigation_mirror::NavigationMirror;
@@ -3075,7 +3077,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             daemon_set_keep_running,
-            daemon_restart
+            daemon_restart,
+            daemon_agent_stop
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

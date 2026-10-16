@@ -1238,6 +1238,8 @@ async fn a_stop_without_the_lease_is_refused_by_the_daemon() {
         // R5: the close-request bridge is lease-gated too — a leaseless caller
         // must not be able to make the app interrupt its own user.
         ("r4", "owner.close_request"),
+        // B1: stopping a single runtime is a lifecycle op like any other.
+        ("r5", "agent.stop"),
     ] {
         let response = request(&mut socket, id, op, owner_args("w-leaseless")).await;
         assert_eq!(response["ok"], false, "{op} must be refused: {response}");
@@ -1249,5 +1251,139 @@ async fn a_stop_without_the_lease_is_refused_by_the_daemon() {
             "{op} must say why: {response}"
         );
     }
+    fixture.state.shutdown_graceful("test").await;
+}
+
+// ---------------------------------------------------------------------------
+// B1 — `agent.stop`: one exact runtime, by its full identity
+// ---------------------------------------------------------------------------
+
+/// The triple is matched **exactly**: a request that names no live runtime is
+/// refused by name, and the refusal touches nothing. `daemon.status` is the
+/// second witness — the row the settings panel renders still lists the runtime
+/// that the refused stop named.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_stop_refuses_an_unknown_triple_and_touches_no_runtime() {
+    use picot_host::runtime_coordinator::RuntimeTarget;
+
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let (mut socket, _) = fixture.attach().await;
+    let running = RuntimeTarget::with_owner("w1", "s1", "i1", "o1", 1);
+    // Held, not dropped: the in-memory process's channels are what keep the
+    // runtime addressable (a dropped seam would make the pump see EOF).
+    let _process = fixture
+        .state
+        .runtimes
+        .register_in_memory(running.clone())
+        .expect("an in-memory runtime stands in for a spawned Pi");
+    // One field wrong in each direction: no wildcard, no partial match.
+    for (id, wrong) in [
+        (
+            "r1",
+            json!({"workspaceId": "w1", "sessionId": "s1", "instanceId": "i-other"}),
+        ),
+        (
+            "r2",
+            json!({"workspaceId": "w1", "sessionId": "s-other", "instanceId": "i1"}),
+        ),
+        (
+            "r3",
+            json!({"workspaceId": "w-other", "sessionId": "s1", "instanceId": "i1"}),
+        ),
+    ] {
+        let response = request(&mut socket, id, "agent.stop", wrong).await;
+        assert_eq!(response["ok"], false, "{response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown agent"),
+            "the refusal names the triple it could not find: {response}"
+        );
+    }
+    // A workspace-only stop is what this op deliberately does not have: the
+    // missing field is an argument error, never a workspace-level batch.
+    let batch = request(
+        &mut socket,
+        "r4",
+        "agent.stop",
+        json!({"workspaceId": "w1"}),
+    )
+    .await;
+    assert_eq!(batch["ok"], false, "{batch}");
+    assert!(
+        batch["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires a string sessionId"),
+        "{batch}"
+    );
+
+    let live = fixture.state.runtimes.running_targets();
+    assert_eq!(live.len(), 1, "a refused stop stops nothing: {live:?}");
+    assert_eq!(live[0].instance_id, "i1");
+
+    let status = request(&mut socket, "r5", "daemon.status", json!({})).await;
+    let agents = status["result"]["agents"]
+        .as_array()
+        .expect("an agents list");
+    assert_eq!(agents.len(), 1, "{status}");
+    assert_eq!(agents[0]["instanceId"], "i1");
+    assert_eq!(agents[0]["sessionId"], "s1");
+    fixture.state.shutdown_graceful("test").await;
+}
+
+/// The exact match stops **one** runtime: a sibling in the same workspace is
+/// what the triple exists for, and it survives — in the manager's own registry
+/// and in the `daemon.status` reply alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_stop_stops_exactly_the_matching_runtime() {
+    use picot_host::runtime_coordinator::RuntimeTarget;
+
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let (mut socket, _) = fixture.attach().await;
+    let victim = RuntimeTarget::with_owner("w1", "s1", "i1", "o1", 1);
+    let sibling = RuntimeTarget::with_owner("w1", "s2", "i2", "o1", 1);
+    let _victim_process = fixture
+        .state
+        .runtimes
+        .register_in_memory(victim.clone())
+        .expect("an in-memory runtime stands in for a spawned Pi");
+    let _sibling_process = fixture
+        .state
+        .runtimes
+        .register_in_memory(sibling.clone())
+        .expect("a second in-memory runtime in the same workspace");
+    let response = request(
+        &mut socket,
+        "r1",
+        "agent.stop",
+        json!({
+            "workspaceId": victim.workspace_id,
+            "sessionId": victim.session_id,
+            "instanceId": victim.instance_id,
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(
+        response["result"]["stopped"],
+        json!({"workspaceId": "w1", "sessionId": "s1", "instanceId": "i1"}),
+        "the confirmation names the exact triple: {response}"
+    );
+    let live = fixture.state.runtimes.running_targets();
+    assert_eq!(live.len(), 1, "one runtime stopped, one survived: {live:?}");
+    assert_eq!(live[0].instance_id, "i2");
+    assert_eq!(
+        fixture.state.runtimes.state_of(&victim),
+        None,
+        "the coordinator no longer tracks the stopped runtime"
+    );
+    let status = request(&mut socket, "r2", "daemon.status", json!({})).await;
+    let agents = status["result"]["agents"]
+        .as_array()
+        .expect("an agents list");
+    assert_eq!(agents.len(), 1, "{status}");
+    assert_eq!(agents[0]["instanceId"], "i2");
     fixture.state.shutdown_graceful("test").await;
 }

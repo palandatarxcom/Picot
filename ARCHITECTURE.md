@@ -51,7 +51,7 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 | 通道 | 端点 / 载体 | 认证 | 用途 |
 | --- | --- | --- | --- |
 | **host 数据面** | daemon host origin 的 `/v2/ws`（含 `/v2/*`、静态资源与 `/api/*` 兼容面） | desktop capability（owner + generation，既有语义） | WebView 与 runtime 的全部常规通信；不因 daemon 化改变 |
-| **admin WS** | daemon 的第二个 listener，`127.0.0.1:0`（**永不放 LAN**），`GET /admin` 升级 | 实例文件中的高熵 `adminToken`（32 随机字节 base64url） | 管理面：`daemon.status` / `daemon.stop` / owner 生命周期（含 `owner.close_request`：关窗确认经数据面下发 WebView）/ app-surface 转发 / 导航镜像事件；同一时刻只有一个 live manager（lease） |
+| **admin WS** | daemon 的第二个 listener，`127.0.0.1:0`（**永不放 LAN**），`GET /admin` 升级 | 实例文件中的高熵 `adminToken`（32 随机字节 base64url） | 管理面：`daemon.status` / `daemon.stop` / `agent.stop`（按 workspaceId+sessionId+instanceId 三元组**精确**停单个 runtime，无 workspace 级批量；拦截留 UI 层，与 `daemon.stop` 同语义）/ owner 生命周期（含 `owner.close_request`：关窗确认经数据面下发 WebView）/ app-surface 转发 / 导航镜像事件；同一时刻只有一个 live manager（lease） |
 | **app-surface 转发** | admin WS 内的 `app_surface_request` / `surface_response`（`surface_progress` 回流进度） | 同 admin 通道 | 必须由 app 执行的能力：开工作区窗口、原生对话框（选目录/选图）、导出目标、更新器、devtools、relaunch、关窗批准与取消、菜单状态重算、browser pane 操作；5s 超时 → 类型化 `app_surface_unavailable` |
 | **导航镜像** | admin WS：attach 时的全量快照（owner/label/origin/generation/session 路由）+ 带 `epoch`/`generation` 的 `navigation_permit` / `permit_revoked` / `owner_binding_changed` | 同 admin 通道 | daemon 是授权权威（owner 记录、pending 导航许可）；app 持有 Tauri 的同步 `on_navigation` 委托，按镜像判定；许可事件需 ack，断连即 fail-closed |
 | **app 私有状态** | `app_config_dir/picot-daemon-settings.json`（0600、原子写） | 仅 app 进程读写 | 退出策略 `keepRunningAfterQuit`；daemon 不感知此值，也不进 SQLite |

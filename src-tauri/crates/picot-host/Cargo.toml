@@ -12,6 +12,13 @@ edition = "2021"
 # `[dev-dependencies]`, never in a production build.
 test-seams = []
 
+[dev-dependencies]
+# This crate's own integration tests (`tests/`) need the same seam the app
+# package's tests do, so the feature is enabled here for them — the only way to
+# reach `test-seams` from a `tests/` target, which is compiled without
+# `cfg(test)`.
+picot-host = { path = ".", features = ["test-seams"] }
+
 # Phase 1 (plan D1, Dr. Lin decision 4): no `tauri` dependency here, directly or
 # transitively. scripts/check-daemon-no-tauri.js enforces this in `bun run test`.
 # Host dependencies stay target-gated exactly as they were in the app package

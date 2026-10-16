@@ -9,6 +9,7 @@
 [[permission]]
 identifier = "allow-daemon-status"
 description = "Allow reading the daemon's status plus the app-private quit policy (Settings → General → Daemon)"
+
 commands.allow = ["daemon_status"]
 
 [[permission]]
@@ -20,6 +21,10 @@ commands.allow = ["daemon_set_keep_running"]
 identifier = "allow-daemon-restart"
 description = "Allow running the app-managed daemon restart transaction (Settings → General → Daemon)"
 commands.allow = ["daemon_restart"]
+[[permission]]
+identifier = "allow-daemon-agent-stop"
+description = "Allow stopping one exact Pi runtime by its full identity (closing a session tab)"
+commands.allow = ["daemon_agent_stop"]
 
 # Permission set that bundles all custom command permissions.
 # Referenced from capabilities/default.json as "pi-desktop:default".
@@ -29,4 +34,5 @@ permissions = [
   "allow-daemon-status",
   "allow-daemon-set-keep-running",
   "allow-daemon-restart",
+  "allow-daemon-agent-stop",
 ]
