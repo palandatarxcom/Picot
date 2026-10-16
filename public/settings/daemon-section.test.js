@@ -44,7 +44,7 @@ vi.mock("../i18n.js", async (importOriginal) => {
 });
 
 import { t } from "../i18n.js";
-import { setupDaemonSection } from "./daemon-section.js";
+import { setupDaemonSection, tauriDaemonTransport } from "./daemon-section.js";
 
 const EN = messagesFor("en");
 const SECTION_KEYS = "settings.daemon.";
@@ -464,3 +464,30 @@ async function renderEveryBranch() {
   }
   expect(typeof t("settings.daemon.title")).toBe("string");
 }
+
+describe("a shell without Tauri IPC", () => {
+  it("stays unavailable and silent instead of leaking the IPC error (PM C10②)", async () => {
+    const { statusValue, notice } = mountSection();
+    // No `window.__TAURI__`: a plain browser tab. The daemon relationship is
+    // app-level, so there is no failure for this shell to report.
+    delete window.__TAURI__;
+    const page = setupDaemonSection({ root: document });
+    await page.activate();
+    expect(statusValue.textContent).toBe(EN.settings.daemon.unknown);
+    // The notice element is hidden by the class (the markup carries no
+    // `hidden` attribute), so assert the class and the copy.
+    expect(notice.classList.contains("hidden")).toBe(true);
+    expect(notice.textContent).toBe("");
+  });
+
+  it("reports whether the app-level IPC is present at all", () => {
+    delete window.__TAURI__;
+    expect(tauriDaemonTransport().available()).toBe(false);
+    window.__TAURI__ = { core: { invoke: () => Promise.resolve() } };
+    expect(tauriDaemonTransport().available()).toBe(true);
+    // A call in a shell without IPC still rejects (the section must never
+    // claim a daemon state it cannot read).
+    delete window.__TAURI__;
+    return expect(tauriDaemonTransport().status()).rejects.toThrow(/Tauri IPC/);
+  });
+});

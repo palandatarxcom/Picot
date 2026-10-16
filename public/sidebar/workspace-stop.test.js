@@ -267,6 +267,85 @@ describe("sidebar workspace stop entry", () => {
   });
 });
 
+describe("workspace list removal", () => {
+  let previousFetch;
+  beforeEach(() => {
+    previousFetch = globalThis.fetch;
+    document.body.innerHTML = "<div id='sessions'></div>";
+  });
+  afterEach(() => {
+    globalThis.fetch = previousFetch;
+    for (const node of document.querySelectorAll(".sidebar-confirm-overlay")) node.remove();
+  });
+
+  function removeItem(sidebar, workspace) {
+    return menuFor(sidebar, workspace).find((button) =>
+      button.textContent.includes("Remove from list"),
+    );
+  }
+
+  test("remove-from-list stops nothing and opens no confirm (PM B9)", async () => {
+    const { sidebar, transport, notices } = await makeSidebar({ instances: [RUNNING_ON_BETA] });
+    await sidebar.loadSessions();
+    const beta = sidebar.projects.find((project) => project.workspaceId === "ws:uuid-2");
+
+    const remove = removeItem(sidebar, beta);
+    expect(remove).toBeDefined();
+    expect(remove.disabled).toBe(false);
+    remove.click();
+    await flush();
+    await flush();
+
+    expect(document.querySelector(".sidebar-confirm-overlay")).toBeNull();
+    expect(transport.stopWorkspace).not.toHaveBeenCalled();
+    expect(transport.removeWorkspace).toHaveBeenCalledWith("uuid-2");
+    expect(notices).toContain("Removed from the list; directory and session files were kept.");
+  });
+
+  test("a stop confirm left open is dismissed by another workspace action (PM B9)", async () => {
+    const { sidebar, transport } = await makeSidebar({ instances: [RUNNING_ON_BETA] });
+    await sidebar.loadSessions();
+    const beta = sidebar.projects.find((project) => project.workspaceId === "ws:uuid-2");
+
+    // The user opens Stop Running and does not answer it.
+    stopItem(sidebar, beta).click();
+    await flush();
+    expect(document.querySelector(".sidebar-confirm-overlay")).not.toBeNull();
+
+    // …then picks "Remove from list" instead. The pending stop must be
+    // dismissed, not left behind as "the dialog remove-from-list opened".
+    removeItem(sidebar, beta).click();
+    await flush();
+    await flush();
+
+    expect(document.querySelector(".sidebar-confirm-overlay")).toBeNull();
+    expect(transport.stopWorkspace).not.toHaveBeenCalled();
+    expect(transport.removeWorkspace).toHaveBeenCalledWith("uuid-2");
+  });
+
+  test("the current workspace's remove entry is disabled and stops nothing", async () => {
+    const { sidebar, transport, notices } = await makeSidebar({
+      instances: [RUNNING_ON_BETA],
+      isCurrentWorkspace: (project) => project?.path === "/work/beta",
+    });
+    await sidebar.loadSessions();
+    const beta = sidebar.projects.find((project) => project.workspaceId === "ws:uuid-2");
+
+    const remove = removeItem(sidebar, beta);
+    expect(remove.disabled).toBe(true);
+    // A dispatched click (a synthetic harness click, or a retargeted one) must
+    // still land on the refusal, never on the stop path.
+    remove.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await flush();
+    await flush();
+
+    expect(document.querySelector(".sidebar-confirm-overlay")).toBeNull();
+    expect(transport.stopWorkspace).not.toHaveBeenCalled();
+    expect(transport.removeWorkspace).not.toHaveBeenCalled();
+    expect(notices).toContain("Cannot remove the current workspace");
+  });
+});
+
 describe("workspace stop copy", () => {
   test("every stop key resolves in all four locales", () => {
     const keys = Object.keys(EN_SIDEBAR_STOP);

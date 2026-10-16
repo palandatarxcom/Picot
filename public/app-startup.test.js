@@ -645,3 +645,21 @@ test("persists the selected sidebar tab and restores it on reload", async () => 
   document.getElementById("file-sidebar-files-tab").click();
   expect(storage.get("pi-studio-file-sidebar-tab")).toBe("files");
 });
+
+test("a deep session link with no runtime still boots the page (PM C10①)", async () => {
+  // A browser (no desktop capability) opening a canonical session URL gets the
+  // shell from the host, but `/v2/bootstrap` answers 401/404. The page must
+  // still render — an unhandled rejection here leaves a blank tab.
+  window.history.replaceState({}, "", "/workspaces/ws-uuid-1/sessions/session-a");
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    await expect(import("./app.js?deep-link-degraded")).resolves.toBeDefined();
+    expect(document.getElementById("settings-btn")).not.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("rendering without one"),
+      expect.anything(),
+    );
+  } finally {
+    window.history.replaceState({}, "", "/");
+  }
+});

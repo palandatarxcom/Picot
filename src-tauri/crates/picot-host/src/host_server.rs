@@ -1378,6 +1378,11 @@ async fn search_sessions_blocking(
 /// Host-origin entry for production existing-shell windows. Route parameters
 /// are validated before serving bootstrap HTML; runtime authorization remains
 /// on `/v2/bootstrap` and `/v2/ws`, never in browser-provided URL state.
+///
+/// A deep link is a **page** route, so a session without a live runtime still
+/// gets the shell: the SPA renders the stopped session from disk and reports
+/// the missing runtime itself (PM finding C10①: a browser tab must never be
+/// answered with `runtime_not_found` JSON).
 async fn workspace_shell(
     State(state): State<Arc<HostState>>,
     axum::extract::Path((workspace_id, session_id)): axum::extract::Path<(String, String)>,
@@ -1390,7 +1395,12 @@ async fn workspace_shell(
         .target_for_session(&workspace_id, &session_id)
         .is_none()
     {
-        return Err(api_error(StatusCode::NOT_FOUND, "runtime_not_found"));
+        // No live runtime: serve the shell anyway and let the page degrade
+        // (the chat surface reports the stopped session). Logged because a
+        // deep link is the one way a browser reaches this route.
+        log::info!(
+            "[picot-host] deep link {workspace_id}/{session_id} has no live runtime; serving the shell"
+        );
     }
     let html = state
         .index_html
@@ -5635,6 +5645,39 @@ mod tests {
             },
             temp,
         )
+    }
+
+    /// A deep link is a *page* route: a session without a live runtime still
+    /// gets the SPA shell — the SPA renders the stopped session from disk —
+    /// never an API error body in a browser tab (PM finding C10①).
+    #[tokio::test]
+    async fn a_deep_link_without_a_live_runtime_still_serves_the_shell() {
+        let (host, harness, temp) = desktop_harness("deep-link", None).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(format!(
+                "{}/workspaces/{}/sessions/session-not-running",
+                host.origin(),
+                harness.workspace_id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "a deep link must serve the page, not answer a browser with runtime_not_found JSON"
+        );
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+        assert!(response.text().await.unwrap().contains("Picot"));
+        host.stop();
+        fs::remove_dir_all(temp).unwrap();
     }
 
     /// Landing-owner variant of `desktop_harness`: the owner carries NO

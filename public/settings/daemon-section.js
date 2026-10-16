@@ -30,6 +30,19 @@ export function tauriDaemonTransport() {
     return invoke(command, args);
   };
   return {
+    /**
+     * Whether this shell can reach the app-level commands at all. A plain
+     * browser tab has no Tauri IPC and therefore no daemon relationship: its
+     * failures are not the user's to act on, so the section stays quiet
+     * instead of leaking a Tauri-internal error into the page (PM finding
+     * C10②).
+     */
+    available: () => {
+      const host = typeof window === "undefined" ? globalThis : window;
+      return (
+        typeof (host.__TAURI__?.core?.invoke ?? globalThis.__TAURI__?.core?.invoke) === "function"
+      );
+    },
     status: () => call("daemon_status"),
     setKeepRunning: (value) => call("daemon_set_keep_running", { value }),
     restart: () => call("daemon_restart"),
@@ -82,6 +95,9 @@ export function setupDaemonSection({
   let actionError = null;
   /** Whether the sub-copy currently shows the post-save explanation. */
   let noteSaved = false;
+  /** Whether this shell has the app-level IPC (a plain browser tab has not). */
+  const ipcAvailable = () =>
+    typeof transport.available === "function" ? transport.available() !== false : true;
   /** Whether the panel is open: polling runs only then. */
   let active = false;
   /** Whether a restart transaction is in flight on this page. */
@@ -150,7 +166,12 @@ export function setupDaemonSection({
       readError = null;
     } catch (error) {
       status = null;
-      readError = t("settings.daemon.readFailed", { reason: errorMessage(error) });
+      // A shell without the app-level IPC (a plain browser tab) has no daemon
+      // to read: it stays “unavailable” and silent rather than telling the
+      // user that Tauri internals are missing (PM finding C10②).
+      readError = ipcAvailable()
+        ? t("settings.daemon.readFailed", { reason: errorMessage(error) })
+        : null;
     }
     render();
     return status;
@@ -230,8 +251,11 @@ export function setupDaemonSection({
       await refresh();
     } catch (error) {
       // The transaction aborted: the window is still here, and this is the only
-      // place the failure is visible.
-      actionError = t("settings.daemon.restartFailed", { reason: errorMessage(error) });
+      // place the failure is visible — except in a shell with no IPC at all,
+      // where there was never a restart to attempt (PM finding C10②).
+      actionError = ipcAvailable()
+        ? t("settings.daemon.restartFailed", { reason: errorMessage(error) })
+        : null;
       render();
       confirmBtn.disabled = false;
       cancelBtn.disabled = false;
@@ -254,7 +278,9 @@ export function setupDaemonSection({
     } catch (error) {
       renderToggle(!next);
       setNote(false);
-      actionError = t("settings.daemon.saveFailed", { reason: errorMessage(error) });
+      actionError = ipcAvailable()
+        ? t("settings.daemon.saveFailed", { reason: errorMessage(error) })
+        : null;
       render();
     }
   });

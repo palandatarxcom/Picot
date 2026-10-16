@@ -123,6 +123,10 @@ export class SessionSidebar {
     this.liveInstancesSnapshot = [];
     this.projectVisibleSessionCounts = new Map();
     this.contextMenu = null;
+    // The one open sidebar confirm (stop / delete), if any: the slot makes
+    // "only one modal at a time" an invariant instead of a convention, so a
+    // stale confirm can never be read as the dialog of a later action.
+    this.confirmDialog = null;
     // `loadSeq` counts issued loads; `loadCommitted` is the highest seq that has
     // actually rendered. We discard a response only when a *newer* one has
     // already committed (out-of-order arrival), never just because a newer load
@@ -334,9 +338,16 @@ export class SessionSidebar {
       dialog.append(message, prompt, expected, label, warning, actions);
       overlay.appendChild(dialog);
 
+      // Same single-modal invariant as the stop confirm: this dialog owns the
+      // slot while it is open, and settles exactly once.
+      let settled = false;
+      let releaseConfirm = () => {};
       const cleanup = (result) => {
+        if (settled) return;
+        settled = true;
         document.removeEventListener("keydown", onKeyDown);
         overlay.remove();
+        releaseConfirm();
         resolve(result);
       };
       const onKeyDown = (event) => {
@@ -360,6 +371,7 @@ export class SessionSidebar {
       });
       document.addEventListener("keydown", onKeyDown);
       document.body.appendChild(overlay);
+      releaseConfirm = this.openConfirmDialog(() => cleanup(false));
       input.focus();
     });
   }
@@ -390,9 +402,16 @@ export class SessionSidebar {
       dialog.append(messageElement, actions);
       overlay.appendChild(dialog);
 
+      // Same single-modal invariant as the stop confirm: this dialog owns the
+      // slot while it is open, and settles exactly once.
+      let settled = false;
+      let releaseConfirm = () => {};
       const cleanup = (result) => {
+        if (settled) return;
+        settled = true;
         document.removeEventListener("keydown", onKeyDown);
         overlay.remove();
+        releaseConfirm();
         resolve(result);
       };
 
@@ -409,6 +428,7 @@ export class SessionSidebar {
 
       document.addEventListener("keydown", onKeyDown);
       document.body.appendChild(overlay);
+      releaseConfirm = this.openConfirmDialog(() => cleanup(false));
     });
   }
 
@@ -1044,6 +1064,9 @@ export class SessionSidebar {
 
   showWorkspaceContextMenu(event, workspace) {
     event.preventDefault();
+    // One action at a time: a confirm left open from the previous action must
+    // not outlive this new one (PM finding B9).
+    this.closeConfirmDialog();
     this.closeContextMenu();
 
     const registryRow = workspace?.source === "registry";
@@ -1240,9 +1263,17 @@ export class SessionSidebar {
       dialog.appendChild(actions);
       overlay.appendChild(dialog);
 
+      // Settling is idempotent: the dialog can be closed by its own buttons,
+      // by Escape, or by the next action dismissing it as stale, and the first
+      // of those wins.
+      let settled = false;
+      let releaseConfirm = () => {};
       const cleanup = (result) => {
+        if (settled) return;
+        settled = true;
         document.removeEventListener("keydown", onKeyDown);
         overlay.remove();
+        releaseConfirm();
         resolve(result);
       };
       const onKeyDown = (event) => {
@@ -1255,6 +1286,7 @@ export class SessionSidebar {
       });
       document.addEventListener("keydown", onKeyDown);
       document.body.appendChild(overlay);
+      releaseConfirm = this.openConfirmDialog(() => cleanup(false));
     });
   }
 
@@ -1496,8 +1528,39 @@ export class SessionSidebar {
     }
   }
 
+  /**
+   * Register the confirm this call just opened and return the release for its
+   * own cleanup. Opening a second confirm (or asking to close) settles the
+   * pending one as cancelled first, so two modals can never be on screen.
+   */
+  openConfirmDialog(cancel) {
+    this.closeConfirmDialog();
+    const entry = { cancel };
+    this.confirmDialog = entry;
+    return () => {
+      if (this.confirmDialog === entry) this.confirmDialog = null;
+    };
+  }
+
+  /**
+   * Settle an open confirm as cancelled.
+   *
+   * The confirms are modal overlays, but a synthetic or dispatched click can
+   * reach an action behind one (a test harness, `element.click()`). Every
+   * workspace/session action therefore starts by dismissing whatever confirm is
+   * still open: otherwise the leftover "Stop Running?" dialog reads as *the
+   * dialog that action opened* (PM finding B9).
+   */
+  closeConfirmDialog() {
+    const pending = this.confirmDialog;
+    if (!pending) return;
+    this.confirmDialog = null;
+    pending.cancel();
+  }
+
   showSessionContextMenu(event, itemEl, session) {
     event?.preventDefault();
+    this.closeConfirmDialog();
     this.closeContextMenu();
     const renameBlocked = session ? this.renameBlockedReason(session.filePath) : null;
     if (renameBlocked) return;

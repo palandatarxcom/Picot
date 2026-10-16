@@ -677,7 +677,16 @@ setupLanQr({
 // Canonical workspace pages obtain host-derived runtime identity before opening
 // the socket. Browser URL state never supplies instance or owner identity.
 if (wsClient.canonicalRoute) {
-  await wsClient.loadCanonicalTarget();
+  // A canonical route normally carries a desktop capability, but a deep link
+  // opened in a plain browser tab — or a session whose runtime is not running —
+  // has none: the host answers `/v2/bootstrap` with 401/404 and the page must
+  // still render (from disk history) instead of failing module evaluation and
+  // leaving a blank tab (PM finding C10①).
+  try {
+    await wsClient.loadCanonicalTarget();
+  } catch (error) {
+    console.warn("[App] no runtime for this deep link; rendering without one:", error);
+  }
   // Upstream initial load: fetch the disk history in parallel with the
   // runtime — the file read does not wait for Pi to start.
   const canonicalTarget = wsClient.getRuntimeTarget();
