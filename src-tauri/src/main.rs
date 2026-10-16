@@ -1620,6 +1620,19 @@ impl DaemonLink {
             .contains(label)
     }
 
+    /// Whether **any** label is mid-migration: the transaction destroys every
+    /// captured window before re-creating it at the new origin (T9 step 5), so
+    /// for a moment the app legitimately has zero windows. The exit path reads
+    /// this to tell "the user closed Picot" apart from "the migration is
+    /// between two windows" (plan D10/T9 × T8).
+    pub fn is_migrating_any(&self) -> bool {
+        !self
+            .migrating
+            .lock()
+            .expect("migration label lock")
+            .is_empty()
+    }
+
     /// The app-side owner/authorization image the daemon feeds (plan D4).
     fn mirror_for(app: &AppHandle) -> Option<Arc<NavigationMirror>> {
         app.try_state::<DaemonLink>()
@@ -2255,6 +2268,41 @@ impl AppRestartLink {
             None => LedgerRow::landing(&row.label, &row.owner, &home),
         }
     }
+
+    /// Re-open the first migrated view when a failed migration left the app
+    /// with no window at all: the exit path holds a request that arrives during
+    /// the migration ([`classify_exit_request`]), so a window-less app would
+    /// never get another one. Best effort — a failure here is logged, not
+    /// fatal, because the transaction still has to report its own error.
+    fn redeem_windowless(&self, rows: &[ViewMigration]) {
+        if !self.app.webview_windows().is_empty() {
+            return;
+        }
+        let Some(row) = rows.first() else {
+            return;
+        };
+        let Some(mirror) = DaemonLink::mirror_for(&self.app) else {
+            return;
+        };
+        match open_native_window(
+            &self.app,
+            &row.label,
+            &row.url,
+            mirror,
+            window_owner::OwnerId::from_string(row.owner.clone()),
+            &row.capability,
+        ) {
+            Ok(_) => log::warn!(
+                "[picot] the restart migration left no window; re-opened {}",
+                row.label
+            ),
+            Err(error) => log::error!(
+                "[picot] the restart migration left no window and {} could not be re-opened: \
+                 {error}",
+                row.label
+            ),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2357,6 +2405,14 @@ impl RestartLink for AppRestartLink {
         link.begin_migration(&labels);
         let result = self.recreate_windows(rows).await;
         link.end_migration(&labels);
+        if result.is_err() {
+            // A failed migration must never leave the app with no window at
+            // all: the exit path holds a request that arrives during the
+            // migration (see `classify_exit_request`), and a window-less app
+            // would never get another one. Best effort — a failure here is
+            // logged, not fatal, because the transaction still has to report.
+            self.redeem_windowless(rows);
+        }
         result
     }
 }
@@ -2749,21 +2805,51 @@ fn main() {
         .run(|app_handle: &tauri::AppHandle, event| match event {
             tauri::RunEvent::Ready => install_termination_handlers(app_handle.clone()),
             tauri::RunEvent::ExitRequested { api, code, .. } => {
-                if code == Some(tauri::RESTART_EXIT_CODE) {
-                    // An app restart (the updater's relaunch surface op) is not a
-                    // quit: the daemon is left alone — the replacement app
-                    // instance adopts it, or version-stops it — and the state
-                    // machine is resolved so the `RunEvent::Exit` that follows
-                    // does not stop it either. `prevent_exit` would be a no-op
-                    // here anyway (tauri ignores it for this code).
-                    log::info!(
-                        "[picot] app restart requested; detaching without stopping the daemon"
-                    );
-                    if let Some(link) = app_handle.try_state::<DaemonLink>() {
-                        link.client().disconnect();
+                // Three different things arrive here (plan T8 step 2 × T9 step 5):
+                // an updater relaunch (code `RESTART_EXIT_CODE`), the user quit
+                // path, and — critically — the transient "no windows" of a
+                // restart migration, which destroys every captured window
+                // before re-creating it at the new origin. The last one must
+                // **not** run the quit flow: that flow stops (or detaches from)
+                // the daemon the user is migrating to and takes the app down.
+                let migration_in_flight = app_handle
+                    .try_state::<DaemonLink>()
+                    .is_some_and(|link| link.is_migrating_any());
+                let windows_open = !app_handle.webview_windows().is_empty();
+                match classify_exit_request(
+                    code,
+                    migration_in_flight,
+                    windows_open,
+                    quit_flow_started(),
+                ) {
+                    ExitRequestVerdict::RestartRelaunch => {
+                        // An app restart (the updater's relaunch surface op) is
+                        // not a quit: the daemon is left alone — the replacement
+                        // app instance adopts it, or version-stops it — and the
+                        // state machine is resolved so the `RunEvent::Exit`
+                        // that follows does not stop it either.
+                        // `prevent_exit` would be a no-op here anyway (tauri
+                        // ignores it for this code).
+                        log::info!(
+                            "[picot] app restart requested; detaching without stopping the \
+                             daemon"
+                        );
+                        if let Some(link) = app_handle.try_state::<DaemonLink>() {
+                            link.client().disconnect();
+                        }
+                        QUIT_STATE.store(2, Ordering::SeqCst);
+                        return;
                     }
-                    QUIT_STATE.store(2, Ordering::SeqCst);
-                    return;
+                    ExitRequestVerdict::Hold => {
+                        // Either a migration is between the destroyed and the
+                        // re-created window, or the "no windows left" request is
+                        // a stale one whose window already came back: hold the
+                        // app open without touching the daemon.
+                        log::info!("[picot] holding the app open: the restart migration owns the ");
+                        api.prevent_exit();
+                        return;
+                    }
+                    ExitRequestVerdict::Quit => {}
                 }
                 // The "all windows closed" / explicit `app.exit` path (plan Task 8
                 // Step 2): hold the exit while the daemon is stopped, and show the
@@ -2791,6 +2877,49 @@ fn main() {
             }
             _ => {}
         });
+}
+
+/// What an `ExitRequested` event means for this app (plan T8 step 2 × T9 step
+/// 5 × D10). Pure so the truth table is testable without a running event loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitRequestVerdict {
+    /// The updater's relaunch: leave the daemon alone and resolve the state.
+    RestartRelaunch,
+    /// Not a quit: the restart migration is between two windows, or the request
+    /// predates a window the migration already re-created. Hold, touch nothing.
+    Hold,
+    /// The user path: run the quit flow (stop/detach the daemon, then exit).
+    Quit,
+}
+
+/// Decide what an `ExitRequested` means.
+///
+/// `migration_in_flight` is [`DaemonLink::is_migrating_any`]: the T9 migration
+/// destroys each captured window before re-creating it at the new origin, so
+/// "all windows closed" is momentarily true **by design**. Treating that as a
+/// quit stops the daemon the transaction just started and takes the app down
+/// mid-migration (the Restart-≈-quit defect).
+///
+/// `windows_open` catches the same event arriving after the migration finished
+/// (the re-created window already exists): a "no windows left" request with a
+/// window open is stale, not a quit. `quit_in_flight` keeps the quit flow's own
+/// windows (the stopping splash) from holding that flow open.
+fn classify_exit_request(
+    code: Option<i32>,
+    migration_in_flight: bool,
+    windows_open: bool,
+    quit_in_flight: bool,
+) -> ExitRequestVerdict {
+    if code == Some(tauri::RESTART_EXIT_CODE) {
+        return ExitRequestVerdict::RestartRelaunch;
+    }
+    if migration_in_flight {
+        return ExitRequestVerdict::Hold;
+    }
+    if code.is_none() && windows_open && !quit_in_flight {
+        return ExitRequestVerdict::Hold;
+    }
+    ExitRequestVerdict::Quit
 }
 
 /// The quit flow's process-global state (plan Task 8 Step 2's "idempotent"
@@ -2947,6 +3076,81 @@ fn install_termination_handlers(app_handle: tauri::AppHandle) {
 
 #[cfg(not(unix))]
 fn install_termination_handlers(_app_handle: tauri::AppHandle) {}
+
+#[cfg(test)]
+mod exit_request_tests {
+    use super::{classify_exit_request, ExitRequestVerdict};
+    use tauri::RESTART_EXIT_CODE;
+
+    /// The migration's destroy→re-create gap: no window exists, but the app is
+    /// mid-restart. This is exactly the state the Restart-≈-quit defect fell
+    /// into: quitting here stops the daemon the transaction just started.
+    #[test]
+    fn the_migrations_window_gap_is_never_a_quit() {
+        assert_eq!(
+            classify_exit_request(None, true, false, false),
+            ExitRequestVerdict::Hold
+        );
+        // A migration with a window still open (rows migrate one by one) is the
+        // same "not a quit".
+        assert_eq!(
+            classify_exit_request(None, true, true, false),
+            ExitRequestVerdict::Hold
+        );
+    }
+
+    /// A "no windows" request that arrives after the migration re-created the
+    /// window is stale: there is a window now, so nothing is quitting.
+    #[test]
+    fn a_stale_no_windows_request_is_held_when_a_window_exists() {
+        assert_eq!(
+            classify_exit_request(None, false, true, false),
+            ExitRequestVerdict::Hold
+        );
+    }
+
+    /// The user path stays the user path: every window closed, nothing else
+    /// running, so the quit flow owns it.
+    #[test]
+    fn the_last_window_closing_is_still_a_quit() {
+        assert_eq!(
+            classify_exit_request(None, false, false, false),
+            ExitRequestVerdict::Quit
+        );
+    }
+
+    /// An explicit `exit` (code-carrying, e.g. the splash path's `exit(0)`) is
+    /// never held — not even while the splash window is open.
+    #[test]
+    fn an_explicit_exit_is_never_held_by_its_own_window() {
+        assert_eq!(
+            classify_exit_request(Some(0), false, true, true),
+            ExitRequestVerdict::Quit
+        );
+        // The quit flow's own "no windows" re-entry (splash still up) must not
+        // prevent the exit it is completing.
+        assert_eq!(
+            classify_exit_request(None, false, true, true),
+            ExitRequestVerdict::Quit
+        );
+    }
+
+    /// The updater's relaunch keeps its own verdict ahead of every other rule:
+    /// it must detach instead of stopping the daemon (and never be held).
+    #[test]
+    fn the_updater_relaunch_outranks_the_other_rules() {
+        for (migration, windows, quit) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                classify_exit_request(Some(RESTART_EXIT_CODE), migration, windows, quit),
+                ExitRequestVerdict::RestartRelaunch
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod skill_source_scope_tests {
