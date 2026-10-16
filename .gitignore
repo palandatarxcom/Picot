@@ -22,6 +22,7 @@ extensions/dist/
 # Embedded pi binary tree (produced by scripts/fetch-pi-binary.js)
 src-tauri/resources/pi/
 src-tauri/resources/pi-bolt/
+src-tauri/resources/pi.official/
 .cache/pi-binaries/
 .cache/pi-bolt-binaries/
 .cache/terminal-fonts/

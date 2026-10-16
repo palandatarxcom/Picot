@@ -1,10 +1,10 @@
 {
-  "version": "0.8.5",
-  "piVersion": "1.1.0",
+  "version": "0.9.3",
+  "piVersion": "1.3.0",
   "variant": "jit",
   "sha256": {
-    "pi-bolt-darwin-arm64-jit.tar.gz": "033e71d57d08e91909454deae190c54fc19e6ae7a6537b6bf3ac497ec57a3566",
-    "pi-bolt-win32-x64-jit.zip": "afda9a82d3db15975132b77721fec56a2b6dd48512804f0016f173cef433f28e"
+    "pi-bolt-darwin-arm64-jit.tar.gz": "dfa33e6eb680b52cb8f851aa3b70b12f67f78d015aa70696e74519850e84d9e0",
+    "pi-bolt-win32-x64-jit.zip": "a634aa90c256c5286eed36c6eba11d3f7c02c3734c7a31fd75051cb42838c68e"
   },
-  "_comment": "Pi-Bolt (github.com/opensec-git/Pi-Bolt) JIT builds fetched by scripts/fetch-pi-bolt.js into src-tauri/resources/pi-bolt/. version = bolt release (tag bolt-v*), piVersion = upstream Pi it was built from — must stay in sync with scripts/pi-version.json. sha256 values are taken from the release's SHA256SUMS asset (signature-verified by the installer, checksum-verified here)."
+  "_comment": "Pi-Bolt (github.com/opensec-git/Pi-Bolt) JIT builds fetched by scripts/fetch-pi-bolt.js into src-tauri/resources/pi-bolt/. version = bolt release (tag bolt-v*), piVersion = upstream Pi it was built from \u2014 informational only: Picot ships the official pi (scripts/pi-version.json); this pin serves Dr. Lin's personal pi-bolt environment and must never be wired into the build. sha256 values are taken from the release's SHA256SUMS asset (signature-verified by the installer, checksum-verified here)."
 }
