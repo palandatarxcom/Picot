@@ -68,7 +68,7 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 | sidebar 侧栏工作区菜单 →「停止运行」（**只有活 runtime 行才出现**；确认弹窗列出工作区与该工作区的运行状态，含「有回合正在跑」的提示） | 数据面 `workspace_close {workspaceId}`：只停该工作区名下的 runtime（进程组终止并 reap、child registry 条目落清），registry row 保留，窗口随后就是既有的 stopped-session 状态（host 发布 `runtime_stopped`，绿点与队列 pill 随进程消失）。当前工作区也允许停（与「从列表移除」不同）。`workspace.remove` 不做这件事，保持纯列表移除 |
 | ⌘Q 退出（`keepRunningAfterQuit=false`，默认） | 优雅停止：`daemon.stop` 返回 **accepted**，app 再阻塞等到**确认进程真的退出**（pid + 进程启动时间身份校验，超时后 SIGTERM→SIGKILL 升级）；RPC 断连本身不算完成 |
 | ⌘Q 退出（`keepRunningAfterQuit=true`） | daemon 与 agent 存活；重开 app 接回现场（含运行中的 turn） |
-| 设置 → Restart daemon | app 管理的**替换事务**：确认弹窗列出正在跑的 agent → `daemon.stop` + 确认旧实例已退出 → 只 spawn 一个替代实例 → 等 ready 并取得 lease → 重建每个窗口的 capability 与绑定 → 把每个 WebView 受控迁移到新 origin（一次性导航许可；允许受控重载）→ 恢复各视图的 session 路由 |
+| 设置 → Restart daemon | app 管理的**替换事务**：确认弹窗列出正在跑的 agent → `daemon.stop` + 确认旧实例已退出 → 只 spawn 一个替代实例 → 等 ready 并取得 lease → 重建每个窗口的 capability 与绑定 → 把每个 WebView 受控迁移到新 origin（一次性导航许可；允许受控重载）→ **session 路由视图降级为 landing**（重启排空全部 runtime，旧 session 路由只会指向死 runtime），其余路由原样恢复 |
 | app 被 SIGKILL / 崩溃 | admin 连接断开即标记该 attachment 死亡（短宽限）：撤其 capability、释放其窗口 label、执行与 detach 相同的归属回收；常驻 runtime 不动。重开 app 为这些 owner 重新签发，session-prepare 把「死 attachment 或已 detach 的 owner」名下的 runtime **原子 rebind** 到新 owner + generation；活 attachment 拥有的 runtime 永不被抢 |
 
 启动序（管理权在 app）：只读探测（实例文件 + 实例一致性校验 + `kill(pid,0)` + `GET /health`，**从不打开 admin 连接**）→ 未运行则 detached spawn（独立进程组，不进任何 kill-on-exit 名单）→ 等 ready（15s 超时，错误带 daemon 日志路径）→ 版本或 `buildId` 不匹配则**先取得 lease 再 stop、再重拉**（取不到 lease 就不动别人的 daemon）→ attach（`admin_hello` 取得 manager lease，第二个 live manager 被拒，在位者不受影响）。

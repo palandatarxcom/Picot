@@ -68,7 +68,7 @@
 - **启动序**：app 探测（实例文件 + 实例一致性校验 + `kill(pid,0)` 探活 + `/health`）→ 未运行则 spawn（detached，不进任何 kill-on-exit 名单）→ 版本不匹配自动 stop+重拉（app 升级后老 daemon 仍在跑，照抄 Paseo daemon-manager）→ 等 ready → 连接。
 - **实例文件（pidfile 扩展）**：pid / listen origin / startedAt / version，tmp+rename 原子写，Paseo daemon instance 同构。HTTP/WS 端口仍临时分配（现 bind 0 无持久化，§2「stable port」注释已过时），daemon ready 后把 origin 写入实例文件，app 读到 origin 才造窗与连接；ready 等待超时 15s，超时给明确错误与日志路径。
 - **崩溃恢复**：主路径 = 下次开 app 按需拉起。launchd LaunchAgent（登录自启 + 崩溃自动重启）降级为设置页 opt-in、默认关——不装用户没要求的常驻后台；Windows 服务 / Linux systemd 同为后续 opt-in 增量。
-- **重启**：设置页按钮（§3.2.2）→ admin RPC（仅 loopback desktop capability；remote 客户端不开放停机权限——管理面专属约定，非传输收窄）。重启 = agent 停止，恢复的是磁盘现场而非跑到一半的 turn；确认弹窗列出正在跑的 agent。**关闭**：不设设置页按钮（2026-10-15 拍板），仅由 quit 流程触发（开关为 false 时）。
+- **重启**：设置页按钮（§3.2.2）→ admin RPC（仅 loopback desktop capability；remote 客户端不开放停机权限——管理面专属约定，非传输收窄）。重启 = agent 停止，恢复的是磁盘现场而非跑到一半的 turn；确认弹窗列出正在跑的 agent。**2026-10-16 修订（窗口落位）**：重启排空全部 runtime，因此窗口迁移时 **session 路由降级为 landing**——捕获到的 `/workspaces/{id}/sessions/{id}` 丢弃 route 与 workspace 绑定，窗口落在新 origin 的 landing 页。理由是死 runtime 上的聊天视图有误导性：用户看到的是一个可用 UI，而输入框背后的 runtime 已经不存在（输入框骗人）。导航镜像的路由保真机制本身不变，留给未来「不排空 runtime」的迁移场景（如 §3.2.1 的 companion 订阅迁移）。**关闭**：不设设置页按钮（2026-10-15 拍板），仅由 quit 流程触发（开关为 false 时）。
 - **远程访问联动**：启用 relay 必须同时开启「退出后保持运行」，否则 quit 即断连，远程访问形同虚设。
 - **单实例**：文件锁；重复启动即退出复用现有实例。
 - **设置页展示**：见 §3.2.2。

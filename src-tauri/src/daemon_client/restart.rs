@@ -167,6 +167,40 @@ pub fn migration_rows(
         })
         .collect()
 }
+/// Whether `route` names a **session** (`/workspaces/{id}/sessions/{id}`), the
+/// shape the WebView's own canonical reader accepts
+/// (`public/app/websocket-client.js`).
+pub fn is_session_route(route: &str) -> bool {
+    let path = route.split('?').next().unwrap_or_default();
+    let mut parts = path.trim_matches('/').split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("workspaces"), Some(workspace), Some("sessions"), Some(session))
+            if !workspace.is_empty() && !session.is_empty()
+    )
+}
+
+/// A restart drains **every** runtime, so a captured session route has nothing
+/// left to show: the re-created window would render a chat view over a runtime
+/// that no longer exists, with a composer that does nothing. Session routes are
+/// therefore migrated as landing views (`route` and `workspace_id` dropped, so
+/// `rebuild_owner` mints a landing owner and the window opens at the origin
+/// root — spec §3.2, 2026-10-16 amendment).
+///
+/// Every other route is carried verbatim: the navigation mirror's route
+/// fidelity stays intact for a migration that does **not** drain runtimes.
+pub fn land_session_routes(views: Vec<CapturedView>) -> Vec<CapturedView> {
+    views
+        .into_iter()
+        .map(|mut view| {
+            if view.route.as_deref().is_some_and(is_session_route) {
+                view.route = None;
+                view.workspace_id = None;
+            }
+            view
+        })
+        .collect()
+}
 
 /// Where a transaction stopped when it could not finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -407,6 +441,11 @@ impl RestartCoordinator {
     }
 
     async fn perform(&self, views: Vec<CapturedView>) -> RestartOutcome {
+        // The replacement daemon starts with no runtimes at all, so a window
+        // captured at a session route would come back to a chat view over a
+        // runtime that does not exist. Land those on the app's landing page
+        // before anything is rebuilt (spec §3.2, 2026-10-16 amendment).
+        let views = land_session_routes(views);
         // Read at transaction start, never written: a restart does not change
         // the quit policy (spec §3.2.2).
         let keep_running_after_quit =
@@ -892,7 +931,13 @@ mod tests {
             "the seven steps run in their documented order"
         );
         assert_eq!(spawner.calls(), 1, "exactly one replacement");
-        assert_eq!(link.captures(), views(), "every captured view was rebuilt");
+        // The captured session route reaches `rebuild_owner` as a landing view:
+        // the replacement daemon has no runtime for it (#3).
+        assert_eq!(
+            link.captures(),
+            land_session_routes(views()),
+            "every captured view was rebuilt"
+        );
     }
 
     // ── The abort that must never spawn ─────────────────────────────────────
@@ -1068,9 +1113,81 @@ mod tests {
     }
 
     // ── Migration: one capability per view, one route per view ──────────────
+    /// The route shape the WebView itself reads back as "this document is a
+    /// session" (`public/app/websocket-client.js` `_readCanonicalRoute`): a
+    /// workspace id and a session id, in that order, with a query allowed.
+    #[test]
+    fn only_the_canonical_session_route_shape_counts_as_a_session_route() {
+        assert!(is_session_route("/workspaces/w1/sessions/s1"));
+        assert!(is_session_route("/workspaces/w1/sessions/s1?focus=w2"));
+        assert!(!is_session_route("/workspaces/w1"), "a workspace route");
+        assert!(!is_session_route("/workspaces/w1/"), "a workspace route");
+        assert!(!is_session_route("/sessions/s1"), "no workspace");
+        assert!(!is_session_route("/workspaces/w1/other/s1"));
+        assert!(!is_session_route("/workspaces//sessions/s1"), "an empty id");
+        assert!(!is_session_route("/workspaces/w1/sessions/"), "an empty id");
+        assert!(!is_session_route("/"));
+        assert!(!is_session_route(""));
+    }
+
+    /// The captured pre-state keeps every route, including a session route; the
+    /// transaction is what drops the ones the new daemon cannot serve.
+    #[test]
+    fn landing_a_drained_session_route_keeps_every_other_route_verbatim() {
+        let workspace_route = CapturedView {
+            route: Some("/workspaces/w1".to_string()),
+            ..workspace_view()
+        };
+        let landed = land_session_routes(vec![workspace_view(), workspace_route, landing_view()]);
+        assert_eq!(
+            landed[0],
+            CapturedView {
+                route: None,
+                workspace_id: None,
+                ..workspace_view()
+            },
+            "a session route becomes a landing view: no route, no workspace binding"
+        );
+        assert_eq!(
+            landed[1].route.as_deref(),
+            Some("/workspaces/w1"),
+            "a non-session route is not touched"
+        );
+        assert_eq!(landed[2], landing_view(), "a landing view is already there");
+    }
+
+    /// Every runtime died with the old daemon, so a window restored at a
+    /// session route would render a chat view over a runtime that does not
+    /// exist — a composer that does nothing. It lands on the app's landing page
+    /// instead (spec §3.2, 2026-10-16 amendment), through the transaction, not
+    /// by faking the row.
+    #[test]
+    fn a_session_route_view_is_migrated_to_the_landing_page() {
+        let journal = Arc::new(Journal::default());
+        let handle = FakeHandle::gone(Arc::clone(&journal));
+        let spawner = FakeSpawner::new(Arc::clone(&journal));
+        let link = FakeLink::new(Arc::clone(&journal));
+        let coordinator = coordinator(Arc::clone(&journal), handle, spawner, link);
+
+        let outcome = runtime().block_on(coordinator.run(views()));
+        let report = outcome.report().expect("restarted");
+
+        assert_eq!(
+            report.views[0].url, "http://127.0.0.1:6001/",
+            "the session route is gone: the runtime it pointed at died with the old daemon"
+        );
+        assert_eq!(
+            report.views[0].workspace_id, None,
+            "the window is a landing window, not a workspace window at a dead session"
+        );
+        assert!(
+            !report.views[0].degraded,
+            "landing by design, not because a rebuild failed"
+        );
+    }
 
     #[test]
-    fn migration_rebuilds_one_capability_per_captured_view_at_its_own_route() {
+    fn migration_rebuilds_one_capability_per_captured_view() {
         let journal = Arc::new(Journal::default());
         let handle = FakeHandle::gone(Arc::clone(&journal));
         let spawner = FakeSpawner::new(Arc::clone(&journal));
@@ -1087,11 +1204,11 @@ mod tests {
                 label: "native-workspace-w1".to_string(),
                 owner: "owner-native-workspace-w1".to_string(),
                 capability: "cap-native-workspace-w1".to_string(),
-                url: "http://127.0.0.1:6001/workspaces/w1/sessions/s1".to_string(),
-                workspace_id: Some("w1".to_string()),
+                url: "http://127.0.0.1:6001/".to_string(),
+                workspace_id: None,
                 degraded: false,
             },
-            "the workspace view keeps its session route on the new origin"
+            "the captured session route is migrated as a landing view (#3)"
         );
         assert_eq!(
             report.views[1],
@@ -1110,7 +1227,7 @@ mod tests {
         assert_eq!(owners.len(), report.views.len(), "no owner is shared");
         assert_eq!(
             link.captures(),
-            views(),
+            land_session_routes(views()),
             "every captured window got exactly one rebuild"
         );
     }
