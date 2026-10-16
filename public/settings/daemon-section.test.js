@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
 // ABOUTME: Verifies the Settings → General → Daemon section: status/toggle rendering,
-// ABOUTME: the policy-only quit toggle, the restart confirm flow, polling, and locale coverage.
+// ABOUTME: the policy-only quit toggle, the restart confirm flow, the permanent
+// ABOUTME: running-agents list and its stop flow, polling, and locale coverage.
 
 import { readFileSync } from "node:fs";
 import { JSDOM } from "jsdom";
@@ -113,11 +114,29 @@ function mountSection() {
     agents: document.getElementById("daemon-restart-agents"),
     confirmBtn: document.getElementById("btn-daemon-restart-confirm"),
     cancelBtn: document.getElementById("btn-daemon-restart-cancel"),
+    empty: document.getElementById("daemon-agents-empty"),
+    stopConfirm: document.getElementById("daemon-stop-confirm"),
+    stopTarget: document.getElementById("daemon-stop-confirm-target"),
+    stopConfirmBtn: document.getElementById("btn-daemon-stop-confirm"),
+    stopCancelBtn: document.getElementById("btn-daemon-stop-cancel"),
   };
 }
 
+/** The rows of the permanent list, without its empty-state node. */
+const agentRows = () => [
+  ...document.querySelectorAll("#daemon-agents li:not(#daemon-agents-empty)"),
+];
+
+/** The permanent list's Stop buttons, in row order. */
+const stopButtons = () => [...document.querySelectorAll("#daemon-agents .daemon-agent-stop")];
+
 /** Mock the WebView's `__TAURI__.core.invoke` and record every call. */
-function mountInvoke({ status = null, setKeepRunning = null, restart = null } = {}) {
+function mountInvoke({
+  status = null,
+  setKeepRunning = null,
+  restart = null,
+  stopAgent = null,
+} = {}) {
   const calls = [];
   const invoke = vi.fn(async (command, args) => {
     calls.push({ command, args });
@@ -132,6 +151,10 @@ function mountInvoke({ status = null, setKeepRunning = null, restart = null } = 
     if (command === "daemon_restart") {
       if (restart instanceof Error) throw restart;
       return typeof restart === "function" ? restart(args) : { pid: 4243 };
+    }
+    if (command === "daemon_agent_stop") {
+      if (stopAgent instanceof Error) throw stopAgent;
+      return typeof stopAgent === "function" ? stopAgent(args) : { stopped: args };
     }
     throw new Error(`unexpected command ${command}`);
   });
@@ -378,6 +401,162 @@ describe("restart", () => {
   });
 });
 
+// ── The permanent running-agents list (plan B2) ──────────────────────────────
+//
+// The v1 runtime management surface: a single-window Picot otherwise has no way
+// to stop one runtime, and the list is the only place the daemon's own view of
+// every live agent is on screen.
+describe("running agents list", () => {
+  it("renders a row per live runtime with its coordinator state", async () => {
+    const { page, empty } = setup({
+      status: status({
+        agents: [
+          agent({ sessionId: "s1", cwd: "/Users/x/proj", state: "working" }),
+          agent({ workspaceId: "w2", sessionId: "s2", cwd: null, state: "idle" }),
+        ],
+      }),
+    });
+    await page.activate();
+    const rows = agentRows();
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain("/Users/x/proj");
+    expect(rows[0].textContent).toContain("s1");
+    expect(rows[0].querySelector(".daemon-agent-state").textContent).toBe(
+      EN.settings.daemon.agentState.working,
+    );
+    // A runtime with no cwd falls back to its workspace id, like the restart
+    // confirm's rows.
+    expect(rows[1].textContent).toContain("w2");
+    expect(rows[1].querySelector(".daemon-agent-state").textContent).toBe(
+      EN.settings.daemon.agentState.idle,
+    );
+    expect(empty.hidden).toBe(true);
+  });
+
+  it("shows the empty-state placeholder when nothing is running", async () => {
+    const { page, empty } = setup({ status: status({ agents: [] }) });
+    await page.activate();
+    expect(empty.hidden).toBe(false);
+    expect(empty.textContent).toBe(EN.settings.daemon.agentsEmpty);
+    expect(agentRows()).toHaveLength(0);
+    expect(stopButtons()).toHaveLength(0);
+  });
+
+  it("stops a non-working agent directly, with the exact identity triple", async () => {
+    const { page, calls, stopConfirm } = setup({
+      status: status({ agents: [agent({ state: "idle" })] }),
+    });
+    await page.activate();
+    stopButtons()[0].click();
+    await flush();
+    const sent = calls.filter((call) => call.command === "daemon_agent_stop");
+    expect(sent).toHaveLength(1);
+    // The daemon matches the full triple, so the command carries all three ids
+    // and nothing else.
+    expect(sent[0].args).toEqual({ workspaceId: "w1", sessionId: "s1", instanceId: "i1" });
+    expect(stopConfirm.hidden).toBe(true);
+    // The list is re-read from the daemon, never updated optimistically.
+    expect(calls.map((call) => call.command)).toEqual([
+      "daemon_status",
+      "daemon_agent_stop",
+      "daemon_status",
+    ]);
+  });
+
+  it("asks before interrupting a working agent, and cancelling sends nothing", async () => {
+    const { page, calls, stopConfirm, stopTarget, stopCancelBtn } = setup({
+      status: status({ agents: [agent({ sessionId: "s9", state: "working" })] }),
+    });
+    await page.activate();
+    stopButtons()[0].click();
+    await flush();
+    // The decision is on screen; nothing has been sent yet.
+    expect(stopConfirm.hidden).toBe(false);
+    expect(stopTarget.textContent).toContain("s9");
+    expect(calls.map((call) => call.command)).toEqual(["daemon_status"]);
+
+    stopCancelBtn.click();
+    await flush();
+    expect(stopConfirm.hidden).toBe(true);
+    expect(calls.map((call) => call.command)).toEqual(["daemon_status"]);
+    expect(stopButtons()[0].textContent).toBe(EN.settings.daemon.stopAgent);
+
+    // Only the confirm sends the stop.
+    stopButtons()[0].click();
+    await flush();
+    document.getElementById("btn-daemon-stop-confirm").click();
+    await flush();
+    expect(calls.map((call) => call.command)).toEqual([
+      "daemon_status",
+      "daemon_agent_stop",
+      "daemon_status",
+    ]);
+  });
+
+  it("marks the stopped row while its call is in flight", async () => {
+    let release;
+    const { page, stopConfirm, notice } = setup({
+      status: status({ agents: [agent({ state: "idle" })] }),
+      stopAgent: () =>
+        new Promise((resolve) => {
+          release = () => resolve({ stopped: {} });
+        }),
+    });
+    await page.activate();
+    stopButtons()[0].click();
+    await flush();
+    expect(stopButtons()[0].textContent).toBe(EN.settings.daemon.stoppingAgent);
+    expect(stopButtons()[0].disabled).toBe(true);
+    release();
+    await flush();
+    await flush();
+    expect(stopButtons()[0].textContent).toBe(EN.settings.daemon.stopAgent);
+    expect(stopConfirm.hidden).toBe(true);
+    expect(notice.classList.contains("hidden")).toBe(true);
+  });
+
+  it("surfaces a failed stop without dropping the row", async () => {
+    const { page, notice } = setup({
+      status: status({ agents: [agent({ state: "idle" })] }),
+      stopAgent: new Error("no runtime matches that identity"),
+    });
+    await page.activate();
+    stopButtons()[0].click();
+    await flush();
+    await flush();
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain("no runtime matches that identity");
+    expect(agentRows()).toHaveLength(1);
+  });
+
+  it("disables every Stop while a restart transaction is draining runtimes", async () => {
+    let release;
+    const { page, stopConfirm } = setup({
+      status: status({ agents: [agent({ state: "idle" })] }),
+      restart: () =>
+        new Promise((resolve) => {
+          release = () => resolve({ pid: 4243 });
+        }),
+    });
+    await page.activate();
+    expect(stopButtons()[0].disabled).toBe(false);
+    document.getElementById("btn-daemon-restart").click();
+    await flush();
+    document.getElementById("btn-daemon-restart-confirm").click();
+    await flush();
+    expect(stopButtons()[0].disabled).toBe(true);
+    // A disabled button also refuses the confirmation path.
+    stopButtons()[0].click();
+    await flush();
+    expect(stopConfirm.hidden).toBe(true);
+    release();
+    await flush();
+    await flush();
+    expect(stopButtons()[0].disabled).toBe(false);
+  });
+});
+
+// ── Restart confirm layout ───────────────────────────────────────────────────
 // ── Restart confirm layout ───────────────────────────────────────────────────
 //
 // `.settings-row` sets `display: flex`, which beats the UA `[hidden]` rule: the
@@ -405,6 +584,19 @@ describe("restart confirm layout", () => {
     // reachable together with the list they belong to.
     expect(dom.confirm.contains(dom.agents)).toBe(true);
     expect(dom.confirm.contains(actions)).toBe(true);
+  });
+
+  it("hides the stop confirm and the empty state without a display of their own", () => {
+    const dom = mountSection();
+    // The stop confirm is a settings-row, so the rule above — not the UA
+    // default — is what keeps it hidden; the empty-state node is an `li` in
+    // the list, and nothing gives either container (or that li) a display
+    // declaration that would beat `[hidden]` (lesson from #1).
+    expect(dom.stopConfirm.classList.contains("settings-row")).toBe(true);
+    expect(dom.stopConfirm.hidden).toBe(true);
+    expect(STYLE).not.toMatch(/#daemon-agents-empty\s*\{[^}]*display\s*:/);
+    expect(STYLE).not.toMatch(/\.daemon-agent-list\s+li\s*\{[^}]*display\s*:/);
+    expect(STYLE).not.toMatch(/#daemon-agents\s*\{[^}]*display\s*:/);
   });
 });
 
@@ -523,6 +715,41 @@ async function renderEveryBranch() {
     document.getElementById("btn-daemon-restart").click();
     await flush();
     document.getElementById("btn-daemon-restart-confirm").click();
+    await flush();
+    await flush();
+  }
+  // The permanent list: its rows, its empty state, and both stop paths (a
+  // direct stop, and a working agent's confirm — the confirm's own copy lives
+  // in the markup, but its cancel and confirm buttons are still exercised).
+  for (const agents of [[agent({ state: "working" }), agent({ state: "idle" })], []]) {
+    mountSection();
+    mountInvoke({ status: status({ agents }) });
+    const page = setupDaemonSection({ root: document });
+    await page.activate();
+    // The first row is the working one: its Stop asks, cancel backs out, and
+    // the confirm sends it.
+    stopButtons()[0]?.click();
+    await flush();
+    stopButtons()[0]?.click();
+    await flush();
+    document.getElementById("btn-daemon-stop-cancel").click();
+    await flush();
+    stopButtons()[0]?.click();
+    await flush();
+    document.getElementById("btn-daemon-stop-confirm").click();
+    await flush();
+    await flush();
+  }
+  // The stop failure notice.
+  mountSection();
+  mountInvoke({
+    status: status({ agents: [agent({ state: "idle" })] }),
+    stopAgent: new Error("no"),
+  });
+  {
+    const page = setupDaemonSection({ root: document });
+    await page.activate();
+    stopButtons()[0].click();
     await flush();
     await flush();
   }

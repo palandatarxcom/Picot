@@ -3280,6 +3280,17 @@ body.landing-mode #landing {
   color: var(--text-secondary);
 }
 
+/* The permanent running-agents block: title over its list, one column. */
+.daemon-agents {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  width: 100%;
+}
+
+.daemon-agent-stop {
+  margin-inline-start: var(--space-2);
+}
 .daemon-confirm-actions {
   display: flex;
   justify-content: flex-end;

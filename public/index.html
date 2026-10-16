@@ -1244,6 +1244,67 @@
                   data-i18n-aria-label="settings.daemon.keepRunning"
                 ></button>
               </div>
+              <!-- The permanent runtime management surface (B2): every live
+                   agent with its coordinator state and its own Stop button.
+                   Unlike the restart confirm below, this block is always on
+                   screen — it is the entry point a single-window Picot
+                   otherwise has no way to reach. -->
+              <div class="settings-row" id="setting-daemon-agents">
+                <div class="daemon-agents">
+                  <span
+                    class="settings-label-main"
+                    data-i18n="settings.daemon.agentsTitle"
+                    >Running agents</span
+                  >
+                  <ul class="daemon-agent-list" id="daemon-agents">
+                    <li
+                      id="daemon-agents-empty"
+                      data-i18n="settings.daemon.agentsEmpty"
+                    >
+                      No agents are running.
+                    </li>
+                  </ul>
+                </div>
+              </div>
+              <div class="settings-row" id="daemon-stop-confirm" hidden>
+                <div class="daemon-confirm">
+                  <p
+                    class="settings-help"
+                    id="daemon-stop-confirm-text"
+                    data-i18n="settings.daemon.stopWorkingConfirmTitle"
+                  >
+                    Stop this agent?
+                  </p>
+                  <span
+                    class="settings-label-sub"
+                    id="daemon-stop-confirm-target"
+                  ></span>
+                  <p
+                    class="settings-help"
+                    id="daemon-stop-confirm-body"
+                    data-i18n="settings.daemon.stopWorkingConfirmBody"
+                  >
+                    It is working on a turn right now. Stopping it interrupts
+                    that turn, and its reply will not be delivered.
+                  </p>
+                  <div class="daemon-confirm-actions">
+                    <button
+                      class="settings-value-btn"
+                      id="btn-daemon-stop-cancel"
+                      data-i18n="settings.daemon.stopCancel"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      class="settings-value-btn is-primary"
+                      id="btn-daemon-stop-confirm"
+                      data-i18n="settings.daemon.stopWorkingConfirmAction"
+                    >
+                      Stop anyway
+                    </button>
+                  </div>
+                </div>
+              </div>
               <div class="settings-row" id="setting-daemon-restart">
                 <span class="settings-label settings-label-stack">
                   <span class="settings-label-main" data-i18n="settings.daemon.restart"

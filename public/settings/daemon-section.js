@@ -1,5 +1,6 @@
 // ABOUTME: Settings → General → Daemon section: the daemon's status row, the app-private
-// ABOUTME: keepRunningAfterQuit toggle, and the restart transaction's confirm flow.
+// ABOUTME: keepRunningAfterQuit toggle, the restart transaction's confirm flow, and the
+// ABOUTME: permanent running-agents list with its per-runtime stop.
 
 import { t as i18n, onLocaleChange } from "../i18n.js";
 
@@ -12,7 +13,8 @@ export const POLL_INTERVAL_MS = 5000;
 
 /**
  * The Tauri IPC transport: `daemon_status` / `daemon_set_keep_running` /
- * `daemon_restart` are the app's three commands (plan D8/T10).
+ * `daemon_restart` / `daemon_agent_stop` are the app's four commands (plan
+ * D8/T10 and B2).
  *
  * `withGlobalTauri` puts `__TAURI__.core.invoke` on the WebView global, so no
  * npm dependency is needed (the same path the rest of the shell uses). The
@@ -46,6 +48,9 @@ export function tauriDaemonTransport() {
     status: () => call("daemon_status"),
     setKeepRunning: (value) => call("daemon_set_keep_running", { value }),
     restart: () => call("daemon_restart"),
+    // The one-runtime stop (plan B2). The triple is forwarded verbatim: the
+    // daemon refuses anything it cannot identify exactly.
+    stopAgent: (args) => call("daemon_agent_stop", args),
   };
 }
 
@@ -94,7 +99,25 @@ export function setupDaemonSection({
   const agentsList = root.getElementById("daemon-restart-agents");
   const confirmBtn = root.getElementById("btn-daemon-restart-confirm");
   const cancelBtn = root.getElementById("btn-daemon-restart-cancel");
-  if (!section || !statusValue || !toggle || !restartBtn || !confirmRow) {
+  const agentsBlock = root.getElementById("daemon-agents");
+  const agentsEmpty = root.getElementById("daemon-agents-empty");
+  const stopConfirmRow = root.getElementById("daemon-stop-confirm");
+  const stopConfirmTarget = root.getElementById("daemon-stop-confirm-target");
+  const stopConfirmBtn = root.getElementById("btn-daemon-stop-confirm");
+  const stopCancelBtn = root.getElementById("btn-daemon-stop-cancel");
+  if (
+    !section ||
+    !statusValue ||
+    !toggle ||
+    !restartBtn ||
+    !confirmRow ||
+    !agentsBlock ||
+    !agentsEmpty ||
+    !stopConfirmRow ||
+    !stopConfirmTarget ||
+    !stopConfirmBtn ||
+    !stopCancelBtn
+  ) {
     return {
       activate: async () => {},
       leave: () => {},
@@ -120,6 +143,10 @@ export function setupDaemonSection({
   let busy = false;
   /** Whether the confirm block is awaiting the user's decision. */
   let confirmOpen = false;
+  /** The working agent whose Stop is awaiting the user's decision, if any. */
+  let stopTarget = null;
+  /** The instance id of the agent whose stop is in flight, if any. */
+  let stoppingId = null;
   let pollTimer = null;
 
   function setNotice(message) {
@@ -159,6 +186,7 @@ export function setupDaemonSection({
 
   function render() {
     renderStatus();
+    renderAgents();
     setNote(noteSaved);
     // Precedence: what the user just tried, then why the read failed, then the
     // daemon's own reason for being down.
@@ -207,17 +235,105 @@ export function setupDaemonSection({
     agentsLabel.textContent = "";
   }
 
-  /** One list row per live runtime: workspace root, session id, coordinator state. */
-  function agentRow(agent) {
-    const li = root.createElement("li");
+  /** A row's identity line: workspace root (or id) and session id. */
+  function agentLabel(agent) {
     const workspace = agent?.cwd || agent?.workspaceId || "—";
     const session = agent?.sessionId ? String(agent.sessionId) : "";
-    li.textContent = `${session ? `${workspace} · ${session}` : String(workspace)} · `;
+    return session ? `${workspace} · ${session}` : String(workspace);
+  }
+
+  /** The row's stop key: the instance id, which is what the daemon carries. */
+  const agentKey = (agent) => (agent?.instanceId == null ? null : String(agent.instanceId));
+
+  /**
+   * One list row per live runtime: workspace root, session id, coordinator
+   * state, and — in the permanent list — that runtime's own Stop button.
+   */
+  function agentRow(agent, onStop) {
+    const li = root.createElement("li");
+    li.textContent = `${agentLabel(agent)} · `;
     const state = root.createElement("span");
     state.className = "daemon-agent-state";
     state.textContent = agentStateLabel(agent?.state);
     li.append(state);
+    if (onStop) {
+      const stop = root.createElement("button");
+      stop.className = "settings-value-btn daemon-agent-stop";
+      const stopping = stoppingId !== null && agentKey(agent) === stoppingId;
+      stop.textContent = t(
+        stopping ? "settings.daemon.stoppingAgent" : "settings.daemon.stopAgent",
+      );
+      // A restart transaction is draining every runtime: racing it with a
+      // per-runtime stop is what the disabled button prevents.
+      stop.disabled = busy || stopping;
+      stop.addEventListener("click", () => onStop(agent));
+      li.append(stop);
+    }
     return li;
+  }
+
+  /**
+   * The permanent list. Rebuilt from the last status document, so a poll (5s)
+   * and a locale change both land here; the empty-state node is the markup's,
+   * kept last so it is never duplicated.
+   */
+  function renderAgents() {
+    const agents = status && Array.isArray(status.agents) ? status.agents : [];
+    agentsEmpty.textContent = t("settings.daemon.agentsEmpty");
+    agentsEmpty.hidden = agents.length > 0;
+    agentsBlock.replaceChildren(
+      ...agents.map((agent) => agentRow(agent, requestStop)),
+      agentsEmpty,
+    );
+  }
+
+  /** A row's Stop click: a working agent asks first, anything else stops now. */
+  function requestStop(agent) {
+    if (busy || stoppingId !== null) return;
+    if (agent?.state === "working") {
+      stopTarget = agent;
+      renderStopConfirm();
+      return;
+    }
+    void stopAgent(agent);
+  }
+
+  function renderStopConfirm() {
+    stopConfirmRow.hidden = stopTarget === null;
+    stopConfirmTarget.textContent = stopTarget ? agentLabel(stopTarget) : "";
+    stopConfirmBtn.disabled = false;
+    stopCancelBtn.disabled = false;
+  }
+
+  function closeStopConfirm() {
+    stopTarget = null;
+    renderStopConfirm();
+  }
+
+  /**
+   * Stop one exact runtime, then re-read the truth: only a fresh status shows
+   * what actually survived, so the row is never updated optimistically.
+   */
+  async function stopAgent(agent) {
+    stoppingId = agentKey(agent);
+    stopTarget = null;
+    renderStopConfirm();
+    renderAgents();
+    try {
+      await transport.stopAgent({
+        workspaceId: agent?.workspaceId,
+        sessionId: agent?.sessionId,
+        instanceId: agent?.instanceId,
+      });
+      actionError = null;
+    } catch (error) {
+      actionError = ipcAvailable()
+        ? t("settings.daemon.stopFailed", { reason: errorMessage(error) })
+        : null;
+    } finally {
+      stoppingId = null;
+    }
+    await refresh();
   }
 
   /**
@@ -265,6 +381,8 @@ export function setupDaemonSection({
    */
   async function restart() {
     busy = true;
+    // Every row's Stop is disabled for the duration of the transaction.
+    renderAgents();
     confirmBtn.disabled = true;
     cancelBtn.disabled = true;
     confirmBtn.textContent = t("settings.daemon.restarting");
@@ -291,6 +409,7 @@ export function setupDaemonSection({
       confirmBtn.textContent = t("settings.daemon.restartConfirmAction");
     } finally {
       busy = false;
+      renderAgents();
     }
   }
 
@@ -326,6 +445,14 @@ export function setupDaemonSection({
     if (busy) return;
     closeConfirm();
   });
+  stopConfirmBtn.addEventListener("click", () => {
+    if (busy || stopTarget === null) return;
+    void stopAgent(stopTarget);
+  });
+  stopCancelBtn.addEventListener("click", () => {
+    if (busy) return;
+    closeStopConfirm();
+  });
 
   // Every dynamic string is rebuilt on a locale change; the status values
   // themselves are locale-free, so nothing is re-fetched.
@@ -350,6 +477,7 @@ export function setupDaemonSection({
       readError = null;
       noteSaved = false;
       closeConfirm();
+      closeStopConfirm();
       confirmRowText();
       await refresh();
       stopPolling();
@@ -362,6 +490,7 @@ export function setupDaemonSection({
       active = false;
       stopPolling();
       closeConfirm();
+      closeStopConfirm();
       unsubscribe();
     },
     refresh,
