@@ -65,6 +65,44 @@ fn daemon_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_picot-daemon"))
 }
 
+/// The build identity the daemon binary under test reports (`--version`).
+///
+/// The instance file must carry **this** value: it is the identity the app
+/// compares against its own compiled `picot_host::BUILD_ID`. It is deliberately
+/// not compared against *this test binary's* `picot_host::BUILD_ID`.
+///
+/// `picot-host/build.rs` carries no `cargo:rerun-if-changed`, so cargo re-runs
+/// it only when a file of the `picot-host` package changes — and a commit
+/// changes no such file. Every cargo unit (feature set × profile × config) then
+/// keeps the `git describe` it captured when it last ran, and two units of the
+/// *same* source legitimately hold describes one commit apart: this workspace
+/// has `libpicot_host-*.rlib` files carrying `…-423-…` and `…-426-…` side by
+/// side (two coexisting cargo configurations for `picot-host`, plus its feature
+/// sets and profiles), while `target/debug/` — including the single
+/// `target/debug/picot-daemon` artifact path — is shared by every invocation.
+/// Comparing across artifacts made this contract fail on the first run after a
+/// commit and pass on a rerun (A4 follow-up #2).
+///
+/// `daemon_client::restart`'s test carries the same rule and the same reason —
+/// the identity it compares is the one the daemon it started published, because
+/// `picot_host::BUILD_ID` "is baked in at its compile time and can legitimately
+/// differ by one commit from a binary built later in the same session".
+fn daemon_build_id() -> String {
+    let version = run_daemon(&["--version"]);
+    assert_eq!(exit_code(version.status), 0, "--version must succeed");
+    let printed = stdout_of(&version);
+    build_id_from_version(&printed)
+        .unwrap_or_else(|| panic!("--version must print the build id: {printed:?}"))
+}
+
+/// The `<id>` of `picot-daemon <version> (build <id>)` — the line both sides of
+/// the app/daemon identity comparison are read from.
+fn build_id_from_version(printed: &str) -> Option<String> {
+    let start = printed.find("(build ")? + "(build ".len();
+    let end = printed[start..].find(')')? + start;
+    (!printed[start..end].is_empty()).then(|| printed[start..end].to_string())
+}
+
 /// One isolated data/config/static triple — one daemon's whole world.
 struct Standalone {
     _temp: tempfile::TempDir,
@@ -351,10 +389,14 @@ async fn the_real_binary_boots_serves_health_and_a_sigterm_clears_its_files() {
         "the instance file describes the process that wrote it"
     );
     assert_eq!(file.version, env!("CARGO_PKG_VERSION"));
+    // The identity the document carries is the one the **daemon binary** was
+    // built with — the value the app compares its own compiled
+    // `picot_host::BUILD_ID` against. It is read from the binary under test
+    // rather than from this test binary's constant: see [`daemon_build_id`].
     assert_eq!(
         file.build_id,
-        picot_host::BUILD_ID,
-        "the document carries the build identity the app compares against"
+        daemon_build_id(),
+        "the document carries the daemon's own build identity, which is what the app compares"
     );
     assert!(
         !file.admin_token.is_empty(),
@@ -700,6 +742,20 @@ fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// The `--version` line is the app/daemon identity comparison's human surface:
+/// the parser behind [`daemon_build_id`] must read the bracketed id, and must
+/// refuse a line with no id rather than return an empty string that would make
+/// the instance-file assertion vacuous.
+#[test]
+fn the_version_line_names_the_build_id() {
+    assert_eq!(
+        build_id_from_version("picot-daemon 0.5.0 (build v0.3.6.1-426-g5058a16)").as_deref(),
+        Some("v0.3.6.1-426-g5058a16")
+    );
+    assert_eq!(build_id_from_version("picot-daemon 0.5.0 (build )"), None);
+    assert_eq!(build_id_from_version("picot-daemon 0.5.0"), None);
+}
+
 /// Step 2's argv surface, against the real binary: the documented exit codes and
 /// a `--version` that names the build identity both sides compare.
 #[tokio::test(flavor = "multi_thread")]
@@ -707,15 +763,24 @@ async fn the_argv_and_usage_contract_is_enforced_by_the_real_binary() {
     let world = Standalone::new();
 
     // `--version` is what a human uses to compare the two sides' identity, so it
-    // must print version *and* build id.
+    // must print version *and* build id. The id is read back from the output
+    // rather than from this test binary's `picot_host::BUILD_ID`, which may come
+    // from a different cargo unit than the binary under test (see
+    // [`daemon_build_id`]).
     let version = run_daemon(&["--version"]);
     assert_eq!(exit_code(version.status), 0);
     let printed = stdout_of(&version);
     assert!(printed.contains("picot-daemon"), "{printed}");
     assert!(printed.contains(env!("CARGO_PKG_VERSION")), "{printed}");
-    assert!(
-        printed.contains(picot_host::BUILD_ID),
-        "the app compares version + build id, so --version must print both: {printed}"
+    let build_id = build_id_from_version(&printed)
+        .unwrap_or_else(|| panic!("--version must print the build id: {printed:?}"));
+    assert_eq!(
+        printed.trim(),
+        format!(
+            "picot-daemon {} (build {build_id})",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "a human compares the two sides' identity with this exact line"
     );
 
     let help = run_daemon(&["--help"]);
