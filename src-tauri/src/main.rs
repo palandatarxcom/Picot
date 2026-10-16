@@ -2845,7 +2845,9 @@ fn main() {
                         // re-created window, or the "no windows left" request is
                         // a stale one whose window already came back: hold the
                         // app open without touching the daemon.
-                        log::info!("[picot] holding the app open: the restart migration owns the ");
+                        log::info!(
+                            "[picot] holding the app open: the restart migration owns this exit"
+                        );
                         api.prevent_exit();
                         return;
                     }
