@@ -24,6 +24,7 @@ use daemon_client::restart::{
     CapturedView, ManagerSpawner, OwnerBinding, RestartConfig, RestartCoordinator, RestartLink,
     RestartReport, RestartTarget, ViewMigration,
 };
+use daemon_client::startup_failure::StartupFailure;
 use daemon_client::surface_ops::ForwardedSurfaceOps;
 use daemon_client::window_ledger::{route_for_url, LedgerRow, WindowLedger};
 use picot_host::daemon::admin::ManagerIdentity;
@@ -1809,20 +1810,33 @@ async fn attach_daemon(
 
 /// Boot the app around its daemon (plan Task 5 Step 3).
 ///
+/// Errors come back as a [`StartupFailure`] — the reason plus the daemon log
+/// file to point the user at — because the caller does not panic on them: the
+/// dialog is presented from the run loop's `Ready` event (see
+/// [`daemon_client::startup_failure`]). Every step past the data directory is
+/// tagged with that directory's daemon log.
+///
 /// One sequence since T12 deleted the in-process mode: get the daemon running
 /// as its own process (`DaemonManager::ensure`), connect the `AdminClient` to
 /// its admin listener, mint the landing owner over that channel, and open the
 /// landing window at the daemon's host origin. There is no in-process shortcut —
 /// the app holds no host state (plan D2/D4).
-fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(), String> {
+fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(), StartupFailure> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("Cannot resolve Picot app data directory: {error}"))?;
+    // From here on a failure can name the daemon log: a detached daemon's only
+    // other trace (`StartupFailure::for_data_dir`).
+    let fail = {
+        let data_dir = data_dir.clone();
+        move |reason: String| StartupFailure::for_data_dir(reason, &data_dir)
+    };
     let config_dir = app
         .path()
         .app_config_dir()
-        .map_err(|error| format!("Cannot resolve Picot app config directory: {error}"))?;
+        .map_err(|error| format!("Cannot resolve Picot app config directory: {error}"))
+        .map_err(&fail)?;
     let bundle_identifier = app.config().identifier.clone();
     // The app's window registry (T9/T10): recorded as windows are created, read
     // by the restart transaction's capture. Managed before the daemon boots, so
@@ -1841,7 +1855,8 @@ fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
         bundle_identifier,
         executor,
         Arc::clone(&mirror),
-    ))?;
+    ))
+    .map_err(&fail)?;
     let (manager, client, host_origin, daemon) = match attached {
         AttachedDaemon::BlockedByOtherApp => {
             // The dialog blocks and the process exits non-zero: a second Picot
@@ -1869,21 +1884,23 @@ fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
     // The landing owner: no registered workspace, placeholder home cwd. Minted
     // over the admin channel, so the mirror learns its origin before the window
     // can load it.
-    let home = canonical_home_dir()?;
+    let home = canonical_home_dir().map_err(&fail)?;
     let landing = tauri::async_runtime::block_on(client.create_owner(
         "native-landing",
         Some(&home.to_string_lossy()),
         0,
         &host_origin,
         None,
-    ))?;
+    ))
+    .map_err(&fail)?;
     open_native_landing_window(
         app.handle(),
         &host_origin,
         Arc::clone(&mirror),
         window_owner::OwnerId::from_string(landing.owner.clone()),
         &landing.capability,
-    )?;
+    )
+    .map_err(&fail)?;
     if let Some(ledger) = app.try_state::<WindowLedger>() {
         ledger.record(LedgerRow::landing(
             "native-landing",
@@ -2720,6 +2737,20 @@ fn disable_press_and_hold_accents() {
     defaults.setBool_forKey(false, &key);
 }
 
+/// A boot failure parked by the `setup` hook, for the `RunEvent::Ready` arm to
+/// present. `setup` runs on the main thread inside the run loop, so it can only
+/// record the failure; the alert is shown once the main thread is back in its
+/// run loop (`daemon_client::startup_failure`).
+static STARTUP_FAILURE: Mutex<Option<StartupFailure>> = Mutex::new(None);
+
+fn record_startup_failure(failure: StartupFailure) {
+    *STARTUP_FAILURE.lock().expect("startup failure slot") = Some(failure);
+}
+
+fn take_startup_failure() -> Option<StartupFailure> {
+    STARTUP_FAILURE.lock().expect("startup failure slot").take()
+}
+
 fn main() {
     // Host tasks spawned through `picot_host::runtime::spawn` must land on the
     // app's tokio runtime (the one `tauri::async_runtime` owns): the pre-split
@@ -2812,7 +2843,16 @@ fn main() {
         .setup(|app| {
             let static_dir = find_static_dir(app);
             // Native HostServer and stdio Pi runtime are the only startup path.
-            setup_daemon_runtime(app, static_dir).map_err(std::io::Error::other)?;
+            // A boot failure is *not* returned to Tauri: `setup` runs on the
+            // main thread inside the run loop's `Ready` callback, so an `Err`
+            // there becomes `panicked at 'Failed to setup app'` — an abort on
+            // the main thread of a bundled app, i.e. exit 134 plus a system
+            // crash report. The failure is parked instead and presented by the
+            // `Ready` arm below (`daemon_client::startup_failure` names the
+            // reason why the alert can only be drawn from there).
+            if let Err(failure) = setup_daemon_runtime(app, static_dir) {
+                record_startup_failure(failure);
+            }
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -2845,7 +2885,19 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle: &tauri::AppHandle, event| match event {
-            tauri::RunEvent::Ready => install_termination_handlers(app_handle.clone()),
+            tauri::RunEvent::Ready => {
+                // A boot failure parked by `setup` pre-empts the rest of
+                // startup: the app shows the alert and exits 1 from here.
+                // `Ready` (unlike the `setup` hook, which runs inside this very
+                // callback) is the first moment the main thread can return to
+                // its run loop, which is what lets the posted alert be drawn —
+                // see `daemon_client::startup_failure`.
+                if let Some(failure) = take_startup_failure() {
+                    daemon_client::startup_failure::present_startup_failure(app_handle, failure);
+                    return;
+                }
+                install_termination_handlers(app_handle.clone())
+            }
             tauri::RunEvent::ExitRequested { api, code, .. } => {
                 // Three different things arrive here (plan T8 step 2 × T9 step 5):
                 // an updater relaunch (code `RESTART_EXIT_CODE`), the user quit

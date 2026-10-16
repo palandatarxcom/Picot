@@ -30,7 +30,11 @@
 //!   `daemon_restart` (T9's transaction) — each validating the Tauri-injected
 //!   calling window against the ledger and the mirror;
 //! - [`present_blocked_by_other_app`] — the localized dialog + non-zero exit for
-//!   a second Picot instance while another app manages the daemon.
+//!   a second Picot instance while another app manages the daemon;
+//! - [`startup_failure`] — the *other* dialog-and-exit: an unrecoverable boot
+//!   failure (a bad sidecar, a daemon that never becomes ready) is presented as
+//!   a localized alert plus `exit(1)`, not as a setup-hook panic (an abort with
+//!   a macOS crash report).
 //!
 //! ## Wiring status
 //!
@@ -60,6 +64,7 @@ pub mod manager;
 pub mod navigation_mirror;
 pub mod quit_policy;
 pub mod restart;
+pub mod startup_failure;
 pub mod surface_ops;
 pub mod window_ledger;
 
