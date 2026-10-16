@@ -58,41 +58,19 @@ pub struct PaneRect {
     pub height: f64,
 }
 
-/// App-owned child-webview surface behind the `browser_pane_*` data-plane ops.
+/// Async forwarder behind the seven `browser_pane_*` data-plane ops.
 ///
-/// The concrete runtime lives in the Tauri app package (`browser_pane.rs`), so
-/// the host holds a trait slot instead of that type: the host crate stays free
-/// of Tauri (plan D1). A host that owns no WebView pairs this with a
-/// [`PaneForwarder`] (review B1); a host with neither answers `unavailable`.
-#[async_trait::async_trait]
-pub trait PaneSurface: Send + Sync {
-    fn create(
-        &self,
-        pane_id: &str,
-        window_label: &str,
-        url: &str,
-        rect: PaneRect,
-    ) -> Result<(), String>;
-    fn set_rect(&self, pane_id: &str, rect: PaneRect) -> Result<(), String>;
-    fn set_visible(&self, pane_id: &str, visible: bool) -> Result<(), String>;
-    async fn eval_json(&self, pane_id: &str, expression: &str) -> Result<String, String>;
-    fn navigate(&self, pane_id: &str, url: &str) -> Result<(), String>;
-    fn url(&self, pane_id: &str) -> Result<String, String>;
-    fn destroy(&self, pane_id: &str) -> Result<(), String>;
-}
-
-/// Async forwarder behind the same seven `browser_pane_*` data-plane ops as
-/// [`PaneSurface`], for a host that owns no WebView.
+/// The child webviews, their window labels and their events live in the app
+/// process (the app package's `browser_pane::BrowserPaneRuntime`), so the host
+/// crate stays free of Tauri (plan D1) and *never* holds the runtime itself:
+/// every op travels to the app as one `app_surface_request { op: "pane" }`
+/// frame and is executed there (review B1 — the seven `browser_pane_*` ops were
+/// a dead end in external mode). A host without a forwarder answers
+/// `unavailable`, exactly as a process with no WebView did before.
 ///
-/// [`PaneSurface`] is the *in-process* child-webview runtime (the app package's
-/// `browser_pane.rs`). A headless daemon cannot hold one — the child webviews,
-/// their window labels and their events live in the app process — so it
-/// installs this seam instead: every op travels to the app as one
-/// `app_surface_request { op: "pane" }` frame and is executed there (review B1,
-/// the seven `browser_pane_*` ops were a dead end in external mode).
-///
-/// `PaneSurface` is preferred when both are installed; a host with neither
-/// answers `unavailable`, exactly as a process with no WebView did before.
+/// This is the only pane path: the in-process `PaneSurface` trait slot it once
+/// deferred to was deleted (follow-up #6) — production never installed it, so
+/// it could only mask this forwarding path in tests.
 #[async_trait::async_trait]
 pub trait PaneForwarder: Send + Sync {
     /// Run one child-webview op app-side; `Err` carries the app's message.
@@ -169,10 +147,8 @@ struct HostState {
     #[allow(dead_code)]
     desktop_capabilities: Mutex<HostCapabilityStore>,
     owner_registry: Mutex<Option<Arc<WindowOwnerRegistry>>>,
-    browser_panes: Mutex<Option<Arc<dyn PaneSurface>>>,
-    /// Headless realization of the same ops: forward each `browser_pane_*` op
-    /// to the app's `AppSurface::pane` (review B1). Set with the control
-    /// handler; `browser_panes` wins when both are installed.
+    /// The host's only pane path: forward each `browser_pane_*` op to the
+    /// app's `AppSurface::pane` (review B1). Set with the control handler.
     pane_forwarder: Mutex<Option<Arc<dyn PaneForwarder>>>,
     officecli_watches: Mutex<Option<Arc<crate::officecli_watch::OfficecliWatchRuntime>>>,
     runtimes: NativePiManager,
@@ -298,7 +274,6 @@ impl HostServer {
             static_dir: static_dir.clone(),
             desktop_capabilities: Mutex::new(HostCapabilityStore::default()),
             owner_registry: Mutex::new(None),
-            browser_panes: Mutex::new(None),
             pane_forwarder: Mutex::new(None),
             officecli_watches: Mutex::new(None),
             runtimes,
@@ -545,14 +520,7 @@ impl HostServer {
         }
     }
 
-    /// Attach the browser-pane runtime (child webviews) after host bind.
-    pub fn set_browser_panes(&self, runtime: Arc<dyn PaneSurface>) {
-        if let Ok(mut slot) = self.state.browser_panes.lock() {
-            *slot = Some(runtime);
-        }
-    }
-
-    /// Attach the headless browser-pane forwarder after host bind (review B1).
+    /// Attach the browser-pane forwarder after host bind (review B1).
     ///
     /// The daemon owns no WebView, so this is how its `browser_pane_*` ops
     /// reach the app: [`PaneForwarder`] carries each op to `AppSurface::pane`
@@ -2453,21 +2421,11 @@ fn retained_session_refresh_required(
     ) && acceptance == crate::operation_registry::OperationAcceptance::Accepted
 }
 
-/// The in-process child-webview runtime, when one is installed. The guard is
-/// dropped here so the dispatch future that awaits a forward stays `Send`.
-fn local_pane_runtime(state: &HostState) -> Option<Arc<dyn PaneSurface>> {
-    state
-        .browser_panes
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-}
-
-/// The headless half of a `browser_pane_*` op (review B1): forward it to the
-/// injected [`PaneForwarder`] when the host owns no in-process runtime.
+/// A `browser_pane_*` op (review B1): forward it to the injected
+/// [`PaneForwarder`].
 ///
-/// A host with neither a [`PaneSurface`] nor a forwarder answers `unavailable`,
-/// the same code and message a process with no WebView produced before B1.
+/// A host with no forwarder answers `unavailable`, the same code and message a
+/// process with no WebView produced before B1.
 fn pane_forwarder(state: &HostState) -> Result<Arc<dyn PaneForwarder>, (&'static str, String)> {
     state
         .pane_forwarder
@@ -3705,27 +3663,20 @@ async fn dispatch(
                         width: num("width")?,
                         height: num("height")?,
                     };
-                    // Review B1: a host with no WebView of its own (the
-                    // external daemon) forwards the op to the app, which owns
-                    // the child webviews; only a host with neither path answers
-                    // `unavailable`.
-                    match local_pane_runtime(state) {
-                        Some(panes) => panes
-                            .create(pane_id, window_label, url, rect)
-                            .map_err(|e| ("browser_pane_failed", e))?,
-                        None => {
-                            forward_browser_pane(
-                                state,
-                                PaneOp::Create {
-                                    pane_id: pane_id.to_owned(),
-                                    window_label: window_label.to_owned(),
-                                    url: url.to_owned(),
-                                    rect,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
+                    // Review B1: the host owns no WebView of its own (the
+                    // external daemon), so the op is forwarded to the app,
+                    // which owns the child webviews; a host without a forwarder
+                    // answers `unavailable`.
+                    forward_browser_pane(
+                        state,
+                        PaneOp::Create {
+                            pane_id: pane_id.to_owned(),
+                            window_label: window_label.to_owned(),
+                            url: url.to_owned(),
+                            rect,
+                        },
+                    )
+                    .await?;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,
@@ -3749,21 +3700,14 @@ async fn dispatch(
                         width: num("width")?,
                         height: num("height")?,
                     };
-                    match local_pane_runtime(state) {
-                        Some(panes) => panes
-                            .set_rect(pane_id, rect)
-                            .map_err(|e| ("browser_pane_failed", e))?,
-                        None => {
-                            forward_browser_pane(
-                                state,
-                                PaneOp::SetRect {
-                                    pane_id: pane_id.to_owned(),
-                                    rect,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
+                    forward_browser_pane(
+                        state,
+                        PaneOp::SetRect {
+                            pane_id: pane_id.to_owned(),
+                            rect,
+                        },
+                    )
+                    .await?;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,
@@ -3776,21 +3720,14 @@ async fn dispatch(
                         .and_then(Value::as_str)
                         .ok_or(("invalid_operation", "paneId is required".into()))?;
                     let visible = frame.get("visible") == Some(&Value::Bool(true));
-                    match local_pane_runtime(state) {
-                        Some(panes) => panes
-                            .set_visible(pane_id, visible)
-                            .map_err(|e| ("browser_pane_failed", e))?,
-                        None => {
-                            forward_browser_pane(
-                                state,
-                                PaneOp::SetVisible {
-                                    pane_id: pane_id.to_owned(),
-                                    visible,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
+                    forward_browser_pane(
+                        state,
+                        PaneOp::SetVisible {
+                            pane_id: pane_id.to_owned(),
+                            visible,
+                        },
+                    )
+                    .await?;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,
@@ -3806,24 +3743,14 @@ async fn dispatch(
                         .get("js")
                         .and_then(Value::as_str)
                         .ok_or(("invalid_operation", "js is required".into()))?;
-                    let result: Value = match local_pane_runtime(state) {
-                        Some(panes) => Value::String(
-                            panes
-                                .eval_json(pane_id, expression)
-                                .await
-                                .map_err(|e| ("browser_pane_failed", e))?,
-                        ),
-                        None => {
-                            forward_browser_pane(
-                                state,
-                                PaneOp::EvalJson {
-                                    pane_id: pane_id.to_owned(),
-                                    expression: expression.to_owned(),
-                                },
-                            )
-                            .await?
-                        }
-                    };
+                    let result: Value = forward_browser_pane(
+                        state,
+                        PaneOp::EvalJson {
+                            pane_id: pane_id.to_owned(),
+                            expression: expression.to_owned(),
+                        },
+                    )
+                    .await?;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,
@@ -3840,21 +3767,14 @@ async fn dispatch(
                         .get("url")
                         .and_then(Value::as_str)
                         .ok_or(("invalid_operation", "url is required".into()))?;
-                    match local_pane_runtime(state) {
-                        Some(panes) => panes
-                            .navigate(pane_id, url)
-                            .map_err(|e| ("browser_pane_failed", e))?,
-                        None => {
-                            forward_browser_pane(
-                                state,
-                                PaneOp::Navigate {
-                                    pane_id: pane_id.to_owned(),
-                                    url: url.to_owned(),
-                                },
-                            )
-                            .await?;
-                        }
-                    }
+                    forward_browser_pane(
+                        state,
+                        PaneOp::Navigate {
+                            pane_id: pane_id.to_owned(),
+                            url: url.to_owned(),
+                        },
+                    )
+                    .await?;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,
@@ -3866,20 +3786,13 @@ async fn dispatch(
                         .get("paneId")
                         .and_then(Value::as_str)
                         .ok_or(("invalid_operation", "paneId is required".into()))?;
-                    let url: Value = match local_pane_runtime(state) {
-                        Some(panes) => Value::String(
-                            panes.url(pane_id).map_err(|e| ("browser_pane_failed", e))?,
-                        ),
-                        None => {
-                            forward_browser_pane(
-                                state,
-                                PaneOp::Url {
-                                    pane_id: pane_id.to_owned(),
-                                },
-                            )
-                            .await?
-                        }
-                    };
+                    let url: Value = forward_browser_pane(
+                        state,
+                        PaneOp::Url {
+                            pane_id: pane_id.to_owned(),
+                        },
+                    )
+                    .await?;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,
@@ -3892,20 +3805,13 @@ async fn dispatch(
                         .get("paneId")
                         .and_then(Value::as_str)
                         .ok_or(("invalid_operation", "paneId is required".into()))?;
-                    match local_pane_runtime(state) {
-                        // Destroy stays best-effort, as it was in-process.
-                        Some(panes) => {
-                            let _ = panes.destroy(pane_id);
-                        }
-                        None => {
-                            let forwarder = pane_forwarder(state)?;
-                            let _ = forwarder
-                                .forward_pane(PaneOp::Destroy {
-                                    pane_id: pane_id.to_owned(),
-                                })
-                                .await;
-                        }
-                    }
+                    // Destroy stays best-effort, as it was in-process.
+                    let forwarder = pane_forwarder(state)?;
+                    let _ = forwarder
+                        .forward_pane(PaneOp::Destroy {
+                            pane_id: pane_id.to_owned(),
+                        })
+                        .await;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,

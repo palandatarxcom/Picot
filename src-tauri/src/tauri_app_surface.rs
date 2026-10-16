@@ -128,8 +128,8 @@ impl AppSurface for TauriAppSurface {
     }
 
     /// Row A13 — child webviews. The runtime is the app package's
-    /// `PaneSurface` implementation; without it (no window, tests) the op is
-    /// unavailable, which is the answer the data plane already gives.
+    /// `browser_pane::BrowserPaneRuntime`; without it (no window, tests) the op
+    /// is unavailable, which is the answer the data plane already gives.
     async fn pane(&self, op: PaneOp) -> Result<Value, String> {
         let panes = self
             .app

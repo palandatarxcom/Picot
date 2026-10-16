@@ -1549,56 +1549,13 @@ mod tests {
         fixture.state.shutdown_graceful("test").await;
     }
 
-    /// A recording in-process [`picot_host::host_server::PaneSurface`]: the
-    /// host's own WebView runtime (the app package's `BrowserPaneRuntime`),
-    /// which keeps precedence over forwarding whenever it is installed.
-    #[derive(Default)]
-    struct RecordingLocalPane {
-        creates: Mutex<Vec<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl picot_host::host_server::PaneSurface for RecordingLocalPane {
-        fn create(
-            &self,
-            pane_id: &str,
-            _window_label: &str,
-            _url: &str,
-            _rect: PaneRect,
-        ) -> Result<(), String> {
-            self.creates.lock().unwrap().push(pane_id.to_string());
-            Ok(())
-        }
-
-        fn set_rect(&self, _pane_id: &str, _rect: PaneRect) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn set_visible(&self, _pane_id: &str, _visible: bool) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn eval_json(&self, _pane_id: &str, _expression: &str) -> Result<String, String> {
-            Ok("local".to_string())
-        }
-
-        fn navigate(&self, _pane_id: &str, _url: &str) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn url(&self, _pane_id: &str) -> Result<String, String> {
-            Ok("https://local/".to_string())
-        }
-
-        fn destroy(&self, _pane_id: &str) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    /// The review-B1 fallback is a fallback: a host that owns an in-process pane
-    /// runtime keeps serving the op itself and never asks the app.
+    /// Review B1, the deleted local slot's replacement: forwarding is the *only*
+    /// pane path. Follow-up #6 removed the in-process `PaneSurface` slot because
+    /// production never installed it, so each of the seven `browser_pane_*` ops
+    /// must reach the app as its exact forwarded `pane` op — nothing may be
+    /// served locally.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_in_process_pane_runtime_wins_over_forwarding() {
+    async fn every_browser_pane_op_forwards_to_the_app() {
         let fixture = boot().await;
         let recording = Arc::new(RecordingPaneSurface::default());
         let (_client, _mirror) = attach(
@@ -1606,42 +1563,126 @@ mod tests {
             Arc::new(ForwardedSurfaceOps::new(recording.clone())),
         )
         .await;
-        let local = Arc::new(RecordingLocalPane::default());
-        fixture.state.host.set_browser_panes(local.clone());
 
-        let mut socket = attach_desktop(&fixture, "native-pane-local").await;
-        socket
-            .send(WsMessage::Text(
+        let mut socket = attach_desktop(&fixture, "native-pane-forward").await;
+        let cases: Vec<(Value, PaneOp)> = vec![
+            (
                 json!({
-                    "type": "data_request",
-                    "protocolVersion": 2,
-                    "requestId": "pane-create-local",
                     "operation": "browser_pane_create",
-                    "paneId": "native-pane-local:tab-1",
-                    "windowLabel": "native-pane-local",
+                    "paneId": "native-pane-forward:tab-1",
+                    "windowLabel": "native-pane-forward",
                     "url": "https://example.com/",
                     "x": 1.0,
                     "y": 2.0,
                     "width": 3.0,
                     "height": 4.0,
-                })
-                .to_string(),
-            ))
-            .await
-            .expect("pane create sent");
+                }),
+                PaneOp::Create {
+                    pane_id: "native-pane-forward:tab-1".to_string(),
+                    window_label: "native-pane-forward".to_string(),
+                    url: "https://example.com/".to_string(),
+                    rect: PaneRect {
+                        x: 1.0,
+                        y: 2.0,
+                        width: 3.0,
+                        height: 4.0,
+                    },
+                },
+            ),
+            (
+                json!({
+                    "operation": "browser_pane_set_rect",
+                    "paneId": "native-pane-forward:tab-1",
+                    "x": 5.0,
+                    "y": 6.0,
+                    "width": 7.0,
+                    "height": 8.0,
+                }),
+                PaneOp::SetRect {
+                    pane_id: "native-pane-forward:tab-1".to_string(),
+                    rect: PaneRect {
+                        x: 5.0,
+                        y: 6.0,
+                        width: 7.0,
+                        height: 8.0,
+                    },
+                },
+            ),
+            (
+                json!({
+                    "operation": "browser_pane_set_visible",
+                    "paneId": "native-pane-forward:tab-1",
+                    "visible": true,
+                }),
+                PaneOp::SetVisible {
+                    pane_id: "native-pane-forward:tab-1".to_string(),
+                    visible: true,
+                },
+            ),
+            (
+                json!({
+                    "operation": "browser_pane_eval",
+                    "paneId": "native-pane-forward:tab-1",
+                    "js": "document.title",
+                }),
+                PaneOp::EvalJson {
+                    pane_id: "native-pane-forward:tab-1".to_string(),
+                    expression: "document.title".to_string(),
+                },
+            ),
+            (
+                json!({
+                    "operation": "browser_pane_navigate",
+                    "paneId": "native-pane-forward:tab-1",
+                    "url": "https://example.com/next",
+                }),
+                PaneOp::Navigate {
+                    pane_id: "native-pane-forward:tab-1".to_string(),
+                    url: "https://example.com/next".to_string(),
+                },
+            ),
+            (
+                json!({
+                    "operation": "browser_pane_url",
+                    "paneId": "native-pane-forward:tab-1",
+                }),
+                PaneOp::Url {
+                    pane_id: "native-pane-forward:tab-1".to_string(),
+                },
+            ),
+            (
+                json!({
+                    "operation": "browser_pane_destroy",
+                    "paneId": "native-pane-forward:tab-1",
+                }),
+                PaneOp::Destroy {
+                    pane_id: "native-pane-forward:tab-1".to_string(),
+                },
+            ),
+        ];
 
-        let response = frame_for(&mut socket, "pane-create-local").await;
-        assert_eq!(response["type"], "data_response", "{response}");
-        assert_eq!(
-            local.creates.lock().unwrap().as_slice(),
-            ["native-pane-local:tab-1"],
-            "the in-process runtime must serve the op"
-        );
-        assert!(
-            recording.panes().is_empty(),
-            "an in-process runtime means the app is never asked: {:?}",
-            recording.panes()
-        );
+        for (index, (op, _)) in cases.iter().enumerate() {
+            let request_id = format!("pane-forward-{index}");
+            let mut frame = op.clone();
+            frame["type"] = json!("data_request");
+            frame["protocolVersion"] = json!(2);
+            frame["requestId"] = json!(request_id);
+            socket
+                .send(WsMessage::Text(frame.to_string()))
+                .await
+                .expect("pane op sent");
+            let response = frame_for(&mut socket, &request_id).await;
+            assert_eq!(response["type"], "data_response", "{response}");
+            assert!(
+                response.get("error").is_none(),
+                "{request_id} must be served by the app, not fail: {response}"
+            );
+        }
+
+        // Order and payload prove no op was short-circuited locally: the app saw
+        // the exact seven ops, once each.
+        let expected: Vec<PaneOp> = cases.into_iter().map(|(_, op)| op).collect();
+        assert_eq!(recording.panes(), expected);
         fixture.state.shutdown_graceful("test").await;
     }
 

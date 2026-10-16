@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use picot_host::host_server::{PaneRect, PaneSurface};
+use picot_host::host_server::PaneRect;
 use tauri::webview::NewWindowResponse;
 use tauri::{
     AppHandle, LogicalPosition, LogicalSize, Manager, Url, Webview, WebviewBuilder, WebviewUrl,
@@ -243,43 +243,6 @@ impl BrowserPaneRuntime {
             Ok(Ok(json)) => Ok(json),
             _ => Err("eval_timeout".to_string()),
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl PaneSurface for BrowserPaneRuntime {
-    fn create(
-        &self,
-        pane_id: &str,
-        window_label: &str,
-        url: &str,
-        rect: PaneRect,
-    ) -> Result<(), String> {
-        BrowserPaneRuntime::create(self, pane_id, window_label, url, rect)
-    }
-
-    fn set_rect(&self, pane_id: &str, rect: PaneRect) -> Result<(), String> {
-        BrowserPaneRuntime::set_rect(self, pane_id, rect)
-    }
-
-    fn set_visible(&self, pane_id: &str, visible: bool) -> Result<(), String> {
-        BrowserPaneRuntime::set_visible(self, pane_id, visible)
-    }
-
-    async fn eval_json(&self, pane_id: &str, expression: &str) -> Result<String, String> {
-        BrowserPaneRuntime::eval_json(self, pane_id, expression).await
-    }
-
-    fn navigate(&self, pane_id: &str, url: &str) -> Result<(), String> {
-        BrowserPaneRuntime::navigate(self, pane_id, url)
-    }
-
-    fn url(&self, pane_id: &str) -> Result<String, String> {
-        BrowserPaneRuntime::url(self, pane_id)
-    }
-
-    fn destroy(&self, pane_id: &str) -> Result<(), String> {
-        BrowserPaneRuntime::destroy(self, pane_id)
     }
 }
 
