@@ -1544,8 +1544,52 @@ pub struct DaemonLink {
     pub config_dir: PathBuf,
     /// Labels the restart transaction is destroying and re-creating (T9): the
     /// window-destroyed path must not detach the owner it is about to re-mint
-    /// for the same label.
-    migrating: Mutex<std::collections::HashSet<String>>,
+    /// for the same label. Shared with its [`MigrationGuard`], which is what
+    /// clears the marks on every exit from the transaction.
+    migrating: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+/// RAII owner of the restart transaction's migration marks (T9; A4 follow-up
+/// #1).
+///
+/// `migrate_views` runs `begin_migration → recreate_windows().await →
+/// end_migration`. If that future is dropped mid-`await` — or a panic unwinds
+/// through it — a plain `end_migration` call never runs: the marks stay set,
+/// [`DaemonLink::is_migrating_any`] stays `true`, and since
+/// `classify_exit_request` holds **every** exit request while a migration is in
+/// flight, the app holds every later quit with no window left to re-open — the
+/// window-less zombie app this guard exists to prevent.
+///
+/// Clearing in `Drop` covers all three abandonment paths (early return, a
+/// dropped future, an unwind) with one piece of code, so no caller can forget
+/// it. The marks travel through an `Arc` rather than a borrow of the link so
+/// the guard can live across the migration's `.await` points.
+pub struct MigrationGuard {
+    migrating: Arc<Mutex<std::collections::HashSet<String>>>,
+    labels: Vec<String>,
+}
+
+impl MigrationGuard {
+    /// Mark `labels` as mid-migration and take ownership of clearing them.
+    fn begin(migrating: Arc<Mutex<std::collections::HashSet<String>>>, labels: &[String]) -> Self {
+        migrating
+            .lock()
+            .expect("migration label lock")
+            .extend(labels.iter().cloned());
+        Self {
+            migrating,
+            labels: labels.to_vec(),
+        }
+    }
+}
+
+impl Drop for MigrationGuard {
+    fn drop(&mut self) {
+        let mut marks = self.migrating.lock().expect("migration label lock");
+        for label in &self.labels {
+            marks.remove(label);
+        }
+    }
 }
 
 impl DaemonLink {
@@ -1562,7 +1606,7 @@ impl DaemonLink {
             manager,
             data_dir,
             config_dir,
-            migrating: Mutex::new(std::collections::HashSet::new()),
+            migrating: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1598,18 +1642,13 @@ impl DaemonLink {
         std::mem::replace(&mut *slot, session)
     }
 
-    /// Mark labels as being migrated by the restart transaction.
-    pub fn begin_migration(&self, labels: &[String]) {
-        let mut guard = self.migrating.lock().expect("migration label lock");
-        guard.extend(labels.iter().cloned());
-    }
-
-    /// Clear the migration marks once the transaction is done with them.
-    pub fn end_migration(&self, labels: &[String]) {
-        let mut guard = self.migrating.lock().expect("migration label lock");
-        for label in labels {
-            guard.remove(label);
-        }
+    /// Mark labels as being migrated by the restart transaction (T9).
+    ///
+    /// The returned [`MigrationGuard`] clears exactly these marks when it drops
+    /// — the fix for the abandoned-transaction zombie app (A4 follow-up #1):
+    /// the caller cannot forget an `end_migration` it never has to call.
+    pub fn begin_migration(&self, labels: &[String]) -> MigrationGuard {
+        MigrationGuard::begin(Arc::clone(&self.migrating), labels)
     }
 
     /// Whether the restart transaction currently owns this label.
@@ -2401,10 +2440,13 @@ impl RestartLink for AppRestartLink {
         let labels: Vec<String> = rows.iter().map(|row| row.label.clone()).collect();
         let link = self.link()?;
         // The destroy path must not detach the owner this transaction is about
-        // to re-mint for the same label.
-        link.begin_migration(&labels);
+        // to re-mint for the same label. The guard clears the marks on *every*
+        // exit from this scope — the `?` below, a panic, or this future being
+        // dropped mid-await; a leaked mark would hold every later exit request
+        // forever (A4 follow-up #1).
+        let migration = link.begin_migration(&labels);
         let result = self.recreate_windows(rows).await;
-        link.end_migration(&labels);
+        drop(migration);
         if result.is_err() {
             // A failed migration must never leave the app with no window at
             // all: the exit path holds a request that arrives during the
@@ -3151,6 +3193,49 @@ mod exit_request_tests {
                 ExitRequestVerdict::RestartRelaunch
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_guard_tests {
+    use super::{classify_exit_request, ExitRequestVerdict, MigrationGuard};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    fn marks_any(marks: &Arc<Mutex<HashSet<String>>>) -> bool {
+        !marks.lock().expect("migration marks").is_empty()
+    }
+
+    /// The restart transaction runs `begin_migration → recreate_windows().await
+    /// → end_migration`; if that future is dropped mid-`await` (or a panic
+    /// unwinds it), `end_migration` never runs. The marks stay set,
+    /// `is_migrating_any()` stays true and **every** later exit request is held
+    /// — a window-less app that can never quit (A4 follow-up #1). The guard is
+    /// the fix: dropping it, with no explicit end, must clear exactly the labels
+    /// it set.
+    #[test]
+    fn dropping_the_guard_without_ending_the_migration_clears_the_marks() {
+        let marks = Arc::new(Mutex::new(HashSet::new()));
+        let labels = vec!["w1".to_string(), "w2".to_string()];
+        let guard = MigrationGuard::begin(Arc::clone(&marks), &labels);
+        // Mid-migration, between the destroyed and the re-created window: the
+        // exit request is held by design.
+        assert_eq!(
+            classify_exit_request(None, marks_any(&marks), false, false),
+            ExitRequestVerdict::Hold
+        );
+        // The abandoning path: no explicit end, the transaction's future is
+        // dropped (or a panic unwinds it).
+        drop(guard);
+        assert!(
+            !marks_any(&marks),
+            "the guard must clear its labels on drop, or the app holds every later exit forever"
+        );
+        assert_eq!(
+            classify_exit_request(None, marks_any(&marks), false, false),
+            ExitRequestVerdict::Quit,
+            "a dropped migration must not hold the next exit"
+        );
     }
 }
 
