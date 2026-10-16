@@ -145,6 +145,12 @@ function toProjectCache(p) {
     lastActivityAt: typeof p.lastActivityAt === "number" ? p.lastActivityAt : 0,
     sessions: Array.isArray(p.sessions)
       ? p.sessions
+          // The provisional placeholder is per-page UI state keyed by the
+          // *runtime* session id, not a file. Caching it made the next boot
+          // (the reload after a daemon restart) restore an unselectable row:
+          // selecting it routes the bare id as `sessionPath`, which the host
+          // cannot canonicalize ("Selected session is unavailable").
+          .filter((session) => session?.provisional !== true)
           .map(toSessionCache)
           .filter((s) => typeof s.filePath === "string" && s.filePath.length > 0)
       : [],

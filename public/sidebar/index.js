@@ -22,6 +22,7 @@ import {
   formatSessionTime,
   getSessionDisplayTitle,
 } from "./build-session-item.js";
+import { provisionalMatchesPersistedFile } from "./provisional-identity.js";
 import { buildFlattenedSessionTree } from "./session-tree-model.js";
 
 function readJsonArray(key) {
@@ -713,6 +714,20 @@ export class SessionSidebar {
 
   applyProvisionalSession() {
     const pending = this.provisionalSession;
+    // Exactly one placeholder can be live per page. Any other provisional row
+    // is stale UI state: a placeholder hydrated from the previous page's cache
+    // (whose key may be a bare runtime id the host cannot canonicalize, so
+    // selecting it fails with "Selected session is unavailable") or one left
+    // behind by an earlier render cycle. Drop them all before reconciling.
+    for (const project of this.projects) {
+      if (!Array.isArray(project?.sessions)) continue;
+      if (!project.sessions.some((session) => session?.provisional && session !== pending)) {
+        continue;
+      }
+      project.sessions = project.sessions.filter(
+        (session) => !session?.provisional || session === pending,
+      );
+    }
     if (!pending) return;
     const project = this.projects.find(
       (candidate) =>
@@ -725,7 +740,14 @@ export class SessionSidebar {
       sessions.some(
         (session) =>
           !session?.provisional &&
-          (session?.filePath === pending.filePath || session?.id === pending.sessionId),
+          (session?.filePath === pending.filePath ||
+            session?.id === pending.sessionId ||
+            // A restart reloads the route for an already-persisted session.
+            // The placeholder is keyed by the runtime session id, which never
+            // equals the scanned absolute path — match it through the file
+            // name instead of leaving an unselectable "New chat" row next to
+            // the persisted session.
+            provisionalMatchesPersistedFile(session?.filePath, pending.sessionId)),
       )
     ) {
       this.provisionalSession = null;
