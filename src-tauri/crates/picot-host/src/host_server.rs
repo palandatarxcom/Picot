@@ -639,6 +639,37 @@ impl HostServer {
         has_owner && self.state.host_events.send_owner_event(owner, value)
     }
 
+    /// Test seam (R5): register a desktop connection for one owner without a
+    /// WebSocket handshake, so a test can exercise an owner-targeted push
+    /// end-to-end (`send_owner_event`'s delivery bit) and read the frame the
+    /// WebView would have received.
+    ///
+    /// Production never calls this: real desktop clients register through
+    /// `/v2/ws`'s handshake, and a fake one would weaken the auth path — which
+    /// is exactly why this takes an explicit `_for_tests` name (same posture as
+    /// [`Self::set_agent_root_for_tests`]).
+    pub fn register_desktop_owner_for_tests(
+        &self,
+        client_id: &str,
+        owner: &crate::window_owner::OwnerId,
+    ) -> bool {
+        let context = HostClientContext::desktop(
+            client_id.to_string(),
+            owner.clone(),
+            crate::window_owner::OwnerWorkspaceSnapshot::NoWorkspace,
+        );
+        let hello = json!({
+            "type": "hello",
+            "protocolVersion": PROTOCOL_VERSION,
+            "clientType": "desktop",
+            "desktopCapability": "test-capability",
+        });
+        let Ok(mut router) = self.state.router.lock() else {
+            return false;
+        };
+        router.connect(client_id, &hello, context).is_ok()
+    }
+
     #[allow(dead_code)]
     pub fn broadcast_native_event(&self, value: Value) -> usize {
         self.state.host_events.broadcast_native_event(value)

@@ -1235,6 +1235,9 @@ async fn a_stop_without_the_lease_is_refused_by_the_daemon() {
         ("r1", "daemon.stop"),
         ("r2", "owner.create"),
         ("r3", "owner.detach"),
+        // R5: the close-request bridge is lease-gated too — a leaseless caller
+        // must not be able to make the app interrupt its own user.
+        ("r4", "owner.close_request"),
     ] {
         let response = request(&mut socket, id, op, owner_args("w-leaseless")).await;
         assert_eq!(response["ok"], false, "{op} must be refused: {response}");

@@ -81,9 +81,14 @@
 //! each one reads state that becomes `DaemonState`-owned, or is called by a row
 //! above:
 //!
-//! - `main.rs:4550` `close_approvals()` / `:4562` `handle_close_requested` /
-//!   `:4646` `handle_window_destroyed` — the app-side close-pending map and the
+//! - `main.rs:2102` `close_approvals()` / `:2133` `handle_close_requested` /
+//!   `:2297` `handle_window_destroyed` — the app-side close-pending map and the
 //!   teardown path that today shares the dispatcher's static (rows A10/A11).
+//!   Re-anchored again by R5: `handle_close_requested` no longer reaches for an
+//!   in-process host (there is none) — it asks the daemon with
+//!   `owner.close_request`, and the daemon pushes `window_close_request` into
+//!   that owner's WebView on the data plane. The pending map and the native
+//!   fallback beside it stay app-side.
 //! - `main.rs:4714` `focused_owner_has_workspace` and `:4755`
 //!   `update_new_session_menu_state` — read `OwnerRegistryState` +
 //!   `NativePiManagerState` from the app handle; called by row A9.

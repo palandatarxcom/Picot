@@ -43,6 +43,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::daemon::owner_close::CloseOutcome;
 use crate::daemon::DaemonState;
 use crate::host_control::ProgressSink;
 use crate::window_owner::{OwnerId, OwnerMirrorEvent, TemporaryKind};
@@ -75,6 +76,11 @@ pub const MIRROR_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// forwarding call must not hang, and silence means the app is gone) is exactly
 /// what an idle deadline enforces. See [`AdminServer::request_app_surface`].
 pub const SURFACE_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+// The `owner.close_request` settlement deadline is not a constant here: the
+// production value lives with the bridge that needs it
+// (`daemon::owner_close::CLOSE_REQUEST_SETTLE_TIMEOUT`), and the admin config
+// only carries it so tests do not wait 30s for the deadline.
 
 /// Grace window between "the manager's socket dropped" and "mark the
 /// attachment dead" (plan D11). A reconnect inside the window keeps the
@@ -116,6 +122,8 @@ pub struct AdminConfig {
     pub token: String,
     pub mirror_ack_timeout: Duration,
     pub surface_forward_timeout: Duration,
+    /// Deadline of the `owner.close_request` long-poll (R5).
+    pub close_request_timeout: Duration,
 }
 
 impl AdminConfig {
@@ -124,6 +132,7 @@ impl AdminConfig {
             token: token.into(),
             mirror_ack_timeout: MIRROR_ACK_TIMEOUT,
             surface_forward_timeout: SURFACE_FORWARD_TIMEOUT,
+            close_request_timeout: crate::daemon::owner_close::CLOSE_REQUEST_SETTLE_TIMEOUT,
         }
     }
 
@@ -136,6 +145,12 @@ impl AdminConfig {
     /// Test/dev knob: shorten the app-surface forwarding deadline.
     pub fn with_surface_forward_timeout(mut self, timeout: Duration) -> Self {
         self.surface_forward_timeout = timeout;
+        self
+    }
+
+    /// Test/dev knob: shorten the `owner.close_request` settlement deadline.
+    pub fn with_close_request_timeout(mut self, timeout: Duration) -> Self {
+        self.close_request_timeout = timeout;
         self
     }
 }
@@ -239,6 +254,8 @@ struct AdminInner {
     origin: std::sync::OnceLock<String>,
     mirror_ack_timeout: Duration,
     surface_forward_timeout: Duration,
+    /// `owner.close_request`'s settlement deadline (R5).
+    close_request_timeout: Duration,
     next_conn_id: AtomicU64,
     /// Surface-request ids (`s1`, `s2`, …), distinct from `admin_request` ids so
     /// the two directions can never be confused for one another.
@@ -284,6 +301,7 @@ impl AdminServer {
             origin: std::sync::OnceLock::new(),
             mirror_ack_timeout: config.mirror_ack_timeout,
             surface_forward_timeout: config.surface_forward_timeout,
+            close_request_timeout: config.close_request_timeout,
             next_conn_id: AtomicU64::new(1),
             next_surface_id: AtomicU64::new(1),
             accepting: AtomicBool::new(true),
@@ -1165,6 +1183,42 @@ async fn run_op_inner(
             // reattach to it (T7).
             state.detach_owner(&owner);
             Ok(json!({ "detached": owner.as_str() }))
+        }
+        // The app's close delegate asks the owner's WebView to run its
+        // confirmation flow (R5). Blocking the *op* is deliberate: the app's
+        // close is suspended until this answers, and the answer says whether
+        // the WebView ever owned the question. Each request is dispatched on
+        // its own task (`frame.rs` timing rule), so this long-poll never stalls
+        // `daemon.status` or the `app_surface_request` frames that *settle* it.
+        "owner.close_request" => {
+            require_lease(inner, conn_id)?;
+            let owner = OwnerId::from_string(arg_str(&args, "owner")?);
+            let request_id = arg_str(&args, "requestId")?;
+            // An owner the daemon does not know is a refusal, not a silent
+            // no-op: the app then runs its native dialog (safe degradation).
+            if state.owner_registry.label_for_owner(&owner).is_none() {
+                return Err(format!("unknown owner {}", owner.as_str()));
+            }
+            // Register before the push, so a coordinator answering instantly
+            // cannot race its own registration.
+            let receiver = state.close_requests.register(&request_id);
+            if !state.push_owner_close_request(&owner, &request_id) {
+                state.close_requests.forget(&request_id);
+                return Ok(json!({
+                    "requestId": request_id,
+                    "delivered": false,
+                    "outcome": CloseOutcome::Undeliverable,
+                }));
+            }
+            let outcome = state
+                .close_requests
+                .await_settlement(&request_id, receiver, inner.close_request_timeout)
+                .await;
+            Ok(json!({
+                "requestId": request_id,
+                "delivered": true,
+                "outcome": outcome,
+            }))
         }
         other => Err(format!("unknown admin op {other}")),
     }

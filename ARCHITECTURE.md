@@ -51,7 +51,7 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 | 通道 | 端点 / 载体 | 认证 | 用途 |
 | --- | --- | --- | --- |
 | **host 数据面** | daemon host origin 的 `/v2/ws`（含 `/v2/*`、静态资源与 `/api/*` 兼容面） | desktop capability（owner + generation，既有语义） | WebView 与 runtime 的全部常规通信；不因 daemon 化改变 |
-| **admin WS** | daemon 的第二个 listener，`127.0.0.1:0`（**永不放 LAN**），`GET /admin` 升级 | 实例文件中的高熵 `adminToken`（32 随机字节 base64url） | 管理面：`daemon.status` / `daemon.stop` / owner 生命周期 / app-surface 转发 / 导航镜像事件；同一时刻只有一个 live manager（lease） |
+| **admin WS** | daemon 的第二个 listener，`127.0.0.1:0`（**永不放 LAN**），`GET /admin` 升级 | 实例文件中的高熵 `adminToken`（32 随机字节 base64url） | 管理面：`daemon.status` / `daemon.stop` / owner 生命周期（含 `owner.close_request`：关窗确认经数据面下发 WebView）/ app-surface 转发 / 导航镜像事件；同一时刻只有一个 live manager（lease） |
 | **app-surface 转发** | admin WS 内的 `app_surface_request` / `surface_response`（`surface_progress` 回流进度） | 同 admin 通道 | 必须由 app 执行的能力：开工作区窗口、原生对话框（选目录/选图）、导出目标、更新器、devtools、relaunch、关窗批准与取消、菜单状态重算、browser pane 操作；5s 超时 → 类型化 `app_surface_unavailable` |
 | **导航镜像** | admin WS：attach 时的全量快照（owner/label/origin/generation/session 路由）+ 带 `epoch`/`generation` 的 `navigation_permit` / `permit_revoked` / `owner_binding_changed` | 同 admin 通道 | daemon 是授权权威（owner 记录、pending 导航许可）；app 持有 Tauri 的同步 `on_navigation` 委托，按镜像判定；许可事件需 ack，断连即 fail-closed |
 | **app 私有状态** | `app_config_dir/picot-daemon-settings.json`（0600、原子写） | 仅 app 进程读写 | 退出策略 `keepRunningAfterQuit`；daemon 不感知此值，也不进 SQLite |
@@ -64,7 +64,7 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 
 | 用户动作 | daemon 行为 |
 | --- | --- |
-| 关闭窗口 | **detach**：撤该 owner 的 capability 与窗口绑定，owner-scoped ephemeral 进程显式终止、temp 目录清理、terminal/git/关窗批准/skill 归属回收；**常驻 workspace/session runtime 照跑**（`detach_owner`）。再次打开窗口或工作区按 rebind 复用同一 runtime（新 owner + 新 generation） |
+| 关闭窗口 | **先确认，再 detach**：app 拦 `CloseRequested`，经 admin `owner.close_request` 让 daemon 在数据面向**该 owner 的 WebView** 推 `window_close_request`；WebView 的关窗协调器跑自己的风险/归属确认（未落盘输入、活终端、Side Chat 丢弃…），结果经数据面 `window_close_approve` / `window_close_cancel` 回到 app-surface 完成落定。降级路径（不消失）：daemon 不可达、owner 无 WebView（`undeliverable`）、协调器不响应（30s `timeout`）→ app 走原生对话框。确认通过后才是 **detach**：撤该 owner 的 capability 与窗口绑定，owner-scoped ephemeral 进程显式终止、temp 目录清理、terminal/git/关窗批准/skill 归属回收；**常驻 workspace/session runtime 照跑**（`detach_owner`）。再次打开窗口或工作区按 rebind 复用同一 runtime（新 owner + 新 generation） |
 | sidebar 侧栏工作区菜单 →「停止运行」（**只有活 runtime 行才出现**；确认弹窗列出工作区与该工作区的运行状态，含「有回合正在跑」的提示） | 数据面 `workspace_close {workspaceId}`：只停该工作区名下的 runtime（进程组终止并 reap、child registry 条目落清），registry row 保留，窗口随后就是既有的 stopped-session 状态（host 发布 `runtime_stopped`，绿点与队列 pill 随进程消失）。当前工作区也允许停（与「从列表移除」不同）。`workspace.remove` 不做这件事，保持纯列表移除 |
 | ⌘Q 退出（`keepRunningAfterQuit=false`，默认） | 优雅停止：`daemon.stop` 返回 **accepted**，app 再阻塞等到**确认进程真的退出**（pid + 进程启动时间身份校验，超时后 SIGTERM→SIGKILL 升级）；RPC 断连本身不算完成 |
 | ⌘Q 退出（`keepRunningAfterQuit=true`） | daemon 与 agent 存活；重开 app 接回现场（含运行中的 turn） |

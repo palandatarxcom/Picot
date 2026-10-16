@@ -52,6 +52,14 @@ impl HostEventSink {
             .is_ok()
     }
 
+    /// Test seam (R5): a subscriber that observes exactly what a WebView's
+    /// data-plane connection would receive, so an owner push is assertable
+    /// without a real WebSocket. Production subscribers live in the `/v2/ws`
+    /// handler, which owns its own receiver.
+    pub fn subscribe_for_tests(&self) -> broadcast::Receiver<OwnerEvent> {
+        self.sender.subscribe()
+    }
+
     pub fn broadcast_native_event(&self, value: Value) -> usize {
         self.sender
             .send(OwnerEvent { owner: None, value })

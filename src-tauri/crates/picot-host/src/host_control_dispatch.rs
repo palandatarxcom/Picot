@@ -24,6 +24,7 @@
 //! (embedded form until T3's admin channel); that construction is Step 3's
 //! move into `DaemonState::start`.
 
+use crate::daemon::owner_close::CloseOutcome;
 use crate::daemon::DaemonState;
 use crate::ephemeral_registry::EphemeralKind;
 use crate::git_service::{self, GitService};
@@ -71,6 +72,9 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
     let install_secret = state.install_secret.clone();
     let host = state.host.clone();
     let environment_installer = state.environment_installer.clone();
+    // The close-request settlement bridge (R5) needs the state itself, not one
+    // of its fields: the waiter map is daemon state, reached by both channels.
+    let daemon_state = state.clone();
     let handler: ControlHandler = Arc::new(
         move |ctx: VerifiedClientContext, canonical: Value, progress: ProgressSink| {
             let (command, args) = match canonical.get("type").and_then(Value::as_str) {
@@ -121,6 +125,7 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
             let host = host.clone();
             let ephemeral_hub = ephemeral_hub.clone();
             let installer = environment_installer.clone();
+            let daemon_state = daemon_state.clone();
             Box::pin(async move {
                 let arg = |key: &str| args.get(key).cloned().unwrap_or(Value::Null);
                 let arg_str = |key: &str| arg(key).as_str().map(|s| s.to_string());
@@ -1639,6 +1644,12 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         app_surface
                             .cancel_window_close(owner.as_str(), &request_id)
                             .await?;
+                        // …and it settles the `owner.close_request` long-poll
+                        // the app's close delegate is waiting on (R5), **after**
+                        // the app has dropped its pending close: the app must not
+                        // see "cancelled" before its own map agrees.
+                        daemon_state
+                            .resolve_owner_close_settlement(&request_id, CloseOutcome::Cancelled);
                         Ok(Value::Null)
                     }
                     "window_close_approve" => {
@@ -1652,6 +1663,8 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                             .label_for_owner(&owner)
                             .ok_or("no pending window close")?;
                         app_surface.close_window(&label, &request_id).await?;
+                        daemon_state
+                            .resolve_owner_close_settlement(&request_id, CloseOutcome::Approved);
                         Ok(Value::Null)
                     }
                     "window_close_risk_response" => {

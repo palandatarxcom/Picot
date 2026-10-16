@@ -34,11 +34,13 @@
 pub mod admin;
 pub mod app_surface;
 pub mod instance;
+pub mod owner_close;
 pub mod surface_forward;
 
 use crate::daemon::admin::AdminServer;
 use crate::daemon::app_surface::AppSurface;
 use crate::daemon::instance::DaemonFiles;
+use crate::daemon::owner_close::{window_close_request_frame, CloseOutcome, OwnerCloseRequests};
 use crate::environment_install;
 use crate::ephemeral_registry::EphemeralRegistry;
 use crate::git_service::GitService;
@@ -157,6 +159,8 @@ pub struct DaemonState {
     /// The app-process surface (rows A2–A12). A headless daemon supplies the
     /// admin-channel forwarding realization (T3/T5).
     pub app_surface: Arc<dyn AppSurface>,
+    /// Owner close requests awaiting a WebView settlement (R5).
+    pub close_requests: OwnerCloseRequests,
     /// The admin channel, once [`Self::install_admin`] ran (T4 starts it in the
     /// daemon binary; embedded mode starts it in the app process). `None` means
     /// no admin channel exists yet, which is why it is not a constructor
@@ -321,6 +325,7 @@ impl DaemonState {
             terminals,
             officecli_watches,
             app_surface,
+            close_requests: OwnerCloseRequests::default(),
             admin: Mutex::new(None),
             daemon_files: Mutex::new(None),
             drained: AtomicBool::new(false),
@@ -350,6 +355,26 @@ impl DaemonState {
     /// The attached admin channel, when one exists.
     pub fn admin(&self) -> Option<AdminServer> {
         self.admin.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Push the WebView close-confirmation frame to one owner (R5).
+    ///
+    /// The `bool` is the **delivery** answer the `owner.close_request` op
+    /// reports: `false` means no live desktop connection holds that owner (a
+    /// closed/crashed renderer), which is exactly when the app must use its
+    /// native dialog instead. This is the in-process push the app process used
+    /// to do directly; the WebView is loaded from this process now, so the
+    /// daemon is the only sender that reaches it.
+    pub fn push_owner_close_request(&self, owner: &OwnerId, request_id: &str) -> bool {
+        self.host
+            .send_owner_event(owner, window_close_request_frame(request_id))
+    }
+
+    /// Settle one pending owner close request from the data plane (the
+    /// WebView's approve/cancel ops). False when nothing by that id was
+    /// pending — a replay, or a request the app already degraded.
+    pub fn resolve_owner_close_settlement(&self, request_id: &str, outcome: CloseOutcome) -> bool {
+        self.close_requests.resolve(request_id, outcome)
     }
 
     /// Install the daemon's persisted bookkeeping (plan D7/T4).

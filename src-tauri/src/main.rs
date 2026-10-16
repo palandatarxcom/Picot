@@ -31,7 +31,6 @@ use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::{child_supervision, window_owner};
 
 use picot_host::host_control::ProgressSink;
-use picot_host::host_server::HostServer;
 use picot_host::runtime_coordinator::RuntimeTarget;
 use serde_json::Value;
 use std::fs;
@@ -45,7 +44,10 @@ use tauri::{AppHandle, Manager, TitleBarStyle, WebviewUrl, WebviewWindowBuilder}
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_window_state::StateFlags;
 
-type HostServerState = Arc<HostServer>;
+// (R5) The `HostServerState` alias is gone with the window-close hand-off: the
+// WebView talks to the daemon's own host, and only the daemon can push into it,
+// so this process holds no host stack to reach for. The app-surface ops that
+// used to reach one now travel through the admin channel.
 // (T8) The managed `NativePiManager` alias is gone: the signal and exit paths no
 // longer reach for an in-app manager copy, they run `DaemonLink`'s quit flow.
 
@@ -524,8 +526,9 @@ mod tests {
     }
 
     use super::{
-        clamp_window_geometry, image_mime_from_path, new_session_menu_enabled, resolve_static_dir,
-        session_export_fetch_url, side_chat_startup_rpc_commands,
+        clamp_window_geometry, close_request_needs_native_fallback, image_mime_from_path,
+        new_session_menu_enabled, resolve_static_dir, session_export_fetch_url,
+        side_chat_startup_rpc_commands,
     };
     // The host-side helpers moved into `picot-host` with the dispatcher
     // (Task 2 Step 2); their tests stayed here.
@@ -546,6 +549,47 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TOUCH_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    /// R5: the close delegate hands the confirmation to the WebView's
+    /// coordinator and only runs its native warning when that hand-off could not
+    /// produce an answer. Every non-settlement — including a failed op — must
+    /// fall back: "ask the user anyway" is the safe direction.
+    #[test]
+    fn the_native_close_warning_runs_exactly_when_the_coordinator_did_not_settle() {
+        use picot_host::daemon::owner_close::{CloseOutcome, OwnerCloseDelivery};
+        let delivery = |delivered: bool, outcome: CloseOutcome| OwnerCloseDelivery {
+            request_id: "close-1".to_string(),
+            delivered,
+            outcome,
+        };
+
+        // The coordinator settled: approving closes the window on its own path,
+        // cancelling leaves it open — neither needs a native dialog.
+        assert!(!close_request_needs_native_fallback(Ok(delivery(
+            true,
+            CloseOutcome::Approved
+        ))));
+        assert!(!close_request_needs_native_fallback(Ok(delivery(
+            true,
+            CloseOutcome::Cancelled
+        ))));
+
+        // No WebView held the owner, or it never answered: the native dialog is
+        // the only confirmation left.
+        assert!(close_request_needs_native_fallback(Ok(delivery(
+            false,
+            CloseOutcome::Undeliverable
+        ))));
+        assert!(close_request_needs_native_fallback(Ok(delivery(
+            true,
+            CloseOutcome::Timeout
+        ))));
+
+        // A dead admin channel or a malformed reply is the same answer.
+        assert!(close_request_needs_native_fallback(Err(
+            "the admin channel is not connected".to_string()
+        )));
+    }
 
     #[test]
     fn restored_window_geometry_is_clamped_to_monitor_work_area() {
@@ -2066,7 +2110,26 @@ fn close_approvals(
 /// Intercept the native close. The first request is prevented and one
 /// owner-targeted close_request is issued; a matching window_close_approve sets
 /// the one-shot approval consumed by the close triggered from the host. A
-/// disconnected WebView falls back to a native warning.
+/// WebView that cannot run its confirmation flow falls back to a native warning.
+///
+/// The confirmation itself belongs to the WebView's close coordinator (R5): its
+/// per-participant risk/settlement dialogs are the product's answer to "discard
+/// unsaved work?". The window is loaded from the **daemon's** host origin and
+/// holds its own data-plane connection, so the app asks through the admin
+/// channel and the daemon pushes the frame into the WebView:
+///
+/// ```text
+/// CloseRequested → admin `owner.close_request` → data-plane `window_close_request`
+///   → coordinator settles → data-plane `window_close_approve` | `window_close_cancel`
+///     → app-surface `close_window` | `cancel_window_close` (this process)
+///   ← `{requestId, delivered, outcome}`
+/// ```
+///
+/// When that round trip cannot produce a coordinator answer — no WebView holds
+/// the owner (`undeliverable`), the coordinator never answers (`timeout`), or
+/// the admin channel itself is down — the native dialog below still confirms the
+/// close. The degradation path is deliberate: it is never *less* safe, only less
+/// informative.
 fn handle_close_requested(window: &tauri::Window, api: &tauri::CloseRequestApi) {
     // The label↔owner map is the app's, fed by the daemon's mirror (plan D4).
     // Using the mirror — not the in-process registry — is what keeps this path
@@ -2110,48 +2173,110 @@ fn handle_close_requested(window: &tauri::Window, api: &tauri::CloseRequestApi) 
     );
     drop(guard);
 
-    let delivered = window
-        .try_state::<HostServerState>()
-        .map(|host| {
-            host.send_owner_event(
-                &owner,
-                serde_json::json!({ "type": "window_close_request", "requestId": request_id }),
-            )
-        })
-        .unwrap_or(false);
-    if delivered {
+    // The WebView is the confirmation authority, and only the daemon can reach
+    // it (R5). A missing link means the app has no channel at all: the native
+    // dialog is the only confirmation left.
+    let Some(link) = app.try_state::<DaemonLink>() else {
+        show_close_fallback_dialog(app, owner, request_id);
         return;
-    }
+    };
+    let client = link.client();
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let delivery = client
+            .request_owner_close(owner.as_str(), &request_id)
+            .await;
+        if !close_request_needs_native_fallback(delivery) {
+            // The coordinator owns the outcome: approving (the app-surface op
+            // already closed the window) or cancelling (the pending close was
+            // dropped) — either way this request is settled.
+            return;
+        }
+        // Only this request may open the dialog: a settlement can land while we
+        // waited, and a native warning over a window that is already closing
+        // would be worse than none.
+        if !close_request_still_pending(&owner, &request_id) {
+            return;
+        }
+        show_close_fallback_dialog(&app_for_task, owner, request_id);
+    });
+}
 
-    // Disconnected WebView fallback: a native warning. Confirm closes (after
-    // settlement of host-owned state); cancel drops the pending request.
-    let app = window.app_handle().clone();
-    let owner_for_dialog = owner.clone();
-    let mirror_for_dialog = mirror.clone();
-    window
-        .app_handle()
-        .dialog()
-        .message("Closing this window will discard unsaved changes and any temporary chats.")
-        .title("Close window")
-        .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-            "Close anyway".to_string(),
-            "Cancel".to_string(),
-        ))
-        .show(move |result| {
-            let mut g = close_approvals().lock().unwrap();
-            if result {
-                if let Some(pending) = g.get_mut(&owner_for_dialog) {
-                    pending.approved = true;
+/// The one decision the close delegate makes from an `owner.close_request`
+/// result: does the native dialog still have to run?
+///
+/// Everything that is not a WebView settlement is a fallback — including a
+/// failed op (a dead admin channel, a malformed reply). The safe direction is
+/// always "ask the user anyway".
+fn close_request_needs_native_fallback(
+    delivery: Result<picot_host::daemon::owner_close::OwnerCloseDelivery, String>,
+) -> bool {
+    match delivery {
+        Ok(delivery) => delivery.requires_native_fallback(),
+        Err(_) => true,
+    }
+}
+
+/// True while this exact request is the owner's pending close and nobody has
+/// approved it yet.
+fn close_request_still_pending(owner: &window_owner::OwnerId, request_id: &str) -> bool {
+    close_approvals()
+        .lock()
+        .unwrap()
+        .get(owner)
+        .is_some_and(|pending| pending.request_id == request_id && !pending.approved)
+}
+
+/// The window label the app's mirror has for one owner (the daemon owns the
+/// registry and the app's copy is the daemon-fed mirror, plan D4).
+fn mirror_label_for_owner(app: &AppHandle, owner: &window_owner::OwnerId) -> Option<String> {
+    DaemonLink::mirror_for(app).and_then(|mirror| mirror.label_for_owner(owner.as_str()))
+}
+
+/// The degradation path: the WebView never owned the close question, so the
+/// native warning asks it instead. Confirm closes (after settlement of
+/// host-owned state); cancel drops the pending request.
+fn show_close_fallback_dialog(app: &AppHandle, owner: window_owner::OwnerId, request_id: String) {
+    let app = app.clone();
+    // The dialog API is main-thread, and the fallback also has to run when it is
+    // reached from a task on the async runtime (a settlement timeout), so the
+    // dialog is built and shown inside the main-thread hop.
+    let dispatched = app.clone().run_on_main_thread(move || {
+        let dialogs = app.dialog();
+        let app_for_dialog = app.clone();
+        let owner_for_dialog = owner.clone();
+        dialogs
+            .message("Closing this window will discard unsaved changes and any temporary chats.")
+            .title("Close window")
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Close anyway".to_string(),
+                "Cancel".to_string(),
+            ))
+            .show(move |result| {
+                let mut guard = close_approvals().lock().unwrap();
+                // A settlement may have landed while the dialog was up; only
+                // the request that opened it may be settled here.
+                match guard.get(&owner_for_dialog) {
+                    Some(pending) if pending.request_id == request_id => {}
+                    _ => return,
                 }
-                let label = mirror_for_dialog.label_for_owner(owner_for_dialog.as_str());
-                drop(g);
-                if let Some(label) = label {
-                    let _ = app.get_webview_window(&label).map(|w| w.close());
+                if result {
+                    if let Some(pending) = guard.get_mut(&owner_for_dialog) {
+                        pending.approved = true;
+                    }
+                    let label = mirror_label_for_owner(&app_for_dialog, &owner_for_dialog);
+                    drop(guard);
+                    if let Some(label) = label {
+                        let _ = app_for_dialog.get_webview_window(&label).map(|w| w.close());
+                    }
+                } else {
+                    guard.remove(&owner_for_dialog);
                 }
-            } else {
-                g.remove(&owner_for_dialog);
-            }
-        });
+            });
+    });
+    if let Err(error) = dispatched {
+        log::warn!("[picot] no native close warning could be presented: {error}");
+    }
 }
 
 /// Final idempotent cleanup when a native window is destroyed: drop the

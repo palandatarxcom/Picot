@@ -40,6 +40,7 @@ use futures_util::{SinkExt, StreamExt};
 use picot_host::daemon::admin::{
     ManagerIdentity, ADMIN_CLOSE_BAD_TOKEN, ADMIN_CLOSE_LEASE_HELD, ADMIN_WS_PATH,
 };
+use picot_host::daemon::owner_close::OwnerCloseDelivery;
 use picot_host::host_control::ProgressSink;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -50,6 +51,15 @@ use super::navigation_mirror::{InstalledPermit, MirrorOwner, NavigationMirror};
 /// How long one `admin_request` may take before the client gives up (plan Task
 /// 5: "10s timeout, id-matched").
 pub const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The app's deadline for one `owner.close_request` (R5).
+///
+/// Deliberately longer than [`ADMIN_REQUEST_TIMEOUT`]: this op is a long-poll
+/// whose deadline belongs to the **daemon**
+/// (`picot_host::daemon::owner_close::CLOSE_REQUEST_SETTLE_TIMEOUT`, 30s), and a
+/// client deadline firing first would report a false "the admin channel is
+/// broken" for a request the daemon was still legitimately waiting on. The
+/// margin covers the round trip.
+pub const CLOSE_REQUEST_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 /// How long the handshake — connect, `admin_hello`, `admin_welcome` — may take.
 pub const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Broadcast fan-out capacity for [`AdminClient::subscribe`] consumers.
@@ -239,6 +249,18 @@ impl AdminClient {
 
     /// One id-matched request with a 10s deadline.
     pub async fn request(&self, op: &str, args: Value) -> Result<Value, String> {
+        self.request_with_timeout(op, args, ADMIN_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// One id-matched request with an explicit deadline, for ops that are
+    /// long-polls by design ([`Self::request_owner_close`]).
+    pub async fn request_with_timeout(
+        &self,
+        op: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         if !self.is_connected() {
             return Err("the admin channel is not connected".to_string());
         }
@@ -253,7 +275,7 @@ impl AdminClient {
             self.pending.lock().expect("admin pending lock").remove(&id);
             return Err(error);
         }
-        match tokio::time::timeout(ADMIN_REQUEST_TIMEOUT, receiver).await {
+        match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             // The pump settled this slot as a failure (channel dropped).
             Ok(Err(_)) => {
@@ -261,12 +283,32 @@ impl AdminClient {
             }
             Err(_) => {
                 self.pending.lock().expect("admin pending lock").remove(&id);
-                Err(format!(
-                    "{op} did not answer within {}s",
-                    ADMIN_REQUEST_TIMEOUT.as_secs()
-                ))
+                Err(format!("{op} did not answer within {}s", timeout.as_secs()))
             }
         }
+    }
+
+    /// The window-close hand-off (R5, plan protocol table `owner.close_request`).
+    ///
+    /// The app cannot reach the WebView itself: the window is loaded from the
+    /// **daemon's** origin and holds its own data-plane connection, so the
+    /// daemon pushes `window_close_request` into the WebView coordinator and
+    /// answers this op when that coordinator settles (or on its own deadline).
+    /// The reply says whether the question ever reached a WebView — which is
+    /// exactly what the app's native-dialog fallback keys on.
+    pub async fn request_owner_close(
+        &self,
+        owner: &str,
+        request_id: &str,
+    ) -> Result<OwnerCloseDelivery, String> {
+        let result = self
+            .request_with_timeout(
+                "owner.close_request",
+                json!({"owner": owner, "requestId": request_id}),
+                CLOSE_REQUEST_CLIENT_TIMEOUT,
+            )
+            .await?;
+        OwnerCloseDelivery::from_value(&result)
     }
 
     /// Mint an owner capability and seed the mirror with the sealed row.
@@ -630,6 +672,7 @@ mod tests {
     use crate::daemon_client::surface_ops::ForwardedSurfaceOps;
     use picot_host::daemon::admin::{AdminConfig, AdminServer};
     use picot_host::daemon::app_surface::{AppSurface, PaneOp, SurfaceProgress};
+    use picot_host::daemon::owner_close::CloseOutcome;
     use picot_host::daemon::surface_forward::{wire, AdminForwardingSurface};
     use picot_host::daemon::{DaemonConfig, DaemonState};
     use picot_host::host_server::PaneRect;
@@ -805,6 +848,47 @@ mod tests {
         );
         assert_eq!(mirror.owner_has_workspace(owner), Some(true));
         assert!(mirror.epoch().is_some());
+        fixture.state.shutdown_graceful("test").await;
+    }
+
+    /// R5: the close delegate's ask travels the real admin channel. No WebView
+    /// holds this owner, so the daemon answers `undeliverable` — the reply the
+    /// native-dialog fallback keys on. The op name, its `{owner, requestId}`
+    /// arguments and the reply decoding are all exercised here; a wrong op name
+    /// would surface as `unknown admin op` instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_close_request_round_trips_and_reports_the_degradation_reply() {
+        let fixture = boot().await;
+        let (client, _mirror) = attach(&fixture, Arc::new(RecordingExecutor::default())).await;
+        let created = client
+            .create_owner(
+                "native-workspace-w1",
+                Some("/workspace"),
+                5001,
+                "http://127.0.0.1:5001",
+                None,
+            )
+            .await
+            .expect("owner.create succeeds over the real channel");
+
+        let delivery = client
+            .request_owner_close(&created.owner, "close-1")
+            .await
+            .expect("owner.close_request answers");
+        assert_eq!(delivery.request_id, "close-1");
+        assert!(!delivery.delivered, "no WebView holds this owner");
+        assert_eq!(delivery.outcome, CloseOutcome::Undeliverable);
+        assert!(
+            delivery.requires_native_fallback(),
+            "an undelivered request is the native-dialog path"
+        );
+
+        // An owner the daemon does not know is an error, never a silent
+        // "settled": the app must not read consent out of a refusal.
+        assert!(client
+            .request_owner_close("no-such-owner", "close-2")
+            .await
+            .is_err());
         fixture.state.shutdown_graceful("test").await;
     }
 
