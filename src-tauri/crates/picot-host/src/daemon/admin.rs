@@ -46,6 +46,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::daemon::owner_close::CloseOutcome;
 use crate::daemon::DaemonState;
 use crate::host_control::ProgressSink;
+use crate::runtime_coordinator::RuntimeState;
 use crate::window_owner::{OwnerId, OwnerMirrorEvent, TemporaryKind};
 
 /// The admin WS path (plan D3: a second listener, never LAN-gated).
@@ -1267,24 +1268,31 @@ fn running_agents(state: &Arc<DaemonState>) -> Vec<Value> {
                     .canonical_root_for_workspace_id(&target.workspace_id)
                     .ok()
             });
-            agent_row(&target, cwd.as_deref(), state.runtimes.is_working(&target))
+            // One lock-guarded read of the coordinator answers the whole row.
+            // `state_of` returns `None` for a runtime the coordinator no longer
+            // tracks; the row reports that as a null state, never a fabricated
+            // `stopped`.
+            agent_row(&target, cwd.as_deref(), state.runtimes.state_of(&target))
         })
         .collect()
 }
 
-/// One agent row of `daemon.status`: the identity a restart stops, with the
-/// workspace root when the registry still knows it.
+/// One agent row of `daemon.status`: the identity a restart stops, the
+/// coordinator's own state, and the workspace root when the registry still
+/// knows it. `state` is null when the coordinator no longer tracks the runtime.
+/// `streaming` stays the mid-turn signal it always was: `Working`, nothing else.
 pub fn agent_row(
     target: &crate::runtime_coordinator::RuntimeTarget,
     cwd: Option<&std::path::Path>,
-    streaming: bool,
+    state: Option<RuntimeState>,
 ) -> Value {
     json!({
         "workspaceId": target.workspace_id,
         "sessionId": target.session_id,
         "instanceId": target.instance_id,
         "cwd": cwd.map(|path| path.to_string_lossy().to_string()),
-        "streaming": streaming,
+        "state": state,
+        "streaming": state == Some(RuntimeState::Working),
     })
 }
 
@@ -1399,14 +1407,25 @@ mod tests {
     fn a_status_agent_row_names_the_running_runtime_and_its_workspace() {
         let target =
             crate::runtime_coordinator::RuntimeTarget::with_owner("w1", "s1", "i1", "o1", 7);
-        let row = agent_row(&target, Some(std::path::Path::new("/ws/proj")), true);
+        let row = agent_row(
+            &target,
+            Some(std::path::Path::new("/ws/proj")),
+            Some(RuntimeState::Working),
+        );
         assert_eq!(row["workspaceId"], "w1");
         assert_eq!(row["sessionId"], "s1");
         assert_eq!(row["instanceId"], "i1");
         assert_eq!(row["cwd"], "/ws/proj");
-        assert_eq!(row["streaming"], true);
+        assert_eq!(
+            row["state"], "working",
+            "the row carries the coordinator's own state, snake_case on the wire"
+        );
+        assert_eq!(
+            row["streaming"], true,
+            "`streaming` stays the mid-turn signal it always was"
+        );
 
-        let unregistered = agent_row(&target, None, false);
+        let unregistered = agent_row(&target, None, Some(RuntimeState::Idle));
         assert_eq!(unregistered["workspaceId"], "w1");
         assert_eq!(
             unregistered["cwd"],
@@ -1414,6 +1433,30 @@ mod tests {
             "an unknown workspace root is null, not a fabricated path: {unregistered}"
         );
         assert_eq!(unregistered["streaming"], false);
+        assert_eq!(unregistered["state"], "idle");
+
+        // Every state the coordinator can hold is reported verbatim; a runtime
+        // it no longer knows reports **null** rather than a fabricated state
+        // (the settings list renders the row either way).
+        for (state, wire) in [
+            (RuntimeState::Starting, "starting"),
+            (RuntimeState::Trusting, "trusting"),
+            (RuntimeState::Ready, "ready"),
+            (RuntimeState::Working, "working"),
+            (RuntimeState::Idle, "idle"),
+            (RuntimeState::Suspended, "suspended"),
+            (RuntimeState::Crashed, "crashed"),
+            (RuntimeState::Stopped, "stopped"),
+        ] {
+            let state_row = agent_row(&target, None, Some(state));
+            assert_eq!(state_row["state"], wire);
+            assert_eq!(
+                state_row["streaming"],
+                wire == "working",
+                "`streaming` mirrors exactly the working state"
+            );
+        }
+        assert_eq!(agent_row(&target, None, None)["state"], Value::Null);
         // The row never carries an owner or capability: it is a settings-panel
         // payload, not authorization state.
         let encoded = row.to_string();

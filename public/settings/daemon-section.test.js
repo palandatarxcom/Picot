@@ -20,6 +20,16 @@ const lookupValue = (messages, key) => {
   return typeof node === "string" ? node : undefined;
 };
 
+// Every leaf key a locale object carries, dotted: the coverage check compares
+// this against the keys the renderer asks for, so a nested group like
+// `agentState.*` still has to be reached by some render path.
+const leafKeys = (node, prefix) =>
+  Object.entries(node).flatMap(([name, value]) =>
+    value && typeof value === "object"
+      ? leafKeys(value, `${prefix}${name}.`)
+      : [`${prefix}${name}`],
+  );
+
 // The same i18n contract the Subagents coverage suite uses: mocked t() records
 // every key the renderer asks for (including keys assembled at runtime) and
 // resolves from en.json, returning the key itself when a lookup fails — which is
@@ -273,6 +283,24 @@ describe("restart", () => {
     expect(rows[1]).toContain("w2");
   });
 
+  it("labels each agent row with its coordinator state, and a placeholder when it has none", async () => {
+    const { page, agents, restartBtn } = setup({
+      status: status({
+        agents: [
+          agent({ sessionId: "s1", state: "working" }),
+          agent({ sessionId: "s2", state: null }),
+        ],
+      }),
+    });
+    await page.activate();
+    restartBtn.click();
+    await flush();
+    const states = [...agents.querySelectorAll("li .daemon-agent-state")].map(
+      (node) => node.textContent,
+    );
+    expect(states).toEqual([EN.settings.daemon.agentState.working, "—"]);
+  });
+
   it("runs the transaction and refreshes the status when confirmed", async () => {
     let version = "0.5.0";
     const { page, commands, calls, restartBtn } = setup({
@@ -440,7 +468,7 @@ describe("locale coverage", () => {
       }
     }
     // No unused copy in en.json (the reference locale).
-    const declared = Object.keys(EN.settings.daemon).map((name) => SECTION_KEYS + name);
+    const declared = leafKeys(EN.settings.daemon, SECTION_KEYS);
     expect([...declared].sort()).toEqual([...keys].sort());
   });
 });
@@ -463,8 +491,14 @@ async function renderEveryBranch() {
     document.getElementById("btn-daemon-restart-cancel").click();
     harness.invoke.mockClear();
   }
-  // The confirm's own copy, with and without agents, and the failure path.
-  for (const agents of [[agent()], []]) {
+  // The confirm's own copy, with a row for every coordinator state and without
+  // agents, and the failure path.
+  for (const agents of [
+    ["starting", "trusting", "ready", "working", "idle", "suspended", "crashed", "stopped"].map(
+      (state) => agent({ state }),
+    ),
+    [],
+  ]) {
     mountSection();
     mountInvoke({ status: status({ agents }) });
     const page = setupDaemonSection({ root: document });

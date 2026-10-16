@@ -770,7 +770,17 @@
       "readFailed": "No se pudo leer el estado del daemon: {reason}",
       "saveFailed": "No se pudo guardar el ajuste: {reason}",
       "restartFailed": "El reinicio falló: {reason}",
-      "stoppedReason": "El daemon no está en ejecución: {reason}"
+      "stoppedReason": "El daemon no está en ejecución: {reason}",
+      "agentState": {
+        "starting": "Iniciando",
+        "trusting": "Esperando confianza",
+        "ready": "Listo",
+        "working": "Trabajando",
+        "idle": "Inactivo",
+        "suspended": "Suspendido",
+        "crashed": "Bloqueado",
+        "stopped": "Detenido"
+      }
     },
     "extensions": "Paquetes de extensión",
     "extensionAdvisor": {

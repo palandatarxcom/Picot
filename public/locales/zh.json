@@ -770,7 +770,17 @@
       "readFailed": "无法读取守护进程状态：{reason}",
       "saveFailed": "无法保存设置：{reason}",
       "restartFailed": "重启失败：{reason}",
-      "stoppedReason": "守护进程未运行：{reason}"
+      "stoppedReason": "守护进程未运行：{reason}",
+      "agentState": {
+        "starting": "启动中",
+        "trusting": "等待信任确认",
+        "ready": "就绪",
+        "working": "工作中",
+        "idle": "空闲",
+        "suspended": "已挂起",
+        "crashed": "已崩溃",
+        "stopped": "已停止"
+      }
     },
     "extensions": "扩展包",
     "extensionAdvisor": {

@@ -455,12 +455,21 @@ impl NativePiManager {
     /// Whether this runtime is mid-turn (`agent_start` … `agent_end`): the
     /// authoritative streaming flag surfaced in `runtime_instances`.
     pub fn is_working(&self, target: &crate::runtime_coordinator::RuntimeTarget) -> bool {
+        self.state_of(target) == Some(crate::runtime_coordinator::RuntimeState::Working)
+    }
+
+    /// The runtime's coordinator state, or `None` when the coordinator no longer
+    /// tracks it: the one read-only probe behind `is_working` and every
+    /// `daemon.status` agent row (`None` travels to the wire as a null state).
+    pub fn state_of(
+        &self,
+        target: &crate::runtime_coordinator::RuntimeTarget,
+    ) -> Option<crate::runtime_coordinator::RuntimeState> {
         self.inner
             .coordinator
             .lock()
             .ok()
             .and_then(|coordinator| coordinator.state_of(target))
-            .is_some_and(|state| state == crate::runtime_coordinator::RuntimeState::Working)
     }
 
     /// Test seam: register a runtime backed by an in-memory bridge instead of a

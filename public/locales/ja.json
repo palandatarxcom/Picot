@@ -770,7 +770,17 @@
       "readFailed": "デーモンの状態を読み取れませんでした：{reason}",
       "saveFailed": "設定を保存できませんでした：{reason}",
       "restartFailed": "再起動に失敗しました：{reason}",
-      "stoppedReason": "デーモンが実行されていません：{reason}"
+      "stoppedReason": "デーモンが実行されていません：{reason}",
+      "agentState": {
+        "starting": "起動中",
+        "trusting": "信頼確認待ち",
+        "ready": "準備完了",
+        "working": "実行中",
+        "idle": "待機中",
+        "suspended": "一時停止中",
+        "crashed": "クラッシュ",
+        "stopped": "停止"
+      }
     },
     "extensions": "拡張パッケージ",
     "extensionAdvisor": {

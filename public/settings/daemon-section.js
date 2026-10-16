@@ -54,6 +54,22 @@ function errorMessage(error) {
 }
 
 /**
+ * The coordinator's eight runtime states, snake_case on the wire (admin.rs
+ * `RuntimeState`). The restart confirm shows the daemon's own state per row, so
+ * an operator sees a mid-turn agent as `working`, not just a boolean.
+ */
+const AGENT_STATES = [
+  "starting",
+  "trusting",
+  "ready",
+  "working",
+  "idle",
+  "suspended",
+  "crashed",
+  "stopped",
+];
+
+/**
  * Wire the Daemon section.
  *
  * @param {{
@@ -191,13 +207,26 @@ export function setupDaemonSection({
     agentsLabel.textContent = "";
   }
 
-  /** One list row per live runtime: its workspace root and its session id. */
+  /** One list row per live runtime: workspace root, session id, coordinator state. */
   function agentRow(agent) {
     const li = root.createElement("li");
     const workspace = agent?.cwd || agent?.workspaceId || "—";
     const session = agent?.sessionId ? String(agent.sessionId) : "";
-    li.textContent = session ? `${workspace} · ${session}` : String(workspace);
+    li.textContent = `${session ? `${workspace} · ${session}` : String(workspace)} · `;
+    const state = root.createElement("span");
+    state.className = "daemon-agent-state";
+    state.textContent = agentStateLabel(agent?.state);
+    li.append(state);
     return li;
+  }
+
+  /**
+   * A row's state copy. A state the coordinator no longer reports (`null`) has
+   * no label of its own: the row shows the placeholder rather than a fabricated
+   * one.
+   */
+  function agentStateLabel(state) {
+    return AGENT_STATES.includes(state) ? t(`settings.daemon.agentState.${state}`) : "—";
   }
 
   async function openConfirm() {

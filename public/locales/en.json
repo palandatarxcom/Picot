@@ -770,7 +770,17 @@
       "readFailed": "Could not read the daemon state: {reason}",
       "saveFailed": "Could not save the setting: {reason}",
       "restartFailed": "The restart failed: {reason}",
-      "stoppedReason": "The daemon is not running: {reason}"
+      "stoppedReason": "The daemon is not running: {reason}",
+      "agentState": {
+        "starting": "Starting",
+        "trusting": "Awaiting trust",
+        "ready": "Ready",
+        "working": "Working",
+        "idle": "Idle",
+        "suspended": "Suspended",
+        "crashed": "Crashed",
+        "stopped": "Stopped"
+      }
     },
     "extensions": "Extension packages",
     "extensionAdvisor": {
