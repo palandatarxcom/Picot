@@ -858,6 +858,77 @@ describe("registry cache invalidation wiring", () => {
     await new Promise((resolve) => setTimeout(resolve, 850));
   });
 
+  test("a runtime-id placeholder converges with the persisted row carrying that id", async () => {
+    // A daemon restart reloads the route (workspace id + runtime session id)
+    // for an already-persisted session. The placeholder seeded from that route
+    // target is keyed by the runtime id, which never equals the scanned
+    // absolute JSONL path — but the persisted file NAME carries the id, so the
+    // placeholder must converge on the spot instead of surviving as an
+    // unselectable "New chat" row.
+    const sessionId = "01a13eab-3d17-7776-8a7e-afbddae6bb59";
+    const persistedFile = `/sessions/2026-10-15T08-26-12-119Z_${sessionId}.jsonl`;
+    const { sidebar } = await makeSidebar({
+      rows: REGISTRY_ROWS,
+      fetchRoutes: {
+        instances: [],
+        workspaceSessions: (url) =>
+          url.searchParams.get("path") === "/work/alpha"
+            ? { sessions: [{ filePath: persistedFile, name: "Hosted session" }] }
+            : { sessions: [] },
+      },
+    });
+    await sidebar.loadSessions();
+    const alpha = sidebar.projects.find((project) => project.workspaceId === "ws:uuid-1");
+    await sidebar.setWorkspaceExpanded(alpha, true);
+    await settleFetches();
+
+    sidebar.setProvisionalSession({ workspaceId: "uuid-1", sessionId });
+
+    expect(sidebar.provisionalSession).toBeNull();
+    expect(alpha.sessions.filter((session) => session.provisional)).toHaveLength(0);
+    expect(document.querySelector(`.session-item[data-file-path="${sessionId}"]`)).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 850));
+  });
+
+  test("boot purges a placeholder hydrated from the previous page's cache", async () => {
+    // The sidebar cookie can carry a route placeholder from an earlier page.
+    // The next boot (the reload that follows a daemon restart) restored it into
+    // a collapsed workspace whose session list is never lazily fetched, so the
+    // row stuck around: selectable-looking, but its bare runtime id is not a
+    // file path, and the host answers "Selected session is unavailable".
+    const sessionId = "01a13eab-3d17-7776-8a7e-afbddae6bb59";
+    const persistedFile = `/sessions/2026-10-15T08-26-12-119Z_${sessionId}.jsonl`;
+    const { sidebar } = await makeSidebar({
+      rows: REGISTRY_ROWS,
+      fetchRoutes: { instances: [], workspaceSessions: () => ({ sessions: [] }) },
+    });
+    // Hydrated boot state: the placeholder beside the live row, workspace
+    // collapsed (fresh page restores no expansion).
+    sidebar.projects = [
+      {
+        workspaceId: "ws:uuid-1",
+        registryId: "uuid-1",
+        path: "/work/alpha",
+        folderName: "alpha",
+        source: "registry",
+        sessions: [
+          { filePath: sessionId, name: "New chat", provisional: true },
+          { filePath: persistedFile, name: "", firstMessage: "" },
+        ],
+      },
+    ];
+    sidebar.setActive(persistedFile);
+
+    sidebar.setProvisionalSession({ workspaceId: "uuid-1", sessionId });
+
+    const alpha = sidebar.projects[0];
+    expect(alpha.sessions.filter((session) => session.provisional)).toHaveLength(0);
+    expect(document.querySelector(`.session-item[data-file-path="${sessionId}"]`)).toBeNull();
+    // Every renderable row must be selectable: no bare runtime ids left behind.
+    expect(alpha.sessions.every((session) => session.filePath.startsWith("/"))).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 850));
+  });
+
   test("coalesced refresh preserves in-flight session-list generation", async () => {
     const { sidebar } = await makeRegistrySidebar();
     await sidebar.loadSessions();

@@ -183,6 +183,32 @@ describe("nav-state-cache", () => {
       expect(cached[0].sessions).toHaveLength(1);
     });
 
+    it("never caches the provisional placeholder row", () => {
+      // The placeholder is per-page UI state keyed by the *runtime* session id
+      // (not a file). Caching it made the next boot (e.g. the reload after a
+      // daemon restart) hydrate an unselectable row: selecting it routes the
+      // bare id as `sessionPath`, which the host cannot canonicalize, so the
+      // click fails with "Selected session is unavailable".
+      cacheSidebarProjects([
+        {
+          ...sampleProjects[0],
+          sessions: [
+            {
+              filePath: "01a13eab-3d17-7776-8a7e-afbddae6bb59",
+              name: "New chat",
+              provisional: true,
+            },
+            ...sampleProjects[0].sessions,
+          ],
+        },
+      ]);
+
+      const cached = readCachedSidebarProjects();
+      expect(cached).not.toBeNull();
+      expect(cached[0].sessions.map((session) => session.filePath)).toEqual(["/s1.jsonl"]);
+      expect(cached[0].sessions.some((session) => session.provisional)).toBe(false);
+    });
+
     it("shards large project trees and reads them back", () => {
       const manySessions = Array.from({ length: 400 }, (_, i) => ({
         filePath: `/s${i}.jsonl`,
