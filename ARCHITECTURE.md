@@ -2,7 +2,7 @@
 
 > 本文档描述 native runtime 迁移完成后的架构。
 > 迁移历史与决策记录见 `docs/superpowers/specs/2026-08-27-native-runtime-migration-design.md`。
-> Phase 1（daemon 化）已落地：**daemon 独立进程是唯一运行形态**（开发期的进程内模式及其环境开关已在 T12 删除，无双轨）。设计来源见 `docs/superpowers/specs/not-started/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4，实施记录见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`。
+> Phase 1（daemon 化）已落地：**daemon 独立进程是唯一运行形态**（开发期的进程内模式及其环境开关已在 T12 删除，无双轨）。设计来源见 `docs/superpowers/specs/implemented/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4，实施记录见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`。
 
 ## 一句话概览
 
@@ -10,7 +10,7 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 
 ## 进程模型
 
-> **Phase 1（macOS-first，已落地）** —— 本章是**现行实现契约**（不是目标态）：宿主栈只存在于 `picot-daemon` 进程，app 进程内没有 host 状态，也没有可切的进程内模式（T12 删除了 embedded 路径与环境开关）。实施计划见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`，设计来源见 `docs/superpowers/specs/not-started/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4。
+> **Phase 1（macOS-first，已落地）** —— 本章是**现行实现契约**（不是目标态）：宿主栈只存在于 `picot-daemon` 进程，app 进程内没有 host 状态，也没有可切的进程内模式（T12 删除了 embedded 路径与环境开关）。实施计划见 `docs/superpowers/plans/2026-10-15-picot-daemon-phase1.md`，设计来源见 `docs/superpowers/specs/implemented/2026-09-20-persistent-daemon-relay-design.md` §3.1-§3.3、§4.4。
 
 ```text
 ┌───────────────────────────────────────────────────────┐

@@ -10,15 +10,15 @@
 
 | 子目录 | 含义 | 文件数 |
 | --- | --- | --- |
-| [`implemented/`](implemented/) | 实现已归档；交付范围、偏差与验证限制见各 spec | 56 |
+| [`implemented/`](implemented/) | 实现已归档；交付范围、偏差与验证限制见各 spec | 61 |
 | [`in-progress/`](in-progress/) | 设计已批准实施未完（部分代码已合入或 working tree 有进展） | 2 |
-| [`not-started/`](not-started/) | 设计草案或待评审，未实施 | 6 |
+| [`not-started/`](not-started/) | 设计草案或待评审，未实施 | 1 |
 | [`audits/`](../../audits/) | 审计记录（非设计 spec，不引入实现） | 1 |
 | [`superseded/`](superseded/) | 已被更新的 spec 取代，保留作历史参考 | 9 |
 | [`process-evidence/`](process-evidence/) | Native Runtime 迁移过程的证据 / CP 评审 / 闭环记录（不是设计规格） | 24 |
 | [`prototypes/`](prototypes/) | 视觉原型（HTML），仅评审用，不进生产 | 3 |
 
-文件数和其他条目的状态来自上轮汇总，尚未同步当前并行归档；本轮只登记 Subagents settings 的完成状态，不将这些计数作为当前目录实况。
+文件数和其他条目的状态来自上轮汇总，尚未同步当前并行归档；本轮只将 `implemented/`（61）与 `not-started/`（1）两项按目录实数核对，其余计数与表中部分行仍指向迁移前的旧路径（已知债务，待下一轮 reorg 收敛）。
 
 ## 分类原则
 
@@ -81,6 +81,7 @@
 | ✅ implemented | [2026-09-19-turn-files-card](implemented/2026-09-19-turn-files-card-design.md) | public/ui/turn-files-card.js + test；spec 标"待复核"指 spec 文本未定稿 |
 | ✅ implemented | [2026-09-20-history-scroll-auto-load](implemented/2026-09-20-history-scroll-auto-load-design.md) | 滚动触发状态机 + history gate；Paseo 参照移植 |
 | ✅ implemented | [2026-09-20-session-resident-views](implemented/2026-09-20-session-resident-views-design.md) | 前端视图层（host session 常驻已实现）；tab LRU 保活 |
+| ✅ implemented | [2026-09-20-persistent-daemon-relay](implemented/2026-09-20-persistent-daemon-relay-design.md) | Phase 1（§3）已落地（T1–T12 代码 + T13 验收矩阵）；Phase 2/2.5/3 未启动 |
 | ✅ implemented | [2026-09-21-datarx-safety-guard-pi](implemented/2026-09-21-datarx-safety-guard-pi-design.md) | safety-guard-dialog.js（fork @firstpick/pi-extension-safety-guard） |
 | ✅ implemented | [2026-09-22-browser-pane-annotation](implemented/2026-09-22-browser-pane-annotation-design.md) | browser-pane/ 目录（tab-renderer + annotations）；09-25 改注入 pane |
 | ✅ implemented | [2026-09-22-provider-quota-display](implemented/2026-09-22-provider-quota-display-design.md) | cost/provider-quota-panel.js + quota-locale |
@@ -91,7 +92,6 @@
 | ⛔ superseded | [2026-09-18-subagent-display](superseded/2026-09-18-subagent-display-design.md) | v2 面向 tintinweb 契约未实现，tintinweb 路线已废弃（2026-10-11）；v1 契约代码已实现并以 0.77.0 复核 |
 | 🚧 in-progress | [2026-09-27-clinical-research-agent-team](in-progress/2026-09-27-clinical-research-agent-team-design.md) | 试用版；六份岗位指令 + Paseo profile 已建，真实团队未验证 |
 | 📋 not-started | [2026-09-18-acp-external-agent-delegation](not-started/2026-09-18-acp-external-agent-delegation-design.md) | 设计草案，Dr. Lin 2026-09：暂时不做 |
-| 📋 not-started | [2026-09-20-persistent-daemon-relay](not-started/2026-09-20-persistent-daemon-relay-design.md) | 持久 daemon + relay 接入；Draft 待拍板 |
 | 📋 not-started | [2026-09-22-environment-toolchain](not-started/2026-09-22-environment-toolchain-design.md) | Settings 「环境」页；Draft 待评审 |
 | 📋 not-started | [2026-09-22-line-review-workflow](not-started/2026-09-22-line-review-workflow-design.md) | 行级 Code Review 工作流；Draft 待评审 |
 | 📋 not-started | [2026-09-23-paseo-pi-only-fork-relay-mobile](not-started/2026-09-23-paseo-pi-only-fork-relay-mobile-design.md) | Paseo Pi-only fork + relay + 移动端；阶段一裁剪已实测 |
