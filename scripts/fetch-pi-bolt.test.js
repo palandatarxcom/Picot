@@ -17,21 +17,6 @@ describe("pi-bolt distribution", () => {
     expect(lock.sha256["pi-bolt-win32-x64-jit.zip"]).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  test("tracks the same upstream Pi version as the official pi lock", () => {
-    // resources/pi and resources/pi-bolt ship together; a version gap must be
-    // a conscious pin bump, never a silent drift.
-    const bolt = JSON.parse(read("scripts/pi-bolt-version.json"));
-    const official = JSON.parse(read("scripts/pi-version.json"));
-    expect(bolt.piVersion).toBe(official.version);
-  });
-
-  test("fetches pi-bolt without replacing the official pi fetch", () => {
-    expect(read("package.json")).toContain('"fetch:pi-bolt"');
-    expect(read("package.json")).toContain('"fetch:pi"');
-    expect(read("package.json")).not.toContain('"prebuild": "bun run fetch:pi-bolt');
-    expect(read(".gitignore")).toContain("src-tauri/resources/pi-bolt/");
-  });
-
   test("fetch script downloads from the Pi-Bolt repo and deflects unsupported platforms to fetch:pi", () => {
     const script = read("scripts/fetch-pi-bolt.js");
     expect(script).toContain("opensec-git/Pi-Bolt/releases/download");

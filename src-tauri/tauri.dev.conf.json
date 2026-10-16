@@ -1,3 +1,8 @@
 {
-  "identifier": "com.palandata.picot.dev"
+  "identifier": "com.palandata.picot.dev",
+  "app": {
+    "security": {
+      "capabilities": ["default", "dev-focus"]
+    }
+  }
 }

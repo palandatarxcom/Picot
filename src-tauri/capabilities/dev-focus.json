@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "dev-focus",
+  "description": "Dev-only: lets the WebView raise its own window so e2e diagnostic harnesses survive occlusion suspension. Referenced only by tauri.dev.conf.json; release builds keep the explicit capabilities list without it.",
+  "local": true,
+  "remote": {
+    "urls": ["http://localhost:*", "http://127.0.0.1:*"]
+  },
+  "windows": ["*"],
+  "permissions": [
+    "core:window:allow-set-focus",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-position",
+    "core:window:allow-set-size"
+  ]
+}
