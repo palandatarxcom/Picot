@@ -350,6 +350,36 @@ describe("restart", () => {
   });
 });
 
+// ── Restart confirm layout ───────────────────────────────────────────────────
+//
+// `.settings-row` sets `display: flex`, which beats the UA `[hidden]` rule: the
+// hidden confirm row rendered anyway, so Restart, Cancel and "Restart now" were
+// all on screen at once. The fix is a stylesheet rule, so the regression is
+// pinned at that level — a jsdom render cannot reproduce the cascade (the page
+// stylesheet is never loaded there, and the UA rule alone would hide the row).
+describe("restart confirm layout", () => {
+  const STYLE = readFileSync("public/style.css", "utf8");
+  const ruleBody = (selector) => {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return STYLE.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+  };
+
+  it("hides a hidden settings row instead of letting display: flex win", () => {
+    expect(ruleBody(".settings-row[hidden]")).toContain("display: none");
+  });
+
+  it("keeps the agent list and the confirm actions in one revealed container", () => {
+    const dom = mountSection();
+    const actions = dom.confirm.querySelector(".daemon-confirm-actions");
+    expect(actions).not.toBeNull();
+    expect(actions.parentElement).toBe(dom.agents.parentElement);
+    // Both live under the row openConfirm() reveals: the two buttons are only
+    // reachable together with the list they belong to.
+    expect(dom.confirm.contains(dom.agents)).toBe(true);
+    expect(dom.confirm.contains(actions)).toBe(true);
+  });
+});
+
 describe("polling", () => {
   it("polls while the section is open and stops when it closes", async () => {
     vi.useFakeTimers();
