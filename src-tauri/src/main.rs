@@ -42,7 +42,7 @@ use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Manager, TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_window_state::StateFlags;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 // (R5) The `HostServerState` alias is gone with the window-close hand-off: the
 // WebView talks to the daemon's own host, and only the daemon can push into it,
@@ -2425,6 +2425,26 @@ impl AppRestartLink {
         let host_origin = self.link()?.host_origin();
         for row in rows {
             if let Some(window) = self.app.get_webview_window(&row.label) {
+                // `destroy()` fires no `CloseRequested`, and a migration is not
+                // a `RunEvent::Exit`: the window-state plugin never records
+                // what this window actually looks like, so the re-created
+                // window restored whatever a session of `Resized`/`Moved`
+                // events had left in the plugin's cache — an oversized window
+                // that `open_native_window` then clamps to the work area (the
+                // "maximized after restart" window). Saving here overwrites
+                // that cache, and the file, from the live window.
+                //
+                // shortcut: saving a maximized window stores the maximized
+                // geometry (the plugin skips SIZE while maximized), so a
+                // restart comes back maximized rather than at the size the
+                // window had before it was maximized.
+                if let Err(error) = self.app.save_window_state(window_state_flags()) {
+                    log::warn!(
+                        "[picot] cannot save the window geometry of {} before migrating it: \
+                         {error}",
+                        row.label
+                    );
+                }
                 window.destroy().map_err(|error| {
                     format!("cannot close window {} for migration: {error}", row.label)
                 })?;
@@ -3468,6 +3488,51 @@ mod migration_guard_tests {
             classify_exit_request(None, marks_any(&marks), false, false),
             ExitRequestVerdict::Quit,
             "a dropped migration must not hold the next exit"
+        );
+    }
+}
+
+/// The restart migration's window-geometry hand-off (see `recreate_windows`).
+///
+/// The plugin writes `.window-state.json` only on `RunEvent::Exit`, and only
+/// refreshes a window's cache entry on `CloseRequested`; `destroy()` fires
+/// neither. A migrated window was therefore re-created from whatever the
+/// in-memory cache held at that moment — the geometry a session of
+/// `Resized`/`Moved` events had left there — and `open_native_window`'s clamp
+/// then turned an oversized restore into the "maximized after restart" window
+/// Dr. Lin saw. The transaction must save each window's live geometry **before**
+/// destroying it, which is the whole fix.
+///
+/// Asserted against the source, not a live `AppHandle`: the call needs a real
+/// `WebviewWindow`, so the assertion locks the ordering inside the
+/// `if let Some(window)` arm.
+#[cfg(test)]
+mod migration_window_state_tests {
+    fn source_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} not found in the source"));
+        let rest = &source[start..];
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_migration_saves_a_windows_geometry_before_destroying_it() {
+        let body = source_body(include_str!("main.rs"), "async fn recreate_windows");
+        let save = body
+            .find("save_window_state(window_state_flags())")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the migration must overwrite the plugin's cache from the live window:\n{body}"
+                )
+            });
+        let destroy = body
+            .find(".destroy()")
+            .unwrap_or_else(|| panic!("the migration destroys each window:\n{body}"));
+        assert!(
+            save < destroy,
+            "the save must run while the window is still alive:\n{body}"
         );
     }
 }
