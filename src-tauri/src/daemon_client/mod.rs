@@ -30,7 +30,11 @@
 //!   `daemon_restart` (T9's transaction) — each validating the Tauri-injected
 //!   calling window against the ledger and the mirror;
 //! - [`present_blocked_by_other_app`] — the localized dialog + non-zero exit for
-//!   a second Picot instance while another app manages the daemon;
+//!   a second Picot instance while another app manages the daemon; parked by
+//!   `setup` and presented from `RunEvent::Ready`, on the same mechanism as
+//!   [`startup_failure`] (R-1: it used to join its dialog thread inside `setup`,
+//!   which is a hang — the plugin posts the dialog to the very thread that was
+//!   blocked waiting for it);
 //! - [`startup_failure`] — the *other* dialog-and-exit: an unrecoverable boot
 //!   failure (a bad sidecar, a daemon that never becomes ready) is presented as
 //!   a localized alert plus `exit(1)`, not as a setup-hook panic (an abort with
@@ -72,6 +76,17 @@ pub mod window_ledger;
 /// Picot. Non-zero and distinct from the usage error (2) and from a generic
 /// failure (1).
 pub const EXIT_BLOCKED_BY_OTHER_APP: i32 = 3;
+
+/// How long the blocked instance waits for the user to dismiss the
+/// "already running" dialog before exiting on its own.
+///
+/// The same **backstop** as [`startup_failure::STARTUP_FAILURE_DIALOG_TIMEOUT`],
+/// for the same reason: the dialog itself is modal and stays up as long as the
+/// user leaves it up, but a main thread that never services the post (or a
+/// session without a window server) must end in the documented non-zero exit
+/// rather than in a hang.
+pub const BLOCKED_BY_OTHER_APP_DIALOG_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
 
 /// The four locales the app's UI ships in (`public/locales/{en,zh,ja,es}.json`).
 pub const LOCALES: [&str; 4] = ["en", "zh", "ja", "es"];
@@ -131,30 +146,69 @@ pub fn resolve_locale(preference: Option<&str>) -> String {
     }
 }
 
-/// Show the localized dialog and exit non-zero.
+/// Everything the blocked-by-other-app path presents: the resolved locale, the
+/// localized copy, and how the process leaves.
 ///
-/// Runs the dialog on its own thread: `blocking_show` blocks until the user
-/// dismisses it, and the caller may well be the app's main thread (Tauri's
-/// startup path), which must not block on a modal dialog that the same thread
-/// has to service.
-pub fn present_blocked_by_other_app(app: &tauri::AppHandle, preference: Option<&str>) -> ! {
-    use tauri_plugin_dialog::DialogExt;
+/// Pure and window-server-free, so the whole decision is a unit-testable seam
+/// (the same role [`startup_failure::StartupFailure`] + `startup_failure_copy`
+/// play for the boot-failure alert).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedByOtherAppPresentation {
+    pub locale: String,
+    pub title: String,
+    pub message: String,
+    pub exit_code: i32,
+    pub dialog_timeout: std::time::Duration,
+}
 
+/// Resolve the blocked-by-other-app presentation for a UI locale preference.
+///
+/// One place decides the locale fallback, the copy and the exit code, so the
+/// dialog and the exit can never disagree.
+pub fn blocked_by_other_app_presentation(
+    preference: Option<&str>,
+) -> BlockedByOtherAppPresentation {
     let locale = resolve_locale(preference);
     let (title, message) = blocked_by_other_app_copy(&locale);
-    log::warn!("[picot] another Picot instance manages the daemon; exiting ({locale})");
-    let handle = app.clone();
-    let shown = std::thread::spawn(move || {
-        handle
-            .dialog()
-            .message(message)
-            .title(title)
-            .blocking_show();
-    });
-    // A failure to show the dialog (headless, no window server) must not turn
-    // into "Picot silently keeps running as a second instance".
-    let _ = shown.join();
-    std::process::exit(EXIT_BLOCKED_BY_OTHER_APP);
+    BlockedByOtherAppPresentation {
+        locale,
+        title: title.to_string(),
+        message: message.to_string(),
+        exit_code: EXIT_BLOCKED_BY_OTHER_APP,
+        dialog_timeout: BLOCKED_BY_OTHER_APP_DIALOG_TIMEOUT,
+    }
+}
+
+/// Show the localized "Picot is already running" alert and exit
+/// [`EXIT_BLOCKED_BY_OTHER_APP`].
+///
+/// Must be called **from the run loop** (the `RunEvent::Ready` arm), never from
+/// `setup`: the dialog plugin posts the alert to the main thread, so a caller
+/// that blocks on it from `setup` — which runs on that very thread — waits
+/// forever for a dialog that can never be drawn (no watchdog, no exit). The
+/// `setup` hook therefore *parks* the block and this runs once the main thread
+/// is back in its run loop; see [`startup_failure`]'s module docs for the full
+/// shape, and [`startup_failure::spawn_alert_and_exit`] for the worker threads
+/// this hands the job to. Returns immediately; the process is left by one of
+/// them.
+///
+/// `preference` is the app's UI locale preference; `None` resolves the locale
+/// from the OS (`resolve_locale`).
+pub fn present_blocked_by_other_app(app: &tauri::AppHandle, preference: Option<&str>) {
+    let presentation = blocked_by_other_app_presentation(preference);
+    log::warn!(
+        "[picot] another Picot instance manages the daemon; exiting {} ({})",
+        presentation.exit_code,
+        presentation.locale
+    );
+    startup_failure::spawn_alert_and_exit(
+        app,
+        presentation.title,
+        presentation.message,
+        presentation.exit_code,
+        presentation.dialog_timeout,
+        "picot-blocked-by-other-app",
+    );
 }
 
 #[cfg(test)]
@@ -186,6 +240,130 @@ mod tests {
         for message in messages {
             assert!(!message.contains("pid"), "{message}");
         }
+    }
+
+    /// The bytes of a Rust function's body, from the `marker` line to the first
+    /// column-zero closing brace. Lets the source itself be asserted on — the
+    /// regression below is a *shape*, not a value, so no runtime seam can see it.
+    fn source_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} not found in the source"));
+        let rest = &source[start..];
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// The presentation seam, mirroring `startup_failure`'s tests: the copy is
+    /// the localized one, the exit code is the product's own (3, distinct from
+    /// the boot failure's 1 and the usage error's 2), and the backstop is a
+    /// real bound — the hang R-1 fixed had no exit at all.
+    #[test]
+    fn the_blocked_presentation_carries_the_copy_and_a_distinct_exit_code() {
+        let mut titles = Vec::new();
+        let mut messages = Vec::new();
+        for locale in LOCALES {
+            let presentation = blocked_by_other_app_presentation(Some(locale));
+            assert_eq!(presentation.locale, locale);
+            assert_eq!(presentation.exit_code, EXIT_BLOCKED_BY_OTHER_APP);
+            assert_eq!(presentation.exit_code, 3);
+            assert_ne!(presentation.exit_code, 1);
+            assert_ne!(presentation.exit_code, 2);
+            assert_eq!(
+                presentation.dialog_timeout,
+                BLOCKED_BY_OTHER_APP_DIALOG_TIMEOUT
+            );
+            assert!(
+                presentation.dialog_timeout >= std::time::Duration::from_secs(30)
+                    && presentation.dialog_timeout <= std::time::Duration::from_secs(300),
+                "the backstop must be a real bound: {:?}",
+                presentation.dialog_timeout
+            );
+            assert_eq!(
+                (presentation.title.as_str(), presentation.message.as_str()),
+                blocked_by_other_app_copy(locale),
+                "the presentation must be the localized copy, not a new string"
+            );
+            titles.push(presentation.title);
+            messages.push(presentation.message);
+        }
+        assert_eq!(
+            titles
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            LOCALES.len()
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            LOCALES.len()
+        );
+    }
+
+    /// `None` (the setup hook's call — no settings file has been read yet)
+    /// still resolves to one of the shipped locales rather than panicking or
+    /// emitting English-only copy.
+    #[test]
+    fn the_blocked_presentation_resolves_the_os_locale_without_a_preference() {
+        let presentation = blocked_by_other_app_presentation(None);
+        assert!(LOCALES.contains(&presentation.locale.as_str()));
+        assert_eq!(presentation.exit_code, EXIT_BLOCKED_BY_OTHER_APP);
+    }
+
+    /// R-1: the blocked instance's backstop is the same kind of bound as the
+    /// boot failure's (the mechanism was reused, not re-invented), while its
+    /// exit code stays 3.
+    #[test]
+    fn the_blocked_backstop_matches_the_startup_failure_mechanism() {
+        assert_eq!(
+            BLOCKED_BY_OTHER_APP_DIALOG_TIMEOUT,
+            startup_failure::STARTUP_FAILURE_DIALOG_TIMEOUT
+        );
+        assert_ne!(
+            EXIT_BLOCKED_BY_OTHER_APP,
+            startup_failure::EXIT_STARTUP_FAILURE
+        );
+    }
+
+    /// R-1: the blocked-by-other-app dialog used to be joined *inside* `setup`.
+    ///
+    /// The dialog plugin posts the alert to the main thread, and `setup` runs
+    /// on that very thread — so the join waits on a dialog that can never be
+    /// drawn: no alert, no watchdog, no exit (the startup-failure module docs
+    /// name this exact shape). The fix parks the block and presents it from
+    /// `RunEvent::Ready`, whose presenter returns immediately on worker
+    /// threads. Both halves are asserted here, so neither can regress silently.
+    #[test]
+    fn the_blocked_dialog_is_neither_joined_nor_shown_from_setup() {
+        let presenter = source_body(
+            include_str!("mod.rs"),
+            "pub fn present_blocked_by_other_app",
+        );
+        for forbidden in ["join(", "std::process::exit"] {
+            assert!(
+                !presenter.contains(forbidden),
+                "the presenter must return at once (a worker thread exits): {forbidden}\n{presenter}"
+            );
+        }
+
+        let main = include_str!("../main.rs");
+        let setup = source_body(main, "fn setup_daemon_runtime");
+        assert!(
+            !setup.contains("present_blocked_by_other_app"),
+            "setup must park the block, never present it (R-1): {setup}"
+        );
+        assert!(
+            setup.contains("SetupOutcome::BlockedByOtherApp"),
+            "setup must report the park so `Ready` can present it: {setup}"
+        );
+        let ready = source_body(main, "tauri::RunEvent::Ready =>");
+        assert!(
+            ready.contains("present_blocked_by_other_app"),
+            "`Ready` is where the parked block is presented: {ready}"
+        );
     }
 
     #[test]

@@ -34,8 +34,10 @@
 //! event). A caller that blocks on the user while holding the main thread is
 //! therefore a **new hang**: the post can never be serviced, the alert never
 //! appears, and the app stays alive forever — strictly worse than the crash
-//! report it replaces (`present_blocked_by_other_app` in `mod.rs` joins its
-//! dialog thread *inside* `setup` and has exactly this shape).
+//! report it replaces (the second-instance block in `mod.rs` was this shape:
+//! it joined its dialog thread *inside* `setup`; R-1 moved it onto the same
+//! park/`Ready`/watchdog mechanism as this module, see
+//! [`super::present_blocked_by_other_app`]).
 //!
 //! Hence: [`present_startup_failure`] spawns the dialog thread and returns
 //! immediately. The main thread finishes the `Ready` callback and goes back to
@@ -200,11 +202,41 @@ pub fn present_startup_failure(app: &tauri::AppHandle, failure: StartupFailure) 
     if let Some(path) = failure.log_path.as_deref() {
         log::error!("[picot] daemon log: {}", path.display());
     }
+    spawn_alert_and_exit(
+        app,
+        title,
+        message,
+        EXIT_STARTUP_FAILURE,
+        STARTUP_FAILURE_DIALOG_TIMEOUT,
+        "picot-startup-failure",
+    );
+}
 
+/// The dialog-and-exit machinery both startup dialogs share: this module's boot
+/// failure and [`super::present_blocked_by_other_app`].
+///
+/// Spawns a thread for the modal alert and a second one for the deadline
+/// backstop, then returns immediately — so the **caller may be the main
+/// thread** (the run loop's `Ready` callback) and can get back to its loop,
+/// which is what lets the plugin's main-thread post actually draw the alert.
+/// The process is left by one of the two workers with `exit_code`; nothing
+/// here blocks, joins or draws.
+///
+/// `thread_prefix` names the two threads (`<prefix>-dialog`,
+/// `<prefix>-watchdog`); it is also what the log lines and the failure messages
+/// use, so a transcript says which alert could not be opened.
+pub(super) fn spawn_alert_and_exit(
+    app: &tauri::AppHandle,
+    title: String,
+    message: String,
+    exit_code: i32,
+    dialog_timeout: Duration,
+    thread_prefix: &'static str,
+) {
     let (dismissed_tx, dismissed_rx) = mpsc::channel::<()>();
     let handle = app.clone();
     let dialog = std::thread::Builder::new()
-        .name("picot-startup-failure-dialog".to_string())
+        .name(format!("{thread_prefix}-dialog"))
         .spawn(move || {
             handle
                 .dialog()
@@ -215,32 +247,32 @@ pub fn present_startup_failure(app: &tauri::AppHandle, failure: StartupFailure) 
             let _ = dismissed_tx.send(());
         });
     if let Err(error) = dialog {
-        // No alert is possible at all (thread creation failed): the log line
-        // above is the report, and the exit code still says "failed to boot".
-        log::error!("[picot] could not open the startup-failure alert: {error}");
-        std::process::exit(EXIT_STARTUP_FAILURE);
+        // No alert is possible at all (thread creation failed): the caller's
+        // log line is the report, and the exit code still says why.
+        log::error!("[picot] could not open the {thread_prefix} alert: {error}");
+        std::process::exit(exit_code);
     }
 
     // The deadline backstop. A thread of its own, so the caller (the run loop's
     // `Ready` callback, on the main thread) returns immediately and the posted
     // alert can actually be drawn.
     let watcher = std::thread::Builder::new()
-        .name("picot-startup-failure-watchdog".to_string())
+        .name(format!("{thread_prefix}-watchdog"))
         .spawn(move || {
-            match dismissed_rx.recv_timeout(STARTUP_FAILURE_DIALOG_TIMEOUT) {
-                Ok(()) => log::info!("[picot] the startup-failure alert was dismissed"),
+            match dismissed_rx.recv_timeout(dialog_timeout) {
+                Ok(()) => log::info!("[picot] the {thread_prefix} alert was dismissed"),
                 Err(_) => log::warn!(
-                    "[picot] the startup-failure alert was not dismissed within {}s; exiting",
-                    STARTUP_FAILURE_DIALOG_TIMEOUT.as_secs()
+                    "[picot] the {thread_prefix} alert was not dismissed within {}s; exiting",
+                    dialog_timeout.as_secs()
                 ),
             }
-            std::process::exit(EXIT_STARTUP_FAILURE);
+            std::process::exit(exit_code);
         });
     if let Err(error) = watcher {
         // Without the watcher the process would hang after the alert: exit
-        // instead, since a boot failure must never leave a live app behind.
-        log::error!("[picot] could not start the startup-failure watchdog: {error}");
-        std::process::exit(EXIT_STARTUP_FAILURE);
+        // instead, since a startup dialog must never leave a live app behind.
+        log::error!("[picot] could not start the {thread_prefix} watchdog: {error}");
+        std::process::exit(exit_code);
     }
 }
 

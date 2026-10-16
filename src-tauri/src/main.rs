@@ -1852,6 +1852,22 @@ async fn attach_daemon(
     })
 }
 
+/// What `setup_daemon_runtime` produced when it did *not* fail.
+///
+/// The second-instance block is not an error: it is a successful decision to
+/// leave. It still cannot present its dialog from there (see
+/// [`daemon_client::present_blocked_by_other_app`]), so `setup` records it and
+/// the `Ready` arm presents it — hence it is a value returned to the hook, not
+/// a side effect performed in it.
+enum SetupOutcome {
+    /// The app booted around its daemon: the landing window is open and the
+    /// runtime state is managed.
+    Ready,
+    /// Another live Picot app manages this daemon (plan Task 4 policy). Parked
+    /// for `Ready` to present; nothing past this point ran.
+    BlockedByOtherApp,
+}
+
 /// Boot the app around its daemon (plan Task 5 Step 3).
 ///
 /// Errors come back as a [`StartupFailure`] — the reason plus the daemon log
@@ -1865,7 +1881,14 @@ async fn attach_daemon(
 /// its admin listener, mint the landing owner over that channel, and open the
 /// landing window at the daemon's host origin. There is no in-process shortcut —
 /// the app holds no host state (plan D2/D4).
-fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(), StartupFailure> {
+///
+/// A successful call returns which of the two non-error outcomes it reached
+/// ([`SetupOutcome`]); a second-instance block returns before any of the above
+/// is set up.
+fn setup_daemon_runtime(
+    app: &mut tauri::App,
+    static_dir: PathBuf,
+) -> Result<SetupOutcome, StartupFailure> {
     let data_dir = app
         .path()
         .app_data_dir()
@@ -1903,10 +1926,14 @@ fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
     .map_err(&fail)?;
     let (manager, client, host_origin, daemon) = match attached {
         AttachedDaemon::BlockedByOtherApp => {
-            // The dialog blocks and the process exits non-zero: a second Picot
-            // must not fight the first for the daemon's lease. `None` resolves
-            // the locale from the OS (T10 passes the app's preference).
-            daemon_client::present_blocked_by_other_app(app.handle(), None);
+            // A second Picot must not fight the first for the daemon's lease,
+            // so this instance leaves non-zero. It cannot show that dialog from
+            // here: `setup` runs on the main thread that the dialog plugin
+            // posts to, and joining the dialog thread there deadlocks (no
+            // alert, no watchdog, no exit — R-1). Park it and let the `Ready`
+            // arm present it; `None` resolves the locale from the OS (T10
+            // passes the app's preference).
+            return Ok(SetupOutcome::BlockedByOtherApp);
         }
         AttachedDaemon::Ready {
             manager,
@@ -1971,7 +1998,7 @@ fn setup_daemon_runtime(app: &mut tauri::App, static_dir: PathBuf) -> Result<(),
     // once now that the window exists. No-op wherever no menu bar is installed.
     update_new_session_menu_state(app.handle());
     log::info!("[picot] landing ready origin={host_origin}");
-    Ok(())
+    Ok(SetupOutcome::Ready)
 }
 
 // ─── Auto-updater cores ─────────────────────────────────────────────────────
@@ -2876,6 +2903,24 @@ fn take_startup_failure() -> Option<StartupFailure> {
     STARTUP_FAILURE.lock().expect("startup failure slot").take()
 }
 
+/// A second-instance block parked by the `setup` hook, for the `RunEvent::Ready`
+/// arm to present. The same reason `STARTUP_FAILURE` is parked: `setup` runs on
+/// the main thread, and the dialog plugin draws by posting to that thread — so
+/// the hook can only record the block, never wait on the dialog
+/// (`daemon_client::present_blocked_by_other_app`).
+static BLOCKED_BY_OTHER_APP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn record_blocked_by_other_app() {
+    BLOCKED_BY_OTHER_APP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Consume the parked block: `true` exactly once, on the `Ready` arm that
+/// presents it.
+fn take_blocked_by_other_app() -> bool {
+    BLOCKED_BY_OTHER_APP.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
 fn main() {
     // Host tasks spawned through `picot_host::runtime::spawn` must land on the
     // app's tokio runtime (the one `tauri::async_runtime` owns): the pre-split
@@ -2975,8 +3020,13 @@ fn main() {
             // crash report. The failure is parked instead and presented by the
             // `Ready` arm below (`daemon_client::startup_failure` names the
             // reason why the alert can only be drawn from there).
-            if let Err(failure) = setup_daemon_runtime(app, static_dir) {
-                record_startup_failure(failure);
+            //
+            // The second-instance block is parked for the same reason: the
+            // dialog is posted to this thread, so joining it here would hang.
+            match setup_daemon_runtime(app, static_dir) {
+                Ok(SetupOutcome::Ready) => {}
+                Ok(SetupOutcome::BlockedByOtherApp) => record_blocked_by_other_app(),
+                Err(failure) => record_startup_failure(failure),
             }
             Ok(())
         })
@@ -3011,12 +3061,18 @@ fn main() {
         .expect("error while building tauri application")
         .run(|app_handle: &tauri::AppHandle, event| match event {
             tauri::RunEvent::Ready => {
-                // A boot failure parked by `setup` pre-empts the rest of
-                // startup: the app shows the alert and exits 1 from here.
-                // `Ready` (unlike the `setup` hook, which runs inside this very
-                // callback) is the first moment the main thread can return to
-                // its run loop, which is what lets the posted alert be drawn —
-                // see `daemon_client::startup_failure`.
+                // A parked exit pre-empts the rest of startup: a boot failure
+                // shows its alert and exits 1, a second-instance block shows
+                // "already running" and exits 3. `Ready` (unlike the `setup`
+                // hook, which runs inside this very callback) is the first
+                // moment the main thread can return to its run loop, which is
+                // what lets the posted dialog be drawn — see
+                // `daemon_client::startup_failure` and
+                // `daemon_client::present_blocked_by_other_app`.
+                if take_blocked_by_other_app() {
+                    daemon_client::present_blocked_by_other_app(app_handle, None);
+                    return;
+                }
                 if let Some(failure) = take_startup_failure() {
                     daemon_client::startup_failure::present_startup_failure(app_handle, failure);
                     return;
