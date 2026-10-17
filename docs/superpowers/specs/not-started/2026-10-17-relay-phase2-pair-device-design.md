@@ -79,7 +79,7 @@ Paseo 的 offer 只含 E2EE 信任锚，准入靠 relay password（可选）。P
 - 启用 relay 时若 `keepRunningAfterQuit` 为 false（`daemon_status` 已返回该值，`daemon_client/commands.rs:207`），consent 文案附一句提醒「退出 Picot 会停掉 daemon，远程连接随之中断」（母 spec §3.2 联动要求；软提醒不硬卡——硬卡需要 daemon 读 app 私有策略文件，违反 Phase 1 D8 的「daemon 不感知此值」边界）。
 - i18n：`settings.daemon.pairDevice.*` 四语言（en/zh/ja/es）同步交付，文案含义对齐 Paseo（enableTitle / enableDescription / hint / securityWarning / copy / copied / retry）。
 
-### 3.3 offer URL 前缀（open question → §9 拍板点 1）
+### 3.3 offer URL 前缀（已拍板方案 A，§9）
 
 Picot 没有 Paseo 的 `app.paseo.sh` Web 客户端。两个方案：
 
@@ -145,11 +145,13 @@ Picot 没有 Paseo 的 `app.paseo.sh` Web 客户端。两个方案：
 
 依赖链 R1→R2→R3→R4 严格串行（每步 TDD 红绿）。合计约 8 人日。
 
-## 9. 留给 Dr. Lin 的拍板点
+## 9. 拍板记录（2026-10-17，Dr. Lin）
 
-1. **offer URL 前缀**（§3.3）：A 占位域名 `https://picot.021521.xyz/#offer=…`（推荐）vs B 裸 payload。若选 A，域名是否定为 picot.021521.xyz。
-2. **relay 配置入口**（§4）：默认常量 + env 覆盖、UI 只做开关——确认即可；若想要 UI 可改 endpoint 请明示（会增加配置校验与错误态工作量约 0.5 人日）。
-3. **一扫码配对**（§2.6）：offer 内嵌 5 分钟一次性 pairingToken（Paseo schema 加法扩展，推荐）vs 照抄 Paseo 纯 offer + 移动端手动输令牌两步流。
+1. **offer URL 前缀 = 方案 A**：占位域名 `https://picot.021521.xyz/#offer=<base64url>`，域名即定为 picot.021521.xyz，可在 daemon 配置覆盖。格式一次定型，移动端上线后存量 QR/链接零改动生效。
+2. **relay 配置入口 = 常量 + env**：endpoint 默认公司 relay 常量，`PICOT_RELAY_ENDPOINT` 覆盖；Settings UI 只做开关与 Pair Device，不做 endpoint 编辑。
+3. **配对流程 = 一扫码配对**：offer 内嵌 5 分钟一次性 pairingToken（复用 RemoteAuth 机制，Paseo v2 schema 加法扩展），扫码一次完成信任锚 + 认证。
+
+另：`docs/superpowers/plans/` 维持 .git/info/exclude 本地排除（plan 只在磁盘、不入 git，与 daemon-phase1/multi-window plan 同口径；已跟踪的历史 plan 不回滚）。
 
 ## 10. 测试与验收
 
