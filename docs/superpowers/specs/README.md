@@ -96,6 +96,7 @@
 | 📋 not-started | [2026-09-22-line-review-workflow](not-started/2026-09-22-line-review-workflow-design.md) | 行级 Code Review 工作流；Draft 待评审 |
 | 📋 not-started | [2026-09-23-paseo-pi-only-fork-relay-mobile](not-started/2026-09-23-paseo-pi-only-fork-relay-mobile-design.md) | Paseo Pi-only fork + relay + 移动端；阶段一裁剪已实测 |
 | 📋 not-started | [2026-09-27-pi-subagent-extension](not-started/2026-09-27-pi-subagent-extension-design.md) | Draft 仅设计未实现 |
+| 📋 not-started | [2026-10-17-relay-phase2-pair-device](not-started/2026-10-17-relay-phase2-pair-device-design.md) | daemon 接入公司 relay + Pair Device UI；Draft 待评审（3 拍板点在 spec §9） |
 | ⛔ superseded | [2026-07-25-at-file-mention](superseded/2026-07-25-at-file-mention-design.md) | 由 [2026-09-19-file-mention-paths](implemented/2026-09-19-file-mention-paths-design.md) 扩展并部分取代 |
 | ⛔ superseded | [2026-07-27-claude-skills-discovery](superseded/2026-07-27-claude-skills-discovery-design.md) | 由 [2026-08-07-composer-skill-discovery-and-execution-fixes](superseded/2026-08-07-composer-skill-discovery-and-execution-fixes.md) 取代 |
 | ⛔ superseded | [2026-08-07-composer-skill-discovery-and-execution-fixes](superseded/2026-08-07-composer-skill-discovery-and-execution-fixes.md) | §3.9 设计点 1-2 由 Pi 0.84.2 原生 expandPromptTemplates 取代（08-25） |
