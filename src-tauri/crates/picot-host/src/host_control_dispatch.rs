@@ -249,7 +249,122 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                             .map_err(|_| "metadata store unavailable".to_string())?
                             .workspace_id_for_canonical_root(&canonical)
                             .map_err(|_| "workspace is not registered".to_string())?;
-                        let session_id = format!("session-{}", uuid::Uuid::new_v4().simple());
+                        // Multi-window §6.2 (MW-1): resolve the persisted session
+                        // identity BEFORE any spawn. An unreadable or misowned
+                        // file fails closed — never a runtime for a session this
+                        // workspace does not own.
+                        let persisted_session_id = session_path
+                            .as_deref()
+                            .map(|path| {
+                                persisted_session_id_for_workspace(Path::new(path), &canonical)
+                            })
+                            .transpose()?;
+                        // The reuse decision runs before the owner mint: a
+                        // just-minted owner can never be the session's holder,
+                        // so a provisional id decides identically, and Blocked
+                        // never mints an owner it would then have to revoke.
+                        // Mint-first ordering returns with label allocation
+                        // (T1's label slice), where the mint reserves the label.
+                        if let Some(session_id) = persisted_session_id.as_deref() {
+                            let provisional_owner =
+                                format!("owner-{}", uuid::Uuid::new_v4().simple());
+                            match plan_prepare_reuse(
+                                &runtimes,
+                                &owner_registry,
+                                &workspace_id,
+                                &provisional_owner,
+                                Some(session_id),
+                                arg_bool("forceNewSession").unwrap_or(false),
+                            ) {
+                                PrepareReuse::Blocked(target) => {
+                                    // A live holder keeps its runtime: focus
+                                    // semantics instead of a second spawn. The
+                                    // holder-window focus call lands with the
+                                    // label/focus slice; this arm only owns
+                                    // "never a second runtime" (§6.2).
+                                    log::info!(
+                                        "[picot-native] open_workspace: session {} of workspace {} is held by a live owner",
+                                        target.session_id,
+                                        target.workspace_id
+                                    );
+                                    return Ok(serde_json::json!({
+                                        "workspaceId": workspace_id,
+                                        "sessionId": target.session_id,
+                                        "focusedExisting": true,
+                                    }));
+                                }
+                                PrepareReuse::Rebind(target) => {
+                                    // The holder detached: reattach its runtime
+                                    // to a fresh owner and open the window on
+                                    // the existing process — no spawn (§6.2).
+                                    let (owner, capability) = owner_registry
+                                        .create_owner_with_workspace(
+                                            format!("native-workspace-{workspace_id}"),
+                                            canonical.clone(),
+                                            0,
+                                            host_origin.clone(),
+                                            Some(workspace_id.clone()),
+                                            window_owner::TemporaryKind::DefaultStartup,
+                                        )?;
+                                    let from = target
+                                        .owner_id
+                                        .clone()
+                                        .ok_or("the detached runtime has no owner")?;
+                                    if !runtimes.rebind_runtime_owner(
+                                        &from,
+                                        owner.as_str(),
+                                        &target.workspace_id,
+                                        &target.session_id,
+                                        0,
+                                    ) {
+                                        owner_registry.revoke_owner(&owner);
+                                        return Err(
+                                            "the detached session runtime could not be reattached"
+                                                .to_string(),
+                                        );
+                                    }
+                                    if arg_bool("openWindow").unwrap_or(true) {
+                                        if let Err(error) = app_surface
+                                            .open_workspace_window(
+                                                &host_origin,
+                                                &target,
+                                                owner.as_str(),
+                                                &capability,
+                                            )
+                                            .await
+                                        {
+                                            // The runtime predates this call and
+                                            // survives the failed open; only the
+                                            // minted owner rolls back (back to
+                                            // reattachable, detach semantics).
+                                            owner_registry.revoke_owner(&owner);
+                                            return Err(error);
+                                        }
+                                    }
+                                    touch_registered_workspace(
+                                        &metadata,
+                                        Some(canonical.to_string_lossy().to_string()),
+                                    );
+                                    log::info!(
+                                        "[picot-native] open_workspace: reattached session {} of workspace {}",
+                                        target.session_id,
+                                        target.workspace_id
+                                    );
+                                    return Ok(serde_json::json!({
+                                        "workspaceId": target.workspace_id,
+                                        "sessionId": target.session_id,
+                                    }));
+                                }
+                                PrepareReuse::Spawn => {
+                                    // Fall through: the spawn below carries the
+                                    // persisted session ID as the target identity
+                                    // so later lookups hit it (§6.2).
+                                }
+                            }
+                        }
+                        let session_id = persisted_session_id.clone().unwrap_or_else(|| {
+                            format!("session-{}", uuid::Uuid::new_v4().simple())
+                        });
                         let launch = pi_launch::native_launch_spec(
                             &static_dir,
                             &canonical.to_string_lossy(),
