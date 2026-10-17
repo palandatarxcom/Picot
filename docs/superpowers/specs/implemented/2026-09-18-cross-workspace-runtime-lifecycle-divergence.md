@@ -103,7 +103,9 @@ workspace 或 session file 的 target 留在 host 内部。
 - 跨项目切换不得中断 A 的任务。
 - 侧栏 session 行显示绿点表示 streaming，蓝点表示有未读输出；选中该 session 清除未读。
 - workspace 折叠时不汇总状态，不新增项目级圆点。
-- 单窗口架构保留，不回退为“一 workspace 一窗口”。
+- 单窗口架构保留，不回退为“一 workspace 一窗口”。（2026-10-17 补注：本句约束的是
+  本次 09-18 恢复工程的实施范围，不构成对后续多窗口增量的禁令；多窗口 v1 见
+  `not-started/multi-window-v1-design.md`。）
 
 ## 4. 剩余实现与必须完成的验证
 
