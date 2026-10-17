@@ -221,10 +221,16 @@ pub trait AppSurface: Send + Sync {
     /// Row A2 — open the workspace window for a committed workspace/session
     /// target at `host_origin`, injecting `capability` as the owner's init
     /// script.
+    ///
+    /// `label` is the daemon-allocated window label (multi-window §6.1): the
+    /// daemon is the single allocation authority for workspace labels and
+    /// reserved it at the owner mint; the app threads it through verbatim
+    /// (window, ledger, mirror) and never recomputes it.
     async fn open_workspace_window(
         &self,
         host_origin: &str,
         target: &RuntimeTarget,
+        label: &str,
         owner: &str,
         capability: &str,
     ) -> Result<(), String>;

@@ -155,6 +155,7 @@ impl AppSurface for AdminForwardingSurface {
         &self,
         host_origin: &str,
         target: &RuntimeTarget,
+        label: &str,
         owner: &str,
         capability: &str,
     ) -> Result<(), String> {
@@ -163,6 +164,7 @@ impl AppSurface for AdminForwardingSurface {
             json!({
                 wire::ARG_HOST_ORIGIN: host_origin,
                 wire::ARG_TARGET: target,
+                wire::ARG_LABEL: label,
                 wire::ARG_OWNER: owner,
                 wire::ARG_CAPABILITY: capability,
             }),

@@ -66,6 +66,7 @@ impl AppSurface for RecordingSurface {
         &self,
         _host_origin: &str,
         _target: &RuntimeTarget,
+        _label: &str,
         _owner: &str,
         _capability: &str,
     ) -> Result<(), String> {

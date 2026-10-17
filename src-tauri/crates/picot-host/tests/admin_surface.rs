@@ -413,6 +413,7 @@ async fn forwarded_rows_carry_their_arguments_on_the_wire() {
                         owner_id: Some("o1".to_string()),
                         workspace_generation: 4,
                     },
+                    "native-workspace-w1",
                     "o1",
                     "cap-1",
                 )
@@ -423,6 +424,7 @@ async fn forwarded_rows_carry_their_arguments_on_the_wire() {
     let (frame, outcome) = round_trip(&mut app, call).await;
     assert_eq!(frame["op"], "open_workspace_window");
     assert_eq!(frame["args"]["hostOrigin"], "http://127.0.0.1:51000");
+    assert_eq!(frame["args"]["label"], "native-workspace-w1");
     assert_eq!(frame["args"]["owner"], "o1");
     assert_eq!(frame["args"]["capability"], "cap-1");
     assert_eq!(

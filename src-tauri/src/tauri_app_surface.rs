@@ -57,6 +57,7 @@ impl AppSurface for TauriAppSurface {
         &self,
         host_origin: &str,
         target: &RuntimeTarget,
+        label: &str,
         owner: &str,
         capability: &str,
     ) -> Result<(), String> {
@@ -64,6 +65,7 @@ impl AppSurface for TauriAppSurface {
             &self.app,
             host_origin,
             target,
+            label,
             Arc::clone(&self.mirror),
             OwnerId::from_string(owner.to_string()),
             capability,

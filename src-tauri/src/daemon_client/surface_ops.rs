@@ -72,6 +72,7 @@ impl SurfaceExecutor for ForwardedSurfaceOps {
                     .open_workspace_window(
                         &arg_str(&args, wire::ARG_HOST_ORIGIN)?,
                         &target,
+                        &arg_str(&args, wire::ARG_LABEL)?,
                         &arg_str(&args, wire::ARG_OWNER)?,
                         &arg_str(&args, wire::ARG_CAPABILITY)?,
                     )
@@ -173,6 +174,7 @@ mod tests {
             &self,
             host_origin: &str,
             target: &RuntimeTarget,
+            label: &str,
             owner: &str,
             capability: &str,
         ) -> Result<(), String> {
@@ -181,6 +183,7 @@ mod tests {
                 json!({
                     "hostOrigin": host_origin,
                     "target": target,
+                    "label": label,
                     "owner": owner,
                     "capability": capability,
                 }),
@@ -283,6 +286,7 @@ mod tests {
                     "ownerId": "o1",
                     "workspaceGeneration": 4,
                 },
+                "label": "native-workspace-w1",
                 "owner": "o1",
                 "capability": "cap-1",
             }),
@@ -375,6 +379,7 @@ mod tests {
                     "ownerId": "o1",
                     "workspaceGeneration": 4,
                 },
+                "label": "native-workspace-w1",
                 "owner": "o1",
                 "capability": "cap-1",
             })
@@ -468,6 +473,7 @@ mod tests {
                 &self,
                 _host_origin: &str,
                 _target: &RuntimeTarget,
+                _label: &str,
                 _owner: &str,
                 _capability: &str,
             ) -> Result<(), String> {

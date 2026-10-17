@@ -30,13 +30,15 @@ use serde_json::{json, Value};
 
 /// Records every workspace-window open the daemon requests; anything else is
 /// unused by these tests and must not look plausible.
+/// Records every workspace-window open (target, owner and the
+/// daemon-allocated label — §6.1 threads the label through A2).
 #[derive(Default)]
 struct RecordingSurface {
-    opened: Mutex<Vec<(RuntimeTarget, String)>>,
+    opened: Mutex<Vec<(RuntimeTarget, String, String)>>,
 }
 
 impl RecordingSurface {
-    fn opened(&self) -> Vec<(RuntimeTarget, String)> {
+    fn opened(&self) -> Vec<(RuntimeTarget, String, String)> {
         self.opened.lock().expect("surface lock").clone()
     }
 }
@@ -47,13 +49,15 @@ impl AppSurface for RecordingSurface {
         &self,
         _host_origin: &str,
         target: &RuntimeTarget,
+        label: &str,
         owner: &str,
         _capability: &str,
     ) -> Result<(), String> {
-        self.opened
-            .lock()
-            .expect("surface lock")
-            .push((target.clone(), owner.to_string()));
+        self.opened.lock().expect("surface lock").push((
+            target.clone(),
+            owner.to_string(),
+            label.to_string(),
+        ));
         Ok(())
     }
 
@@ -241,9 +245,7 @@ impl Fixture {
         }
     }
 
-    /// A live window owner holding a label distinct from
-    /// `native-workspace-<wid>` — the shape open_workspace's own mint expects
-    /// to find free (a landing-entered owner, e.g.).
+    /// A live window owner (a landing-entered owner, e.g.).
     fn live_owner(&self, label: &str) -> OwnerId {
         let (owner, _capability) = self
             .state
@@ -334,11 +336,127 @@ async fn open_workspace_reattaches_a_detached_holders_runtime() {
     assert_eq!(opened.len(), 1, "the window opens on the reused runtime");
     assert_eq!(opened[0].0.session_id, "saved");
     assert_eq!(opened[0].0.instance_id, existing.instance_id);
+    assert_eq!(
+        opened[0].2,
+        format!("native-workspace-{}", fixture.workspace_id),
+        "A2 receives the daemon-allocated label (§6.1)"
+    );
     assert_ne!(
         opened[0].1,
         existing.owner_id.clone().unwrap_or_default(),
         "the window belongs to the freshly minted owner"
     );
+}
+
+/// Multi-window §6.1 (MW-2): the daemon is the workspace-label authority — a
+/// second window for the same workspace gets the `-2` suffix, its own owner
+/// and its own runtime, and the label threads through A2 to the window open.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_workspace_allocates_suffixed_labels_for_a_second_same_workspace_window() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+
+    fixture
+        .dispatch("open_workspace", fixture.open_args())
+        .await
+        .expect("the first open succeeds");
+    fixture
+        .dispatch("open_workspace", fixture.open_args())
+        .await
+        .expect("the second open succeeds despite the shared base label");
+
+    let running = fixture.state.runtimes.running_targets();
+    assert_eq!(running.len(), 2, "one runtime per window");
+    assert_ne!(running[0].session_id, running[1].session_id);
+    let opened = fixture.surface.opened();
+    assert_eq!(opened.len(), 2, "both windows opened");
+    let labels: Vec<&str> = opened.iter().map(|(_, _, label)| label.as_str()).collect();
+    assert!(
+        labels.contains(&base.as_str()),
+        "the first window gets the base label: {labels:?}"
+    );
+    assert!(
+        labels.contains(&format!("{base}-2").as_str()),
+        "the second window gets the -2 suffix: {labels:?}"
+    );
+    assert_ne!(opened[0].1, opened[1].1, "each window has its own owner");
+}
+
+/// Multi-window §6.2 Blocked with mint-first (MW-2): the pre-minted owner is
+/// revoked cleanly — the holder keeps its record and the base label, the
+/// registry keeps no leaked owner, and the daemon's next allocation sees the
+/// freed suffix as available.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_workspace_blocked_revokes_the_minted_owner_and_releases_its_label() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+    let holder = fixture.live_owner(&base);
+    fixture.spawn_stub_runtime("saved", &holder);
+
+    let mut args = fixture.open_args();
+    args["sessionPath"] = json!(fixture.session_file.to_string_lossy());
+    let result = fixture
+        .dispatch("open_workspace", args)
+        .await
+        .expect("the Blocked arm answers, it does not error");
+
+    assert_eq!(result["focusedExisting"], json!(true));
+    assert_eq!(
+        fixture.state.runtimes.running_targets().len(),
+        1,
+        "no second runtime for a live holder"
+    );
+    assert!(
+        fixture.surface.opened().is_empty(),
+        "Blocked opens no window"
+    );
+    let snapshot = fixture.state.owner_registry.mirror_snapshot();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "the minted owner is revoked, not leaked: {snapshot:?}"
+    );
+    assert_eq!(snapshot[0].label, base, "the holder keeps the base label");
+    assert_eq!(snapshot[0].owner, holder.as_str());
+
+    // Label authority survived the rollback: the base stays with the holder,
+    // the released suffix is what the next allocation takes.
+    fixture
+        .dispatch("open_workspace", fixture.open_args())
+        .await
+        .expect("a later fresh open still allocates");
+    let opened = fixture.surface.opened();
+    assert_eq!(opened.len(), 1);
+    assert_eq!(
+        opened[0].2,
+        format!("{base}-2"),
+        "the revoked owner's suffix is free again"
+    );
+}
+
+/// Multi-window §6.1: two concurrent opens of one workspace both succeed —
+/// the registry's label collision is retried onto the next suffix instead of
+/// failing with "window label is already owned", and no runtime is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_same_workspace_opens_settle_on_distinct_labels() {
+    let fixture = Fixture::boot().await;
+
+    let (first, second) = tokio::join!(
+        fixture.dispatch("open_workspace", fixture.open_args()),
+        fixture.dispatch("open_workspace", fixture.open_args()),
+    );
+    first.expect("the base-label winner succeeds");
+    second.expect("the loser retries onto a suffix instead of erroring");
+
+    assert_eq!(
+        fixture.state.runtimes.running_targets().len(),
+        2,
+        "both opens kept their runtimes"
+    );
+    let opened = fixture.surface.opened();
+    let labels: std::collections::HashSet<&str> =
+        opened.iter().map(|(_, _, label)| label.as_str()).collect();
+    assert_eq!(labels.len(), 2, "the labels are distinct: {opened:?}");
 }
 
 /// A session file whose header workspace is not the target workspace fails

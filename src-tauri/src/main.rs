@@ -415,11 +415,14 @@ fn open_native_workspace_window(
     app: &AppHandle,
     host_origin: &str,
     target: &RuntimeTarget,
+    label: &str,
     mirror: Arc<NavigationMirror>,
     owner: window_owner::OwnerId,
     capability: &str,
 ) -> Result<(), String> {
-    let label = format!("native-workspace-{}", target.workspace_id);
+    // Multi-window §6.1 (MW-2): `label` is daemon-allocated and reserved at
+    // the owner mint — this factory threads it through verbatim (window,
+    // ledger, mirror) and never recomputes it.
     let route = format!(
         "/workspaces/{}/sessions/{}",
         target.workspace_id, target.session_id
@@ -430,7 +433,7 @@ fn open_native_workspace_window(
     // authority for it (the T9 `owner.create` amendment).
     if let Some(ledger) = app.try_state::<WindowLedger>() {
         ledger.record(LedgerRow::workspace(
-            &label,
+            label,
             owner.as_str(),
             &target.workspace_id,
             Some(route.clone()),
@@ -438,7 +441,7 @@ fn open_native_workspace_window(
     }
     open_native_window(
         app,
-        &label,
+        label,
         &format!("{host_origin}{route}"),
         mirror,
         owner,

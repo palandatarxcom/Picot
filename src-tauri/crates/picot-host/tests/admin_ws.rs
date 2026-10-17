@@ -39,6 +39,7 @@ impl AppSurface for NeverCalledSurface {
         &self,
         _host_origin: &str,
         _target: &picot_host::runtime_coordinator::RuntimeTarget,
+        _label: &str,
         _owner: &str,
         _capability: &str,
     ) -> Result<(), String> {

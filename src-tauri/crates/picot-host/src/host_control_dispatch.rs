@@ -259,34 +259,42 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                 persisted_session_id_for_workspace(Path::new(path), &canonical)
                             })
                             .transpose()?;
-                        // The reuse decision runs before the owner mint: a
-                        // just-minted owner can never be the session's holder,
-                        // so a provisional id decides identically, and Blocked
-                        // never mints an owner it would then have to revoke.
-                        // Mint-first ordering returns with label allocation
-                        // (T1's label slice), where the mint reserves the label.
+                        // Multi-window §6.2 (MW-2), mint-first: the owner mint
+                        // comes BEFORE the reuse decision — the mint reserves
+                        // the daemon-allocated label (§6.1) and
+                        // `plan_prepare_reuse` needs the requester's real
+                        // owner identity. A Blocked answer revokes the
+                        // just-minted owner, releasing its label (the same
+                        // rollback every error path below uses).
+                        let (owner, capability, label) = mint_workspace_window_owner(
+                            &owner_registry,
+                            &workspace_id,
+                            &canonical,
+                            &host_origin,
+                        )?;
                         if let Some(session_id) = persisted_session_id.as_deref() {
-                            let provisional_owner =
-                                format!("owner-{}", uuid::Uuid::new_v4().simple());
                             match plan_prepare_reuse(
                                 &runtimes,
                                 &owner_registry,
                                 &workspace_id,
-                                &provisional_owner,
+                                owner.as_str(),
                                 Some(session_id),
                                 arg_bool("forceNewSession").unwrap_or(false),
                             ) {
                                 PrepareReuse::Blocked(target) => {
                                     // A live holder keeps its runtime: focus
                                     // semantics instead of a second spawn. The
-                                    // holder-window focus call lands with the
-                                    // label/focus slice; this arm only owns
-                                    // "never a second runtime" (§6.2).
+                                    // minted owner is revoked — the label
+                                    // releases with it. The holder-window
+                                    // focus call lands with the focus slice
+                                    // (§6.3); this arm only owns "never a
+                                    // second runtime" (§6.2).
                                     log::info!(
                                         "[picot-native] open_workspace: session {} of workspace {} is held by a live owner",
                                         target.session_id,
                                         target.workspace_id
                                     );
+                                    owner_registry.revoke_owner(&owner);
                                     return Ok(serde_json::json!({
                                         "workspaceId": workspace_id,
                                         "sessionId": target.session_id,
@@ -297,15 +305,6 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                     // The holder detached: reattach its runtime
                                     // to a fresh owner and open the window on
                                     // the existing process — no spawn (§6.2).
-                                    let (owner, capability) = owner_registry
-                                        .create_owner_with_workspace(
-                                            format!("native-workspace-{workspace_id}"),
-                                            canonical.clone(),
-                                            0,
-                                            host_origin.clone(),
-                                            Some(workspace_id.clone()),
-                                            window_owner::TemporaryKind::DefaultStartup,
-                                        )?;
                                     let from = target
                                         .owner_id
                                         .clone()
@@ -328,6 +327,7 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                             .open_workspace_window(
                                                 &host_origin,
                                                 &target,
+                                                &label,
                                                 owner.as_str(),
                                                 &capability,
                                             )
@@ -370,14 +370,6 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                             &canonical.to_string_lossy(),
                             session_path.as_deref(),
                         )?;
-                        let (owner, capability) = owner_registry.create_owner_with_workspace(
-                            format!("native-workspace-{workspace_id}"),
-                            canonical.clone(),
-                            0,
-                            host_origin.clone(),
-                            Some(workspace_id.clone()),
-                            window_owner::TemporaryKind::DefaultStartup,
-                        )?;
                         let target = RuntimeTarget::with_owner(
                             workspace_id.clone(),
                             session_id.clone(),
@@ -387,6 +379,33 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         );
                         if let Err(error) = runtimes.spawn(target.clone(), launch) {
                             owner_registry.revoke_owner(&owner);
+                            // §6.2: spawn atomicity IS the reservation — the
+                            // coordinator is unique per (workspace, session),
+                            // so a failed spawn usually means a concurrent
+                            // open won the race. Re-decide: a now-live holder
+                            // gets the Blocked answer (focus semantics) rather
+                            // than a hard error; any other failure stands.
+                            if let Some(session_id) = persisted_session_id.as_deref() {
+                                if let PrepareReuse::Blocked(target) = plan_prepare_reuse(
+                                    &runtimes,
+                                    &owner_registry,
+                                    &workspace_id,
+                                    owner.as_str(),
+                                    Some(session_id),
+                                    arg_bool("forceNewSession").unwrap_or(false),
+                                ) {
+                                    log::info!(
+                                        "[picot-native] open_workspace: session {} of workspace {} was taken by a concurrent open; focusing existing",
+                                        target.session_id,
+                                        target.workspace_id
+                                    );
+                                    return Ok(serde_json::json!({
+                                        "workspaceId": workspace_id,
+                                        "sessionId": target.session_id,
+                                        "focusedExisting": true,
+                                    }));
+                                }
+                            }
                             return Err(error);
                         }
                         tokio::spawn(record_session_bucket_after_spawn(
@@ -416,6 +435,7 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                 .open_workspace_window(
                                     &host_origin,
                                     &target,
+                                    &label,
                                     owner.as_str(),
                                     &capability,
                                 )
@@ -2163,6 +2183,45 @@ fn open_external_core(url: &str) -> Result<(), String> {
         })
 }
 
+/// Mint the owner for a workspace window with the daemon-allocated label
+/// (multi-window §6.1, MW-2): the base `native-workspace-{wid}` first, then
+/// the first free `-2`/`-3`/`-4` suffix. The mint itself is the atomic
+/// reservation — label uniqueness is decided and inserted under the owner
+/// registry's lock — so a collision retries with the next suffix instead of
+/// pre-checking a set that could go stale. Bounded at three retries: more
+/// than four live windows on one workspace is not a v1 shape.
+///
+/// Returns the owner, its capability, and the reserved label; the label
+/// threads through A2 (`AppSurface::open_workspace_window`) to the app's
+/// window factory and ledger, which never recompute it.
+fn mint_workspace_window_owner(
+    owner_registry: &WindowOwnerRegistry,
+    workspace_id: &str,
+    canonical_cwd: &std::path::Path,
+    host_origin: &str,
+) -> Result<(window_owner::OwnerId, String, String), String> {
+    let base = format!("native-workspace-{workspace_id}");
+    for suffix in ["", "-2", "-3", "-4"] {
+        let label = format!("{base}{suffix}");
+        match owner_registry.create_owner_with_workspace(
+            label.clone(),
+            canonical_cwd.to_path_buf(),
+            0,
+            host_origin.to_string(),
+            Some(workspace_id.to_string()),
+            window_owner::TemporaryKind::DefaultStartup,
+        ) {
+            Ok((owner, capability)) => return Ok((owner, capability, label)),
+            Err(error) if error == "window label is already owned" => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(format!(
+        "workspace {workspace_id} already holds four workspace windows"
+    ))
+}
+
+// ─── Window helpers ───────────────────────────────────────────────────────────
 // ─── Window helpers ───────────────────────────────────────────────────────────
 
 pub fn should_stop_owner_runtimes_on_transition(
