@@ -28,18 +28,37 @@ use picot_host::runtime_coordinator::RuntimeTarget;
 use picot_host::window_owner::{OwnerId, TemporaryKind};
 use serde_json::{json, Value};
 
-/// Records every workspace-window open the daemon requests; anything else is
-/// unused by these tests and must not look plausible.
 /// Records every workspace-window open (target, owner and the
-/// daemon-allocated label — §6.1 threads the label through A2).
+/// daemon-allocated label — §6.1 threads the label through A2) and every
+/// window focus (label, in call order — §6.3). Anything else is unused by
+/// these tests and must not look plausible.
 #[derive(Default)]
 struct RecordingSurface {
     opened: Mutex<Vec<(RuntimeTarget, String, String)>>,
+    focused: Mutex<Vec<String>>,
+    /// When set, `focus_window` fails with this error (§6.3's failure fork).
+    focus_error: Mutex<Option<String>>,
+    /// Runs inside `focus_window` before it answers — the in-flight window
+    /// the holder can disappear from (the race the §6.3 re-check guards).
+    #[allow(clippy::type_complexity)]
+    on_focus: Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl RecordingSurface {
     fn opened(&self) -> Vec<(RuntimeTarget, String, String)> {
         self.opened.lock().expect("surface lock").clone()
+    }
+
+    fn focused(&self) -> Vec<String> {
+        self.focused.lock().expect("surface lock").clone()
+    }
+
+    fn fail_focus_with(&self, error: &str) {
+        *self.focus_error.lock().expect("surface lock") = Some(error.to_string());
+    }
+
+    fn on_focus(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.on_focus.lock().expect("surface lock") = Some(Box::new(hook));
     }
 }
 
@@ -63,6 +82,23 @@ impl AppSurface for RecordingSurface {
 
     async fn open_devtools(&self, _label: &str) -> Result<(), String> {
         Err("unused in open-workspace-reuse tests".into())
+    }
+
+    async fn focus_window(&self, label: &str) -> Result<(), String> {
+        self.focused
+            .lock()
+            .expect("surface lock")
+            .push(label.to_string());
+        {
+            let guard = self.on_focus.lock().expect("surface lock");
+            if let Some(hook) = guard.as_ref() {
+                hook(label);
+            }
+        }
+        match self.focus_error.lock().expect("surface lock").clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn close_window(&self, _label: &str, _request_id: &str) -> Result<(), String> {
@@ -515,4 +551,135 @@ async fn open_workspace_without_a_session_still_spawns_fresh() {
         "the response reports the spawned session"
     );
     assert_eq!(fixture.surface.opened().len(), 1, "the window opened");
+}
+
+/// Multi-window §6.3 (slice 3): a live holder's Blocked reopen focuses the
+/// holder's window for real — the focus carries the holder's daemon-resolved
+/// label (call sequence recorded), A2 is not called, no runtime spawns.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_workspace_focuses_the_live_holders_window_with_its_label() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+    let holder = fixture.live_owner(&base);
+    fixture.spawn_stub_runtime("saved", &holder);
+
+    let mut args = fixture.open_args();
+    args["sessionPath"] = json!(fixture.session_file.to_string_lossy());
+    let result = fixture
+        .dispatch("open_workspace", args)
+        .await
+        .expect("the Blocked arm answers with the focus semantics");
+
+    assert_eq!(result["focusedExisting"], json!(true));
+    assert_eq!(result["sessionId"], json!("saved"));
+    assert_eq!(
+        fixture.surface.focused(),
+        vec![base.clone()],
+        "the holder's daemon-resolved label is what gets focused"
+    );
+    assert!(
+        fixture.surface.opened().is_empty(),
+        "Blocked never opens a window"
+    );
+    assert_eq!(
+        fixture.state.runtimes.running_targets().len(),
+        1,
+        "no second runtime for a live holder"
+    );
+}
+
+/// Multi-window §6.3: a focus failure with the holder still alive is a
+/// retryable error — a stable `focus_window_failed` prefix, the underlying
+/// failure carried, nothing spawned, no window opened, the minted owner
+/// revoked, the holder's record untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_workspace_focus_failure_with_a_live_holder_is_a_retryable_error() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+    let holder = fixture.live_owner(&base);
+    fixture.spawn_stub_runtime("saved", &holder);
+    fixture
+        .surface
+        .fail_focus_with("the window refused the focus");
+
+    let mut args = fixture.open_args();
+    args["sessionPath"] = json!(fixture.session_file.to_string_lossy());
+    let error = fixture
+        .dispatch("open_workspace", args)
+        .await
+        .expect_err("a failed focus must not look like success");
+
+    assert!(
+        error.starts_with("focus_window_failed"),
+        "the retryable error is identifiable by a stable prefix: {error}"
+    );
+    assert!(
+        error.contains("the window refused the focus"),
+        "the underlying failure travels with it: {error}"
+    );
+    assert_eq!(fixture.surface.focused().len(), 1);
+    assert!(
+        fixture.surface.opened().is_empty(),
+        "no fallback window open past a live holder"
+    );
+    assert_eq!(
+        fixture.state.runtimes.running_targets().len(),
+        1,
+        "no fallback spawn"
+    );
+    let snapshot = fixture.state.owner_registry.mirror_snapshot();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "the minted owner is revoked and the holder survives: {snapshot:?}"
+    );
+    assert_eq!(snapshot[0].owner, holder.as_str());
+}
+
+/// Multi-window §6.3: a focus failure whose holder left while the focus was
+/// in flight takes over via the rebind path — same runtime, same instance,
+/// identity stable, the window opens on the existing process (never a
+/// fallback spawn and never a second runtime).
+#[tokio::test(flavor = "multi_thread")]
+async fn open_workspace_focus_failure_with_a_detached_holder_rebinds_the_runtime() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+    let holder = fixture.live_owner(&base);
+    let existing = fixture.spawn_stub_runtime("saved", &holder);
+    // The holder's window is destroyed while the focus call is in flight —
+    // exactly the race the holder re-check exists for.
+    let registry = fixture.state.owner_registry.clone();
+    let leaving = holder.clone();
+    fixture.surface.on_focus(move |_| {
+        registry.detach_owner(&leaving);
+    });
+    fixture.surface.fail_focus_with("the window is gone");
+
+    let mut args = fixture.open_args();
+    args["sessionPath"] = json!(fixture.session_file.to_string_lossy());
+    let result = fixture
+        .dispatch("open_workspace", args)
+        .await
+        .expect("the takeover succeeds");
+
+    assert!(
+        result.get("focusedExisting").is_none(),
+        "a takeover is not a focus answer: {result}"
+    );
+    assert_eq!(result["sessionId"], json!("saved"));
+    let running = fixture.state.runtimes.running_targets();
+    assert_eq!(
+        running.len(),
+        1,
+        "the runtime is taken over, not duplicated"
+    );
+    assert_eq!(running[0].instance_id, existing.instance_id);
+    let opened = fixture.surface.opened();
+    assert_eq!(opened.len(), 1, "the window opens on the reused runtime");
+    assert_eq!(opened[0].0.instance_id, existing.instance_id);
+    assert_eq!(
+        fixture.surface.focused(),
+        vec![base],
+        "the focus was attempted on the holder's label before the takeover"
+    );
 }

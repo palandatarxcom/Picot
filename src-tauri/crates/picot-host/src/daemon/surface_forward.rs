@@ -37,8 +37,10 @@ pub mod wire {
     /// The typed failure every unavailable forwarded row reports (plan D5).
     pub const APP_SURFACE_UNAVAILABLE: &str = "app_surface_unavailable";
 
-    /// The `app_surface_request` op names, in the plan's table order.
-    pub const SURFACE_OPS: [&str; 12] = [
+    /// The `app_surface_request` op names: the plan's table order with the
+    /// multi-window §6.3 `focus_window` op appended (the table predates
+    /// multi-window; the fixture in `tests/admin_surface.rs` pins this list).
+    pub const SURFACE_OPS: [&str; 13] = [
         "open_workspace_window",
         "open_devtools",
         "close_window",
@@ -51,6 +53,7 @@ pub mod wire {
         "save_session_export",
         "check_for_update",
         "download_and_install_update",
+        "focus_window",
     ];
 
     pub const OP_OPEN_WORKSPACE_WINDOW: &str = SURFACE_OPS[0];
@@ -65,6 +68,7 @@ pub mod wire {
     pub const OP_SAVE_SESSION_EXPORT: &str = SURFACE_OPS[9];
     pub const OP_CHECK_FOR_UPDATE: &str = SURFACE_OPS[10];
     pub const OP_DOWNLOAD_AND_INSTALL_UPDATE: &str = SURFACE_OPS[11];
+    pub const OP_FOCUS_WINDOW: &str = SURFACE_OPS[12];
 
     pub const ARG_HOST_ORIGIN: &str = "hostOrigin";
     pub const ARG_TARGET: &str = "target";
@@ -174,6 +178,11 @@ impl AppSurface for AdminForwardingSurface {
 
     async fn open_devtools(&self, label: &str) -> Result<(), String> {
         self.forward_void(wire::OP_OPEN_DEVTOOLS, json!({ wire::ARG_LABEL: label }))
+            .await
+    }
+
+    async fn focus_window(&self, label: &str) -> Result<(), String> {
+        self.forward_void(wire::OP_FOCUS_WINDOW, json!({ wire::ARG_LABEL: label }))
             .await
     }
 

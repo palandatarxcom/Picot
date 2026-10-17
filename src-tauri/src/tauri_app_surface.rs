@@ -84,6 +84,17 @@ impl AppSurface for TauriAppSurface {
         Ok(())
     }
 
+    /// Multi-window §6.3. Same label lookup as `open_devtools`: the daemon
+    /// resolved the holder's label, the app owns the window. A missing window
+    /// is exactly the failure the §6.3 caller re-checks the holder against.
+    async fn focus_window(&self, label: &str) -> Result<(), String> {
+        let window = self
+            .app
+            .get_webview_window(label)
+            .ok_or_else(|| format!("No window found for {label}"))?;
+        window.set_focus().map_err(|error| error.to_string())
+    }
+
     /// Row A10 — settle the approval, then close. The pending map (D4) is
     /// keyed by owner: the label the daemon passes is resolved app-side, where
     /// the registry lives, exactly as the app's own close delegate does. The

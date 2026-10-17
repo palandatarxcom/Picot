@@ -24,6 +24,7 @@
 //! (embedded form until T3's admin channel); that construction is Step 3's
 //! move into `DaemonState::start`.
 
+use crate::daemon::app_surface::AppSurface;
 use crate::daemon::owner_close::CloseOutcome;
 use crate::daemon::DaemonState;
 use crate::ephemeral_registry::EphemeralKind;
@@ -283,64 +284,43 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                             ) {
                                 PrepareReuse::Blocked(target) => {
                                     // A live holder keeps its runtime: focus
-                                    // semantics instead of a second spawn. The
-                                    // minted owner is revoked — the label
-                                    // releases with it. The holder-window
-                                    // focus call lands with the focus slice
-                                    // (§6.3); this arm only owns "never a
-                                    // second runtime" (§6.2).
-                                    log::info!(
-                                        "[picot-native] open_workspace: session {} of workspace {} is held by a live owner",
-                                        target.session_id,
-                                        target.workspace_id
-                                    );
-                                    owner_registry.revoke_owner(&owner);
-                                    return Ok(serde_json::json!({
-                                        "workspaceId": workspace_id,
-                                        "sessionId": target.session_id,
-                                        "focusedExisting": true,
-                                    }));
+                                    // semantics instead of a second spawn
+                                    // (§6.2). §6.3: the focus is real — a
+                                    // failure only re-checks the holder
+                                    // (alive → retryable error; detached →
+                                    // rebind takeover); never a fallback
+                                    // spawn past a live holder (MW-2).
+                                    return blocked_focus_or_reattach(
+                                        &runtimes,
+                                        &owner_registry,
+                                        app_surface.as_ref(),
+                                        &metadata,
+                                        &canonical,
+                                        &owner,
+                                        &capability,
+                                        &label,
+                                        &host_origin,
+                                        arg_bool("openWindow").unwrap_or(true),
+                                        target,
+                                    )
+                                    .await;
                                 }
                                 PrepareReuse::Rebind(target) => {
                                     // The holder detached: reattach its runtime
                                     // to a fresh owner and open the window on
                                     // the existing process — no spawn (§6.2).
-                                    let from = target
-                                        .owner_id
-                                        .clone()
-                                        .ok_or("the detached runtime has no owner")?;
-                                    if !runtimes.rebind_runtime_owner(
-                                        &from,
-                                        owner.as_str(),
-                                        &target.workspace_id,
-                                        &target.session_id,
-                                        0,
-                                    ) {
-                                        owner_registry.revoke_owner(&owner);
-                                        return Err(
-                                            "the detached session runtime could not be reattached"
-                                                .to_string(),
-                                        );
-                                    }
-                                    if arg_bool("openWindow").unwrap_or(true) {
-                                        if let Err(error) = app_surface
-                                            .open_workspace_window(
-                                                &host_origin,
-                                                &target,
-                                                &label,
-                                                owner.as_str(),
-                                                &capability,
-                                            )
-                                            .await
-                                        {
-                                            // The runtime predates this call and
-                                            // survives the failed open; only the
-                                            // minted owner rolls back (back to
-                                            // reattachable, detach semantics).
-                                            owner_registry.revoke_owner(&owner);
-                                            return Err(error);
-                                        }
-                                    }
+                                    reattach_runtime_to_fresh_owner(
+                                        &runtimes,
+                                        &owner_registry,
+                                        app_surface.as_ref(),
+                                        &owner,
+                                        &capability,
+                                        &label,
+                                        &host_origin,
+                                        arg_bool("openWindow").unwrap_or(true),
+                                        &target,
+                                    )
+                                    .await?;
                                     touch_registered_workspace(
                                         &metadata,
                                         Some(canonical.to_string_lossy().to_string()),
@@ -378,15 +358,17 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                             0,
                         );
                         if let Err(error) = runtimes.spawn(target.clone(), launch) {
-                            owner_registry.revoke_owner(&owner);
                             // §6.2: spawn atomicity IS the reservation — the
                             // coordinator is unique per (workspace, session),
                             // so a failed spawn usually means a concurrent
-                            // open won the race. Re-decide: a now-live holder
-                            // gets the Blocked answer (focus semantics) rather
-                            // than a hard error; any other failure stands.
+                            // open won the race. Re-decide with the minted
+                            // owner still held: a now-live holder gets the
+                            // Blocked answer — the same §6.3 focus semantics
+                            // (real focus + failure re-check) as the
+                            // pre-decided Blocked arm; any other failure
+                            // stands.
                             if let Some(session_id) = persisted_session_id.as_deref() {
-                                if let PrepareReuse::Blocked(target) = plan_prepare_reuse(
+                                if let PrepareReuse::Blocked(blocked) = plan_prepare_reuse(
                                     &runtimes,
                                     &owner_registry,
                                     &workspace_id,
@@ -396,16 +378,26 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                 ) {
                                     log::info!(
                                         "[picot-native] open_workspace: session {} of workspace {} was taken by a concurrent open; focusing existing",
-                                        target.session_id,
-                                        target.workspace_id
+                                        blocked.session_id,
+                                        blocked.workspace_id
                                     );
-                                    return Ok(serde_json::json!({
-                                        "workspaceId": workspace_id,
-                                        "sessionId": target.session_id,
-                                        "focusedExisting": true,
-                                    }));
+                                    return blocked_focus_or_reattach(
+                                        &runtimes,
+                                        &owner_registry,
+                                        app_surface.as_ref(),
+                                        &metadata,
+                                        &canonical,
+                                        &owner,
+                                        &capability,
+                                        &label,
+                                        &host_origin,
+                                        arg_bool("openWindow").unwrap_or(true),
+                                        blocked,
+                                    )
+                                    .await;
                                 }
                             }
+                            owner_registry.revoke_owner(&owner);
                             return Err(error);
                         }
                         tokio::spawn(record_session_bucket_after_spawn(
@@ -2223,6 +2215,190 @@ fn mint_workspace_window_owner(
 
 // ─── Window helpers ───────────────────────────────────────────────────────────
 // ─── Window helpers ───────────────────────────────────────────────────────────
+
+/// The §6.3 outcome of trying to focus a Blocked holder's window.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FocusBlocked {
+    /// The holder's window took the focus.
+    Focused,
+    /// The focus failed and the holder left while it was in flight: the
+    /// rebind takeover may proceed.
+    HolderDetached,
+    /// The focus failed with the holder still live: retryable — the caller
+    /// surfaces the error; a fallback open is forbidden (MW-2).
+    Retryable(String),
+}
+
+/// Focus the live holder's window for a Blocked session (multi-window §6.3).
+///
+/// The holder's label is resolved daemon-side — the owner registry is the
+/// label map (the same one the close flow mirrors), so no new channel. The
+/// only thing a focus failure may do is re-check the holder: still alive →
+/// the retryable `focus_window_failed` error (a stale mirror usually heals
+/// on retry); detached → [`FocusBlocked::HolderDetached`].
+pub async fn focus_blocked_holder(
+    owner_registry: &WindowOwnerRegistry,
+    app_surface: &dyn AppSurface,
+    blocked: &RuntimeTarget,
+) -> FocusBlocked {
+    let Some(holder) = blocked
+        .owner_id
+        .clone()
+        .map(window_owner::OwnerId::from_string)
+    else {
+        return FocusBlocked::Retryable(format!(
+            "focus_window_failed: session {} is held by a live owner with no owning window; retry",
+            blocked.session_id
+        ));
+    };
+    match owner_registry.label_for_owner(&holder) {
+        Some(label) => match app_surface.focus_window(&label).await {
+            Ok(()) => FocusBlocked::Focused,
+            Err(error) => recheck_holder_after_failed_focus(
+                owner_registry,
+                &holder,
+                blocked,
+                format!("focus failed: {error}"),
+            ),
+        },
+        None => recheck_holder_after_failed_focus(
+            owner_registry,
+            &holder,
+            blocked,
+            "no window label is bound to the holder".to_string(),
+        ),
+    }
+}
+
+/// After a failed focus, the holder's registry state decides §6.3's fork:
+/// detached (reattachable) → takeover; anything else → the retryable error.
+fn recheck_holder_after_failed_focus(
+    owner_registry: &WindowOwnerRegistry,
+    holder: &window_owner::OwnerId,
+    blocked: &RuntimeTarget,
+    why: String,
+) -> FocusBlocked {
+    if owner_registry.owner_is_reattachable(holder) {
+        return FocusBlocked::HolderDetached;
+    }
+    FocusBlocked::Retryable(format!(
+        "focus_window_failed: session {} is open in another window whose window could not be focused ({why}); retry",
+        blocked.session_id
+    ))
+}
+
+/// Resolve a `PrepareReuse::Blocked` answer (multi-window §6.3): focus the
+/// live holder's window for real — the `focusedExisting` reply only follows
+/// a successful focus. A focus failure only re-checks the holder: alive →
+/// the retryable error (never silent, never a fallback open past a live
+/// holder — MW-2); detached in the meantime → the rebind takeover, which
+/// opens the window on the existing runtime. The minted owner is revoked on
+/// every outcome except the takeover (which keeps it as the rebind
+/// destination).
+#[allow(clippy::too_many_arguments)]
+async fn blocked_focus_or_reattach(
+    runtimes: &NativePiManager,
+    owner_registry: &WindowOwnerRegistry,
+    app_surface: &dyn AppSurface,
+    metadata: &SharedMetadataStore,
+    canonical: &std::path::Path,
+    owner: &window_owner::OwnerId,
+    capability: &str,
+    label: &str,
+    host_origin: &str,
+    open_window: bool,
+    blocked: RuntimeTarget,
+) -> Result<Value, String> {
+    match focus_blocked_holder(owner_registry, app_surface, &blocked).await {
+        FocusBlocked::Focused => {
+            owner_registry.revoke_owner(owner);
+            log::info!(
+                "[picot-native] open_workspace: focused the existing window for session {} of workspace {}",
+                blocked.session_id,
+                blocked.workspace_id
+            );
+            Ok(json!({
+                "workspaceId": blocked.workspace_id,
+                "sessionId": blocked.session_id,
+                "focusedExisting": true,
+            }))
+        }
+        FocusBlocked::HolderDetached => {
+            reattach_runtime_to_fresh_owner(
+                runtimes,
+                owner_registry,
+                app_surface,
+                owner,
+                capability,
+                label,
+                host_origin,
+                open_window,
+                &blocked,
+            )
+            .await?;
+            touch_registered_workspace(metadata, Some(canonical.to_string_lossy().to_string()));
+            log::info!(
+                "[picot-native] open_workspace: holder detached during focus; reattached session {} of workspace {}",
+                blocked.session_id,
+                blocked.workspace_id
+            );
+            Ok(json!({
+                "workspaceId": blocked.workspace_id,
+                "sessionId": blocked.session_id,
+            }))
+        }
+        FocusBlocked::Retryable(error) => {
+            owner_registry.revoke_owner(owner);
+            Err(error)
+        }
+    }
+}
+
+/// Rebind a detached holder's runtime to the freshly minted owner and open
+/// the window on the existing process — no spawn (§6.2 Rebind; §6.3's
+/// focus-failure takeover is the same move). On failure the minted owner is
+/// revoked and the error stands; the runtime itself survives (detach
+/// semantics put it back to reattachable).
+#[allow(clippy::too_many_arguments)]
+async fn reattach_runtime_to_fresh_owner(
+    runtimes: &NativePiManager,
+    owner_registry: &WindowOwnerRegistry,
+    app_surface: &dyn AppSurface,
+    owner: &window_owner::OwnerId,
+    capability: &str,
+    label: &str,
+    host_origin: &str,
+    open_window: bool,
+    target: &RuntimeTarget,
+) -> Result<(), String> {
+    let from = target
+        .owner_id
+        .clone()
+        .ok_or("the detached runtime has no owner")?;
+    if !runtimes.rebind_runtime_owner(
+        &from,
+        owner.as_str(),
+        &target.workspace_id,
+        &target.session_id,
+        0,
+    ) {
+        owner_registry.revoke_owner(owner);
+        return Err("the detached session runtime could not be reattached".to_string());
+    }
+    if open_window {
+        if let Err(error) = app_surface
+            .open_workspace_window(host_origin, target, label, owner.as_str(), capability)
+            .await
+        {
+            // The runtime predates this call and survives the failed open;
+            // only the minted owner rolls back (back to reattachable,
+            // detach semantics).
+            owner_registry.revoke_owner(owner);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
 
 pub fn should_stop_owner_runtimes_on_transition(
     current_workspace: Option<&std::path::Path>,

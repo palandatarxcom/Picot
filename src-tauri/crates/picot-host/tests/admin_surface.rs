@@ -146,7 +146,8 @@ fn keys(value: &Value) -> Vec<String> {
 }
 
 /// Engineering-lesson #1: the op names are copied by hand from the plan's
-/// `app_surface_request` table. A renamed op — or a 13th one — fails here.
+/// `app_surface_request` table (plus the multi-window §6.3 `focus_window`).
+/// A renamed op — or a 14th one — fails here.
 #[test]
 fn surface_op_names_match_the_protocol_table() {
     assert_eq!(
@@ -164,6 +165,7 @@ fn surface_op_names_match_the_protocol_table() {
             "save_session_export",
             "check_for_update",
             "download_and_install_update",
+            "focus_window",
         ]
     );
 }

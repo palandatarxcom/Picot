@@ -56,6 +56,10 @@ impl AppSurface for NeverCalledSurface {
         Err("unused in window-detach tests".into())
     }
 
+    async fn focus_window(&self, _label: &str) -> Result<(), String> {
+        Err("unused in window-detach tests".into())
+    }
+
     async fn close_window(&self, _label: &str, _request_id: &str) -> Result<(), String> {
         Err("unused in window-detach tests".into())
     }

@@ -238,6 +238,16 @@ pub trait AppSurface: Send + Sync {
     /// Row A6 — `open_devtools` op for the owner's window label.
     async fn open_devtools(&self, label: &str) -> Result<(), String>;
 
+    /// Multi-window §6.3 — focus the window of the live holder that blocked a
+    /// session reopen.
+    ///
+    /// `label` is the holder's window label, resolved daemon-side from the
+    /// owner registry (the same label map the close flow mirrors — no new
+    /// channel). Mirrors Row A2's error contract: a failure travels to the
+    /// caller, which re-checks the holder — it never falls back to opening a
+    /// window past a live holder.
+    async fn focus_window(&self, label: &str) -> Result<(), String>;
+
     /// Row A10 — settle the pending close that `window_close_approve`
     /// approves (the pending map lives app-side, D4) and close the window.
     ///

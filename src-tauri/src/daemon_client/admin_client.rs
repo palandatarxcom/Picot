@@ -1339,6 +1339,10 @@ mod tests {
             Err("this test only forwards pane ops".to_string())
         }
 
+        async fn focus_window(&self, _label: &str) -> Result<(), String> {
+            Err("this test only forwards pane ops".to_string())
+        }
+
         async fn close_window(&self, _label: &str, _request_id: &str) -> Result<(), String> {
             Err("this test only forwards pane ops".to_string())
         }

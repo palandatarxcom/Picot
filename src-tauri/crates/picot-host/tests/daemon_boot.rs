@@ -77,6 +77,10 @@ impl AppSurface for RecordingSurface {
         self.record("open_devtools")
     }
 
+    async fn focus_window(&self, _label: &str) -> Result<(), String> {
+        self.record("focus_window")
+    }
+
     async fn close_window(&self, _label: &str, _request_id: &str) -> Result<(), String> {
         self.record("close_window")
     }
