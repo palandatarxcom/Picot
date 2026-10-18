@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, watch, Semaphore};
 use tower::ServiceBuilder;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -194,6 +194,92 @@ pub(crate) struct HostState {
     /// Port the host listener bound; stored after `start` binds because the
     /// OS assigns it. Mobile entry URLs are built from this.
     host_port: std::sync::atomic::AtomicU16,
+    /// Live kickable sessions per paired device (plan T10/D15): the registry
+    /// `remote_device_revoke` flips to tear a revoked device's sessions down.
+    remote_devices: Arc<RemoteDeviceSessions>,
+}
+
+/// The device→sessions kick registry behind `remote_device_revoke` (plan
+/// T10, spec §2.9): every remote-authenticated session registers a lease
+/// whose watch flips on revocation; the session loop then exits through the
+/// same teardown path a socket close takes. Dropping the lease unregisters.
+#[derive(Default)]
+struct RemoteDeviceSessions {
+    inner: std::sync::Mutex<HashMap<String, Vec<watch::Sender<bool>>>>,
+}
+
+impl RemoteDeviceSessions {
+    fn register(self: &Arc<Self>, device_id: &str) -> RemoteDeviceLease {
+        let (sender, receiver) = watch::channel(false);
+        self.inner
+            .lock()
+            .expect("remote device registry lock poisoned")
+            .entry(device_id.to_owned())
+            .or_default()
+            .push(sender.clone());
+        RemoteDeviceLease {
+            device_id: device_id.to_owned(),
+            sender,
+            receiver,
+            registry: Arc::clone(self),
+        }
+    }
+
+    /// Flip every registered lease of `device_id`; returns how many live
+    /// sessions were kicked (0 for an unknown device — a no-op revoke).
+    fn kick(&self, device_id: &str) -> usize {
+        match self
+            .inner
+            .lock()
+            .expect("remote device registry lock poisoned")
+            .remove(device_id)
+        {
+            Some(senders) => {
+                for sender in &senders {
+                    let _ = sender.send(true);
+                }
+                senders.len()
+            }
+            None => 0,
+        }
+    }
+
+    fn session_count(&self, device_id: &str) -> usize {
+        self.inner
+            .lock()
+            .expect("remote device registry lock poisoned")
+            .get(device_id)
+            .map_or(0, Vec::len)
+    }
+}
+
+/// One registered remote session's kick signal. Holding it keeps the session
+/// registered; dropping it (when `run_session` returns) unregisters.
+struct RemoteDeviceLease {
+    device_id: String,
+    sender: watch::Sender<bool>,
+    receiver: watch::Receiver<bool>,
+    registry: Arc<RemoteDeviceSessions>,
+}
+
+impl RemoteDeviceLease {
+    /// Resolve once the device is revoked (the watch flips to true).
+    async fn kicked(&mut self) {
+        let _ = self.receiver.changed().await;
+    }
+}
+
+impl Drop for RemoteDeviceLease {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.inner.lock() {
+            if let Some(senders) = registry.get_mut(&self.device_id) {
+                senders.retain(|sender| !sender.same_channel(&self.sender));
+                if senders.is_empty() {
+                    registry.remove(&self.device_id);
+                }
+            }
+        }
+    }
 }
 
 pub struct HostServer {
@@ -314,6 +400,7 @@ impl HostServer {
             legacy_rpc_gone_hits: Mutex::new(HashMap::new()),
             agent_root_override: Mutex::new(None),
             host_port: std::sync::atomic::AtomicU16::new(0),
+            remote_devices: Arc::new(RemoteDeviceSessions::default()),
         });
         // Prewarm the cost-metrics cache in the background: one 90d scan at
         // startup parses every file the 7d/30d/90d chips can need, so the
@@ -599,6 +686,27 @@ impl HostServer {
     /// daemon's lifetime; integration tests build their own.
     pub fn relay_session_sink(&self) -> Arc<RelaySessionBridge> {
         Arc::new(RelaySessionBridge::new(Arc::clone(&self.state)))
+    }
+
+    /// `remote_device_revoke` (plan T10, spec §2.9): the device's token
+    /// records die first, then every live session of that device — relay
+    /// attached or loopback remote — exits through the same teardown a
+    /// socket close takes. Delete-before-kick plus the session-side DB
+    /// re-check close the revoke-vs-hello race. Returns how many live
+    /// sessions were kicked.
+    pub fn revoke_remote_device(&self, device_id: &str) -> Result<usize, String> {
+        self.state
+            .auth
+            .lock()
+            .map_err(|_| "remote auth lock poisoned".to_string())?
+            .revoke(device_id)?;
+        Ok(self.state.remote_devices.kick(device_id))
+    }
+
+    /// Test seam: live session count of one paired device.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn remote_device_sessions_for_tests(&self, device_id: &str) -> usize {
+        self.state.remote_devices.session_count(device_id)
     }
 
     /// Install the terminal manager so the WebSocket loop can route
@@ -1662,25 +1770,52 @@ pub(crate) async fn run_session<S, E>(
     }
     // Gate B (spec §2.8): a device-token hello resolves the pairing-bound
     // principal — which device, and the owner whose pairing minted the token.
-    let device_principal = if hello.get("clientType").and_then(Value::as_str) == Some("remote") {
-        let principal = hello
-            .get("deviceToken")
-            .and_then(Value::as_str)
-            .and_then(|token| state.auth.lock().ok()?.authenticate(token).ok().flatten());
-        if principal.is_none() {
-            let _ = send_error(
-                &mut socket,
-                None,
-                "unauthorized_device",
-                "Device token rejected",
-            )
-            .await;
-            return;
-        }
-        principal
-    } else {
-        None
-    };
+    let (device_principal, device_token) =
+        if hello.get("clientType").and_then(Value::as_str) == Some("remote") {
+            let token = hello
+                .get("deviceToken")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let principal = token
+                .as_deref()
+                .and_then(|token| state.auth.lock().ok()?.authenticate(token).ok().flatten());
+            if principal.is_none() {
+                let _ = send_error(
+                    &mut socket,
+                    None,
+                    "unauthorized_device",
+                    "Device token rejected",
+                )
+                .await;
+                return;
+            }
+            (principal, token)
+        } else {
+            (None, None)
+        };
+    // T10 (spec §2.9): a remote-authenticated session is kickable. The DB
+    // re-check right after registration closes the revoke-vs-hello race: a
+    // revoke that deleted the device record between the hello-time
+    // authenticate and this registration missed the kick and must still end
+    // the session here.
+    let mut device_kick = device_principal.as_ref().map(|principal| {
+        let lease = state.remote_devices.register(&principal.device_id);
+        let record_gone = device_token.as_deref().is_some_and(|token| {
+            state
+                .auth
+                .lock()
+                .ok()
+                .and_then(|auth| auth.authenticate(token).ok().flatten())
+                .is_none()
+        });
+        (lease, record_gone)
+    });
+    if device_kick
+        .as_ref()
+        .is_some_and(|(_, record_gone)| *record_gone)
+    {
+        return;
+    }
     let context = match hello.get("clientType").and_then(Value::as_str) {
         Some("desktop") => {
             let capability = hello
@@ -1867,6 +2002,14 @@ pub(crate) async fn run_session<S, E>(
 
     loop {
         tokio::select! {
+            // T10: device revocation flips the lease signal — exit through
+            // the shared teardown below, exactly like a socket close.
+            _ = async {
+                match device_kick.as_mut() {
+                    Some((lease, _)) => lease.kicked().await,
+                    None => std::future::pending().await,
+                }
+            } => break,
             incoming = socket_stream.next() => {
                 let Some(Ok(message)) = incoming else { break };
                 let Message::Text(text) = message else {
@@ -8774,9 +8917,10 @@ mod tests {
             serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(refusal["error"]["code"], "forbidden_class", "{refusal}");
 
-        // Losing the owner registration invalidates the data plane on the
-        // very next frame (registry re-read, not a cached handshake).
-        host.set_owner_registry(Arc::new(crate::window_owner::WindowOwnerRegistry::default()));
+        // Unregistering the owner invalidates the data plane on the very
+        // next frame (registry re-read, not a cached handshake; the same
+        // registry object, so only the owner record went away).
+        registry.detach_owner(&owner);
         remote
             .send(Message::Text(
                 json!({
@@ -9829,6 +9973,62 @@ mod tests {
             drop(in_tx);
             host.stop();
             std::fs::remove_dir_all(temp).unwrap();
+        }
+    }
+
+    mod remote_device_sessions {
+        use super::super::{RemoteDeviceLease, RemoteDeviceSessions};
+        use std::sync::Arc;
+
+        /// T10 registry semantics in isolation: kick flips only the revoked
+        /// device's leases (every one of them), an unknown device is a no-op,
+        /// and a dropped lease unregisters its session.
+        #[tokio::test]
+        async fn kick_flips_only_the_revoked_devices_leases() {
+            let registry = Arc::new(RemoteDeviceSessions::default());
+            let mut a1 = registry.register("phone-a");
+            let mut a2 = registry.register("phone-a");
+            let mut b = registry.register("phone-b");
+            assert_eq!(registry.session_count("phone-a"), 2);
+
+            assert_eq!(registry.kick("phone-a"), 2, "both live sessions kick");
+            assert_eq!(
+                registry.kick("phone-a"),
+                0,
+                "a second revoke of the same device is a no-op"
+            );
+            assert_eq!(registry.kick("phone-unknown"), 0);
+            assert_eq!(registry.session_count("phone-a"), 0);
+            assert_eq!(
+                registry.session_count("phone-b"),
+                1,
+                "other device untouched"
+            );
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), a1.kicked())
+                .await
+                .expect("the first lease flipped");
+            tokio::time::timeout(std::time::Duration::from_millis(50), a2.kicked())
+                .await
+                .expect("the second lease flipped");
+            tokio::time::timeout(std::time::Duration::from_millis(50), b.kicked())
+                .await
+                .expect_err("phone-b was never revoked");
+
+            // Dropping a lease unregisters it: a later kick finds nothing.
+            drop(b);
+            assert_eq!(registry.session_count("phone-b"), 0);
+        }
+
+        /// The lease outlives a kick in the registry map: the same lease
+        /// still unregisters cleanly after the entry was removed by `kick`.
+        #[test]
+        fn dropped_lease_after_kick_is_a_no_op() {
+            let registry = Arc::new(RemoteDeviceSessions::default());
+            let lease: RemoteDeviceLease = registry.register("phone-a");
+            assert_eq!(registry.kick("phone-a"), 1);
+            drop(lease);
+            assert_eq!(registry.session_count("phone-a"), 0);
         }
     }
 }

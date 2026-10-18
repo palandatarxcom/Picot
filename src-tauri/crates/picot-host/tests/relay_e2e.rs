@@ -40,6 +40,7 @@ struct E2e {
     transport: RelayTransportHandle,
     identity: DaemonIdentity,
     device_token: String,
+    device_token_b: String,
     temp: PathBuf,
 }
 
@@ -127,6 +128,15 @@ async fn e2e_setup(label: &str, e2ee_handshake_timeout: Duration) -> E2e {
         .unwrap()
         .exchange(&pairing.token, "relay-e2e-device", 1_001)
         .expect("seeded device token");
+    let pairing_b = auth
+        .lock()
+        .unwrap()
+        .create_pairing(1_500, Some(owner.as_str()));
+    let device_token_b = auth
+        .lock()
+        .unwrap()
+        .exchange(&pairing_b.token, "relay-e2e-device-b", 1_501)
+        .expect("seeded second device token");
 
     let host = HostServer::start_with_session_root(
         public,
@@ -165,6 +175,7 @@ async fn e2e_setup(label: &str, e2ee_handshake_timeout: Duration) -> E2e {
         transport,
         identity,
         device_token,
+        device_token_b,
         temp,
     }
 }
@@ -218,6 +229,131 @@ async fn teardown(e2e: E2e) {
     e2e.transport.stop().await;
     e2e.host.stop();
     fs::remove_dir_all(e2e.temp).unwrap();
+}
+
+/// Poll until the daemon reports `want` live sessions of `device`.
+async fn device_sessions_reach(e2e: &E2e, device: &str, want: usize, what: &str) {
+    for _ in 0..400 {
+        if e2e.host.remote_device_sessions_for_tests(device) == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{what}: session count never reached {want}");
+}
+
+/// T9-C lifecycle check (plan T5(d)): the remote session's own teardown —
+/// the client disconnects, the transport tears the daemon-side data socket
+/// down, and the session task observes the ended stream and unregisters. No
+/// session survives its connection.
+#[tokio::test]
+async fn client_disconnect_unregisters_the_relay_session() {
+    let e2e = e2e_setup("disconnect-cleanup", Duration::from_secs(5)).await;
+    let (mut client, _id) = connect_client(&e2e.relay).await;
+    let shared = e2ee_client::handshake(&mut client, &e2e.identity.public_key_b64).await;
+    e2ee_client::send_sealed(
+        &mut client,
+        &shared,
+        &remote_hello("cleanup-1", &e2e.device_token),
+    )
+    .await;
+    assert_eq!(recv_json(&mut client, &shared).await["type"], "hello_ack");
+    device_sessions_reach(&e2e, "relay-e2e-device", 1, "the session registered").await;
+
+    // Client gone: the mock severs the daemon's data socket, the inbound
+    // stream ends, run_session returns, and the lease drop unregisters.
+    client.close().await;
+    device_sessions_reach(
+        &e2e,
+        "relay-e2e-device",
+        0,
+        "the session unregistered after the disconnect",
+    )
+    .await;
+
+    teardown(e2e).await;
+}
+
+/// T10 (spec §2.9): revoking a paired device while it is connected tears
+/// its live relay session down (the E2EE data connection closes mid-session),
+/// refuses a reconnect with the same device token at hello, and leaves a
+/// second paired device connected.
+#[tokio::test]
+async fn revoking_a_device_kicks_its_live_relay_sessions() {
+    let e2e = e2e_setup("revoke-kick", Duration::from_secs(5)).await;
+    let (mut revoked, _id_a) = connect_client(&e2e.relay).await;
+    let revoked_shared = e2ee_client::handshake(&mut revoked, &e2e.identity.public_key_b64).await;
+    e2ee_client::send_sealed(
+        &mut revoked,
+        &revoked_shared,
+        &remote_hello("revoke-a", &e2e.device_token),
+    )
+    .await;
+    assert_eq!(
+        recv_json(&mut revoked, &revoked_shared).await["type"],
+        "hello_ack"
+    );
+    let (mut survivor, _id_b) = connect_client(&e2e.relay).await;
+    let survivor_shared = e2ee_client::handshake(&mut survivor, &e2e.identity.public_key_b64).await;
+    e2ee_client::send_sealed(
+        &mut survivor,
+        &survivor_shared,
+        &remote_hello("revoke-b", &e2e.device_token_b),
+    )
+    .await;
+    assert_eq!(
+        recv_json(&mut survivor, &survivor_shared).await["type"],
+        "hello_ack"
+    );
+    device_sessions_reach(&e2e, "relay-e2e-device", 1, "device a registered").await;
+    device_sessions_reach(&e2e, "relay-e2e-device-b", 1, "device b registered").await;
+
+    e2e.host
+        .revoke_remote_device("relay-e2e-device")
+        .expect("revoke succeeds");
+
+    // The revoked device's data connection tears down mid-session; a
+    // follow-up read/write on it is impossible (socket closed).
+    revoked.expect_close().await;
+    device_sessions_reach(
+        &e2e,
+        "relay-e2e-device",
+        0,
+        "the kicked session unregistered",
+    )
+    .await;
+
+    // The second paired device still round-trips on its own channel.
+    e2ee_client::send_sealed(
+        &mut survivor,
+        &survivor_shared,
+        &json!({
+            "type": "host_request", "requestId": "surv-1", "operation": "preference_get"
+        })
+        .to_string(),
+    )
+    .await;
+    let response = recv_json(&mut survivor, &survivor_shared).await;
+    assert_eq!(response["error"]["code"], "forbidden_class", "{response}");
+
+    // A reconnect with the revoked device token is refused at hello.
+    let (mut again, _id_c) = connect_client(&e2e.relay).await;
+    let again_shared = e2ee_client::handshake(&mut again, &e2e.identity.public_key_b64).await;
+    e2ee_client::send_sealed(
+        &mut again,
+        &again_shared,
+        &remote_hello("revoke-a", &e2e.device_token),
+    )
+    .await;
+    let rejected = recv_json(&mut again, &again_shared).await;
+    assert_eq!(
+        rejected["error"]["code"], "unauthorized_device",
+        "{rejected}"
+    );
+    again.expect_close().await;
+    device_sessions_reach(&e2e, "relay-e2e-device-b", 1, "device b still live").await;
+
+    teardown(e2e).await;
 }
 
 /// (a) Full session: handshake → remote hello → hello_ack → one routed

@@ -1211,6 +1211,17 @@ async fn run_op_inner(
                 .map_err(|error| format!("relay pairing offer failed: {error}"))?;
             Ok(json!({ "url": offer.url, "expiresAt": offer.expires_at }))
         }
+        // `remote_device_revoke` (plan T10, spec §2.9): revoke the device's
+        // tokens **and** kick its live remote sessions — relay-attached and
+        // loopback remote alike — through the host server's one teardown
+        // path. Keyed by deviceId (the RemoteAuth record shape); the admin
+        // surface never carries raw device tokens.
+        "relay.revoke_device" => {
+            require_lease(inner, conn_id)?;
+            let device_id = arg_str(&args, "deviceId")?;
+            state.host.revoke_remote_device(&device_id)?;
+            Ok(json!({ "ok": true }))
+        }
         "owner.create" => {
             require_lease(inner, conn_id)?;
             let label = arg_str(&args, "label")?;

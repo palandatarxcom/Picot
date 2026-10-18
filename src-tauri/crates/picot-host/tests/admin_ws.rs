@@ -243,8 +243,17 @@ async fn next_frame(socket: &mut Client) -> Frame {
         let message = tokio::time::timeout(Duration::from_secs(15), socket.next())
             .await
             .expect("a frame within the deadline")
-            .expect("the socket is open")
-            .expect("a valid frame");
+            .expect("the socket is open");
+        // A kicked session ends in an abrupt TCP reset (revocation drops the
+        // socket without a close handshake): that is a close, not a protocol
+        // violation the harness should panic on.
+        let message = match message {
+            Ok(message) => message,
+            Err(tokio_tungstenite::tungstenite::Error::Protocol(
+                tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            )) => return Frame::Closed(1006, "reset without closing handshake".into()),
+            Err(error) => panic!("a valid frame: {error}"),
+        };
         match message {
             Message::Text(text) => {
                 return Frame::Json(serde_json::from_str(&text).expect("a JSON frame"));
@@ -550,6 +559,105 @@ async fn relay_offer_is_refused_while_relay_is_disabled() {
     let status = request(&mut socket, "r2", "relay.status", json!({})).await;
     assert_eq!(status["result"]["enabled"], false, "{status}");
     assert_eq!(status["result"]["serverId"], Value::Null, "{status}");
+}
+/// T10 (spec §2.9): `relay.revoke_device` revokes the device's tokens and
+/// kicks its **live loopback remote session** — the connection closes, the
+/// same device token cannot reconnect, and revoking an already-gone device
+/// is a no-op `{ok: true}`. No relay transport needed: revocation is
+/// DB + sessions.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_revoke_device_kicks_the_live_loopback_session() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let (mut socket, _welcome) = fixture.attach().await;
+    let owner = create_owner(&mut socket, "revoke-owner").await;
+
+    let auth = fixture.state.relay.remote_auth_for_tests();
+    let pairing = auth.lock().unwrap().create_pairing(1_000, Some(&owner));
+    let device_token = auth
+        .lock()
+        .unwrap()
+        .exchange(&pairing.token, "revoke-phone", 1_001)
+        .expect("seeded device token");
+
+    // The paired device holds a live loopback remote session.
+    let host_ws = fixture.state.host.origin().replacen("http://", "ws://", 1) + "/v2/ws";
+    let (mut remote, _) = tokio_tungstenite::connect_async(&host_ws).await.unwrap();
+    remote
+        .send(Message::Text(
+            json!({
+                "type": "hello", "protocolVersion": 2, "clientType": "remote",
+                "clientId": "revoke-phone-session", "deviceToken": device_token
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let ack = next_json(&mut remote).await;
+    assert_eq!(ack["type"], "hello_ack", "{ack}");
+    for _ in 0..400 {
+        if fixture
+            .state
+            .host
+            .remote_device_sessions_for_tests("revoke-phone")
+            == 1
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        fixture
+            .state
+            .host
+            .remote_device_sessions_for_tests("revoke-phone"),
+        1,
+        "the loopback remote session registered as kickable"
+    );
+
+    // Revoke: the record dies first, then the live session is kicked.
+    let response = request(
+        &mut socket,
+        "r-revoke",
+        "relay.revoke_device",
+        json!({ "deviceId": "revoke-phone" }),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"], json!({ "ok": true }), "{response}");
+    match next_frame(&mut remote).await {
+        Frame::Closed(..) => {}
+        other => panic!("the kicked session's socket must close, got {other:?}"),
+    }
+
+    // The revoked token cannot reconnect (hello-time DB check).
+    let (mut again, _) = tokio_tungstenite::connect_async(&host_ws).await.unwrap();
+    again
+        .send(Message::Text(
+            json!({
+                "type": "hello", "protocolVersion": 2, "clientType": "remote",
+                "clientId": "revoke-phone-retry", "deviceToken": device_token
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let rejected = next_json(&mut again).await;
+    assert_eq!(
+        rejected["error"]["code"], "unauthorized_device",
+        "{rejected}"
+    );
+
+    // Revoking an already-gone device is a no-op success.
+    let response = request(
+        &mut socket,
+        "r-revoke-again",
+        "relay.revoke_device",
+        json!({ "deviceId": "revoke-phone" }),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "{response}");
+
+    fixture.state.shutdown_graceful("test").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1577,6 +1685,8 @@ async fn a_stop_without_the_lease_is_refused_by_the_daemon() {
         ("r4", "owner.close_request"),
         // B1: stopping a single runtime is a lifecycle op like any other.
         ("r5", "agent.stop"),
+        // T10: device revocation is a mutating relay op — lease-gated too.
+        ("r6", "relay.revoke_device"),
     ] {
         let response = request(&mut socket, id, op, owner_args("w-leaseless")).await;
         assert_eq!(response["ok"], false, "{op} must be refused: {response}");
