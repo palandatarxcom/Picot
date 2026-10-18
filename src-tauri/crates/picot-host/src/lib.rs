@@ -70,6 +70,7 @@ pub mod ponytail_config;
 #[allow(dead_code)]
 pub mod process_tree;
 pub mod project_trust;
+pub mod relay;
 pub mod remote_auth;
 pub mod rpiv_config;
 pub mod runtime;

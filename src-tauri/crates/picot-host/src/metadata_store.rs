@@ -862,7 +862,10 @@ impl MetadataStore {
     }
 
     fn validate_public_preference_key(key: &str) -> Result<(), String> {
-        if key.starts_with("runtime.") {
+        // `relay.*` joins `runtime.*` as reserved (spec relay-phase2 §2.3):
+        // the public preference face must not reach the daemon identity
+        // secret or the relay enable state.
+        if key.starts_with("runtime.") || key.starts_with("relay.") {
             return Err("reserved preference namespace".to_string());
         }
         Ok(())
@@ -870,6 +873,12 @@ impl MetadataStore {
 
     pub fn pref_get(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
         Self::validate_public_preference_key(key)?;
+        self.read_preference(key)
+    }
+
+    /// Namespace-agnostic preference reader shared by the public and
+    /// relay-reserved accessors (validation happens at each entry point).
+    fn read_preference(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
         let json: Option<String> = self
             .connection
             .query_row(
@@ -889,6 +898,11 @@ impl MetadataStore {
 
     pub fn pref_set(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
         Self::validate_public_preference_key(key)?;
+        self.write_preference(key, value)
+    }
+
+    /// Namespace-agnostic preference writer; see [`Self::read_preference`].
+    fn write_preference(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
         let json = serde_json::to_string(value)
             .map_err(|error| format!("Cannot serialize Picot preference {key}: {error}"))?;
         self.connection
@@ -911,7 +925,7 @@ impl MetadataStore {
     }
 
     pub fn pref_list(&self, prefix: &str) -> Result<BTreeMap<String, serde_json::Value>, String> {
-        if prefix.starts_with("runtime.") {
+        if prefix.starts_with("runtime.") || prefix.starts_with("relay.") {
             return Err("reserved preference namespace".to_string());
         }
         // Escape LIKE metacharacters so caller-supplied prefixes match
@@ -934,7 +948,7 @@ impl MetadataStore {
         for entry in mapped {
             let (key, json) =
                 entry.map_err(|error| format!("Cannot list Picot preferences: {error}"))?;
-            if key.starts_with("runtime.") {
+            if key.starts_with("runtime.") || key.starts_with("relay.") {
                 continue;
             }
             let value: serde_json::Value = serde_json::from_str(&json)
@@ -942,6 +956,32 @@ impl MetadataStore {
             entries.insert(key, value);
         }
         Ok(entries)
+    }
+
+    /// Relay-reserved namespace accessor (spec relay-phase2 §2.3): the daemon
+    /// identity and relay enable state never traverse the public preference
+    /// face, and the public face can neither read nor list them. Crate-internal
+    /// so the relay module and its control ops are the only reachable callers.
+    pub(crate) fn relay_pref_get(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        Self::validate_relay_preference_key(key)?;
+        self.read_preference(key)
+    }
+
+    /// Relay-reserved namespace writer; see [`Self::relay_pref_get`].
+    pub(crate) fn relay_pref_set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), String> {
+        Self::validate_relay_preference_key(key)?;
+        self.write_preference(key, value)
+    }
+
+    fn validate_relay_preference_key(key: &str) -> Result<(), String> {
+        if !key.starts_with("relay.") {
+            return Err("relay preference key must use the relay.* namespace".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -1744,6 +1784,72 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| { !event.contains("runtime.native_origin") && !event.contains("true") }));
+    }
+    #[test]
+    fn relay_preference_namespace_is_reserved_from_the_public_face() {
+        let (_guard, store) = fresh_store("picot.sqlite3");
+        assert_eq!(
+            store.pref_get("relay.daemon.identity").unwrap_err(),
+            "reserved preference namespace"
+        );
+        assert_eq!(
+            store
+                .pref_set("relay.enabled", &serde_json::json!(true))
+                .unwrap_err(),
+            "reserved preference namespace"
+        );
+        assert_eq!(
+            store.pref_delete("relay.enabled").unwrap_err(),
+            "reserved preference namespace"
+        );
+        assert_eq!(
+            store.pref_list("relay.").unwrap_err(),
+            "reserved preference namespace"
+        );
+
+        // Seeded internal rows never leak through any public listing.
+        store
+            .relay_pref_set("relay.enabled", &serde_json::json!(true))
+            .unwrap();
+        store
+            .relay_pref_set("relay.daemon.identity", &serde_json::json!({ "a": 1 }))
+            .unwrap();
+        assert!(store.pref_list("").unwrap().is_empty());
+        assert!(store.pref_list("relay").unwrap().is_empty());
+    }
+
+    #[test]
+    fn relay_preference_internal_accessors_round_trip_and_guard_their_namespace() {
+        let (_guard, store) = fresh_store("picot.sqlite3");
+        assert!(store.relay_pref_get("relay.enabled").unwrap().is_none());
+        store
+            .relay_pref_set("relay.enabled", &serde_json::json!(true))
+            .unwrap();
+        assert_eq!(
+            store.relay_pref_get("relay.enabled").unwrap(),
+            Some(serde_json::json!(true))
+        );
+
+        // The internal path accepts only relay.* keys: no spilling into other
+        // namespaces, not even into the runtime-reserved one.
+        assert!(store.relay_pref_get("other.key").is_err());
+        assert!(store.relay_pref_get("runtime.native_origin").is_err());
+        assert!(store
+            .relay_pref_set("runtime.native_origin", &serde_json::json!(false))
+            .is_err());
+    }
+
+    #[test]
+    fn relay_preference_reader_fails_closed_for_invalid_json() {
+        let (_guard, store) = fresh_store("picot.sqlite3");
+        store
+            .connection
+            .execute(
+                "INSERT INTO preferences (key, value_json) VALUES ('relay.enabled', 'not-json')",
+                [],
+            )
+            .unwrap();
+        assert!(store.relay_pref_get("relay.enabled").is_err());
     }
 
     #[test]
