@@ -162,6 +162,13 @@ fn import_public_key(value_b64: &str) -> Result<[u8; KEY_BYTES], String> {
 /// points an attacker-forced key agreement would reduce to. The identical
 /// rejection lives on the Paseo side, so both ends refuse the connection
 /// rather than derive a predictable key.
+/// Validate an offer-embedded public key string: canonical standard base64
+/// decoding to exactly 32 bytes. Thin pub(crate) seam over
+/// [`import_public_key`] for the pairing offer codec (spec §2.6).
+pub(crate) fn validate_public_key_b64(value_b64: &str) -> Result<(), String> {
+    import_public_key(value_b64).map(|_| ())
+}
+
 pub fn derive_shared_key(secret: &[u8], peer_public_b64: &str) -> Result<[u8; 32], String> {
     if secret.len() != KEY_BYTES {
         return Err(format!(
