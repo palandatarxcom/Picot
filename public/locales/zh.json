@@ -1716,7 +1716,8 @@
     "focusTitle": "工作区",
     "back": "返回",
     "newTask": "新任务",
-    "showMore": "显示更多"
+    "showMore": "显示更多",
+    "focusedExisting": "该会话已在另一窗口打开，已为你聚焦该窗口"
   },
   "migrated": {
     "native": {

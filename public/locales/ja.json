@@ -1716,7 +1716,8 @@
     "focusTitle": "ワークスペース",
     "back": "戻る",
     "newTask": "新しいタスク",
-    "showMore": "もっと表示"
+    "showMore": "もっと表示",
+    "focusedExisting": "このセッションは別のウィンドウで開いています。そのウィンドウにフォーカスしました"
   },
   "migrated": {
     "index": {

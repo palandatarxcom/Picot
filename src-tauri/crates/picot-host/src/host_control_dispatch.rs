@@ -1537,8 +1537,8 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                         return Ok(serde_json::json!({
                                             "classification": if same_cwd { "same" } else { "cross" },
                                             "focusedExisting": true,
-                                            "targetWorkspaceId": blocked.workspace_id,
-                                            "targetSessionId": blocked.session_id,
+                                            "workspaceId": blocked.workspace_id,
+                                            "sessionId": blocked.session_id,
                                         }));
                                     }
                                     FocusBlocked::Retryable(error) => return Err(error),

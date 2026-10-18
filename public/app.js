@@ -5872,6 +5872,13 @@ async function handleSessionSelectImpl(session, project) {
         sessionPath: session.filePath,
         reuseExisting: Boolean(targetLiveInstance),
       });
+      if (prepared?.focusedExisting) {
+        // The daemon focused the window already showing this session
+        // (multi-window §6.3). This window stays where it is — no commit,
+        // no navigation, no error.
+        messageRenderer.renderSystemMessage(t("workspace.focusedExisting"));
+        return;
+      }
       if (typeof prepared?.transitionGeneration !== "number") {
         throw new Error("Workspace transition was not prepared");
       }
@@ -5919,6 +5926,12 @@ async function handleSessionSelectImpl(session, project) {
         sessionPath: session.filePath,
         reuseExisting: Boolean(targetLiveInstance),
       });
+      if (prepared?.focusedExisting) {
+        // Same §6.3 semantics on the same-workspace select: the holder's
+        // window was focused; this document keeps its current session.
+        messageRenderer.renderSystemMessage(t("workspace.focusedExisting"));
+        return;
+      }
       if (typeof prepared?.transitionGeneration !== "number") {
         throw new Error("Session runtime transition was not prepared");
       }

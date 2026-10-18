@@ -211,6 +211,12 @@ async function enterWorkspace(path, { sessionPath, forceNewSession } = {}) {
       forceNewSession: Boolean(forceNewSession),
       reuseExisting,
     });
+    if (prepared?.focusedExisting) {
+      // The daemon focused the window already showing this session
+      // (multi-window §6.3). Landing stays put: no commit, no navigation.
+      renderLandingNotice(t("workspace.focusedExisting"));
+      return true;
+    }
     if (typeof prepared?.transitionGeneration !== "number") {
       throw new Error("Workspace transition was not prepared");
     }

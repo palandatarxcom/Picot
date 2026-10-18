@@ -1716,7 +1716,8 @@
     "focusTitle": "Espacio de trabajo",
     "back": "Atrás",
     "newTask": "Nueva tarea",
-    "showMore": "Mostrar más"
+    "showMore": "Mostrar más",
+    "focusedExisting": "Esa sesión ya está abierta en otra ventana; se ha enfocado esa ventana."
   },
   "migrated": {
     "index": {

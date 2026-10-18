@@ -732,8 +732,8 @@ async fn prepare_focuses_the_holders_window_for_a_blocked_session() {
         .expect("the Blocked arm answers with focus semantics, not an error");
 
     assert_eq!(result["focusedExisting"], json!(true));
-    assert_eq!(result["targetSessionId"], json!("saved"));
-    assert_eq!(result["targetWorkspaceId"], json!(fixture.workspace_id));
+    assert_eq!(result["sessionId"], json!("saved"));
+    assert_eq!(result["workspaceId"], json!(fixture.workspace_id));
     assert!(
         result.get("transitionGeneration").is_none(),
         "no transition was prepared: {result}"

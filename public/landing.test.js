@@ -629,3 +629,24 @@ test("errors render into the landing notice, never a chat renderer", async () =>
   expect(notice.classList.contains("hidden")).toBe(false);
   expect(notice.textContent).toContain("spawn failed");
 });
+
+test("a focused-away prepare lands as a notice with no navigation or commit", async () => {
+  await bootLanding();
+  harness.transport.prepareWorkspaceTarget = async () => ({
+    classification: "cross",
+    focusedExisting: true,
+    workspaceId: "wid",
+    sessionId: "sid-1",
+  });
+  const assigns = trackNavigation();
+  const ok = await harness.sidebarInstance.onSessionSelect(
+    { filePath: "/tmp/s.jsonl", cwd: "/tmp/ws" },
+    { path: "/tmp/ws" },
+  );
+  expect(ok).toBe(true);
+  expect(harness.commits).toEqual([]);
+  expect(assigns).toEqual([]);
+  const notice = document.getElementById("landing-notice");
+  expect(notice.classList.contains("hidden")).toBe(false);
+  expect(notice.textContent).toContain("another window");
+});

@@ -1716,7 +1716,8 @@
     "focusTitle": "Workspace",
     "back": "Back",
     "newTask": "New Task",
-    "showMore": "Show more"
+    "showMore": "Show more",
+    "focusedExisting": "That session is already open in another window — focused it for you."
   },
   "migrated": {
     "native": {

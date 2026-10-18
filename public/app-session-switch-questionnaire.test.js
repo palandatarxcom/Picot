@@ -20,6 +20,7 @@ const enMessages = JSON.parse(readFileSync(join(process.cwd(), "public/locales/e
 const wsInstances = [];
 let snapshots = new Map(); // native sessionId -> { sessionFile, streaming }
 let preparedTargets = new Map(); // sessionPath -> native sessionId
+let prepareResponse = null; // per-test prepare reply override (e.g. focusedExisting)
 let instancesData = [];
 let sequence = 0;
 
@@ -104,7 +105,7 @@ class FakeWebSocket extends EventTarget {
       else if (envelope.operation === "runtime_instances") response = { instances: instancesData };
       else if (envelope.operation === "workspace_target_prepare") {
         const sessionId = preparedTargets.get(envelope.args?.sessionPath) || null;
-        response = {
+        response = prepareResponse ?? {
           transitionGeneration: 1,
           targetWorkspaceId: "w1",
           targetSessionId: sessionId,
@@ -171,6 +172,7 @@ beforeEach(async () => {
     [S1, "s1"],
     [S2, "s2"],
   ]);
+  prepareResponse = null;
   instancesData = [
     { ...TARGET_S1, sessionFile: S1, streaming: true },
     { ...TARGET_S2, sessionFile: S2, streaming: false },
@@ -505,5 +507,31 @@ test("switching sessions sends the sidebar's scanned file path with the history 
   // Drain the switch's async sidebar warm before jsdom tears down: its
   // deferred render would otherwise fire after the environment is gone and
   // surface as an unhandled `document is not defined` rejection.
+  await settle(120);
+});
+
+test("a focused-away prepare shows a notice instead of switching", async () => {
+  // The daemon focused the holder's window (multi-window §6.3): this window
+  // must not navigate, commit, or surface a transition error — only tell the
+  // user where the session went.
+  prepareResponse = {
+    classification: "same",
+    focusedExisting: true,
+    workspaceId: "w1",
+    sessionId: "s2",
+  };
+  await import("./app.js?switch-focused-existing");
+  await settle();
+  const pushState = vi.spyOn(window.history, "pushState");
+  await switchTo(S2);
+  await settle();
+  const ws = wsInstances.at(-1);
+  expect(ws.sent.some((frame) => frame.operation === "workspace_transition_commit")).toBe(false);
+  expect(pushState).not.toHaveBeenCalled();
+  expect(document.querySelector(".error-message")).toBeNull();
+  const notice = [...document.querySelectorAll(".system-message")].find((el) =>
+    el.textContent.includes("another window"),
+  );
+  expect(notice).toBeTruthy();
   await settle(120);
 });
