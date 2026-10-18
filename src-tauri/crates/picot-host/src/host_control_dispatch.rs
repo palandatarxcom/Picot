@@ -1502,8 +1502,14 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         // Explicit new-session requests always get a new runtime.
                         // A runtime whose owner the app relinquished (destroyed
                         // window, dead attachment) is reattached to this owner
-                        // below; a *live* owner's runtime is refused instead of
-                        // stealing it (plan D11/T7).
+                        // below; a *live* owner's runtime is never stolen (plan
+                        // D11/T7) — the holder's window is focused instead
+                        // (multi-window §6.3). This entry has no mint: the
+                        // requester IS this window's owner, so a focused-away
+                        // answer leaves every registry record untouched, and a
+                        // holder that detached mid-focus falls through to the
+                        // rebind flow below (the same one a direct Rebind
+                        // answer takes).
                         let existing = match plan_prepare_reuse(
                             &runtimes,
                             &owner_registry,
@@ -1514,10 +1520,30 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         ) {
                             PrepareReuse::Spawn => None,
                             PrepareReuse::Rebind(target) => Some(target),
-                            PrepareReuse::Blocked(_) => {
-                                return Err(
-                                    "this session is already open in another window".to_string()
+                            PrepareReuse::Blocked(blocked) => {
+                                match focus_blocked_holder(
+                                    &owner_registry,
+                                    app_surface.as_ref(),
+                                    &blocked,
                                 )
+                                .await
+                                {
+                                    FocusBlocked::Focused => {
+                                        log::info!(
+                                            "[picot-native] workspace_target_prepare: focused the existing window for session {} of workspace {}",
+                                            blocked.session_id,
+                                            blocked.workspace_id
+                                        );
+                                        return Ok(serde_json::json!({
+                                            "classification": if same_cwd { "same" } else { "cross" },
+                                            "focusedExisting": true,
+                                            "targetWorkspaceId": blocked.workspace_id,
+                                            "targetSessionId": blocked.session_id,
+                                        }));
+                                    }
+                                    FocusBlocked::Retryable(error) => return Err(error),
+                                    FocusBlocked::HolderDetached => Some(blocked),
+                                }
                             }
                         };
 
@@ -2213,7 +2239,6 @@ fn mint_workspace_window_owner(
     ))
 }
 
-// ─── Window helpers ───────────────────────────────────────────────────────────
 // ─── Window helpers ───────────────────────────────────────────────────────────
 
 /// The §6.3 outcome of trying to focus a Blocked holder's window.

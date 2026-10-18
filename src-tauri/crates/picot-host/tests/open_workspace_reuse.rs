@@ -241,8 +241,25 @@ impl Fixture {
         }
     }
 
+    fn native_ctx(&self, owner: &OwnerId) -> VerifiedClientContext {
+        VerifiedClientContext {
+            client_id: 1,
+            class: ClientClass::Native,
+            owner_id: Some(owner.clone()),
+        }
+    }
+
     /// Drive one control op through the production dispatcher.
     async fn dispatch(&self, command: &str, args: Value) -> Result<Value, String> {
+        self.dispatch_as(self.ctx(), command, args).await
+    }
+
+    async fn dispatch_as(
+        &self,
+        ctx: VerifiedClientContext,
+        command: &str,
+        args: Value,
+    ) -> Result<Value, String> {
         let handler = host_control_dispatch(Arc::clone(&self.state));
         let canonical = json!({
             "type": "runtime_request",
@@ -250,7 +267,7 @@ impl Fixture {
             "args": args,
         });
         let progress: ProgressSink = Arc::new(|_| {});
-        handler(self.ctx(), canonical, progress).await
+        handler(ctx, canonical, progress).await
     }
 
     fn open_args(&self) -> Value {
@@ -677,6 +694,173 @@ async fn open_workspace_focus_failure_with_a_detached_holder_rebinds_the_runtime
     let opened = fixture.surface.opened();
     assert_eq!(opened.len(), 1, "the window opens on the reused runtime");
     assert_eq!(opened[0].0.instance_id, existing.instance_id);
+    assert_eq!(
+        fixture.surface.focused(),
+        vec![base],
+        "the focus was attempted on the holder's label before the takeover"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 4: the in-window prepare entry routes Blocked to the holder's window
+// (spec §6.3) instead of the flat refusal string.
+// ---------------------------------------------------------------------------
+
+/// A second window's prepare for a session a live holder owns focuses the
+/// holder's window and answers with the machine-readable focus semantics —
+/// the old "this session is already open in another window" error is gone,
+/// nothing spawns, nothing is stolen, and no transition state leaks for a
+/// navigation that never happens (spec §6.3).
+#[tokio::test(flavor = "multi_thread")]
+async fn prepare_focuses_the_holders_window_for_a_blocked_session() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+    let holder = fixture.live_owner(&base);
+    fixture.spawn_stub_runtime("saved", &holder);
+    let requester = fixture.live_owner(&format!("{base}-2"));
+
+    let result = fixture
+        .dispatch_as(
+            fixture.native_ctx(&requester),
+            "workspace_target_prepare",
+            json!({
+                "targetCwd": fixture.workspace_dir.to_string_lossy(),
+                "sessionPath": fixture.session_file.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("the Blocked arm answers with focus semantics, not an error");
+
+    assert_eq!(result["focusedExisting"], json!(true));
+    assert_eq!(result["targetSessionId"], json!("saved"));
+    assert_eq!(result["targetWorkspaceId"], json!(fixture.workspace_id));
+    assert!(
+        result.get("transitionGeneration").is_none(),
+        "no transition was prepared: {result}"
+    );
+    assert_eq!(
+        fixture.surface.focused(),
+        vec![base],
+        "the holder's daemon-resolved label is what gets focused"
+    );
+    assert!(
+        fixture.surface.opened().is_empty(),
+        "prepare never opens a window"
+    );
+    let running = fixture.state.runtimes.running_targets();
+    assert_eq!(running.len(), 1, "no second runtime for a live holder");
+    assert_eq!(running[0].session_id, "saved", "identity did not drift");
+    assert_eq!(
+        running[0].owner_id.as_deref(),
+        Some(holder.as_str()),
+        "the live holder keeps its runtime"
+    );
+    assert_eq!(
+        fixture.state.owner_registry.pending_target_cwd(&requester),
+        None,
+        "no pending transition leaks for a focused-away prepare"
+    );
+}
+
+/// A focus failure with the holder still live is the retryable
+/// `focus_window_failed` error — the runtime is not stolen, nothing spawns,
+/// and the requester's navigation state stays untouched (spec §6.3).
+#[tokio::test(flavor = "multi_thread")]
+async fn prepare_focus_failure_with_a_live_holder_is_a_retryable_error() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+    let holder = fixture.live_owner(&base);
+    fixture.spawn_stub_runtime("saved", &holder);
+    let requester = fixture.live_owner(&format!("{base}-2"));
+    fixture
+        .surface
+        .fail_focus_with("the window refused the focus");
+
+    let error = fixture
+        .dispatch_as(
+            fixture.native_ctx(&requester),
+            "workspace_target_prepare",
+            json!({
+                "targetCwd": fixture.workspace_dir.to_string_lossy(),
+                "sessionPath": fixture.session_file.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect_err("a failed focus must not look like success");
+
+    assert!(
+        error.starts_with("focus_window_failed"),
+        "the retryable error is identifiable by a stable prefix: {error}"
+    );
+    assert!(
+        error.contains("the window refused the focus"),
+        "the underlying failure travels with it: {error}"
+    );
+    assert_eq!(fixture.surface.focused().len(), 1);
+    let running = fixture.state.runtimes.running_targets();
+    assert_eq!(running.len(), 1, "no fallback spawn");
+    assert_eq!(
+        running[0].owner_id.as_deref(),
+        Some(holder.as_str()),
+        "a live holder's runtime is never taken over by a failed focus"
+    );
+    assert_eq!(
+        fixture.state.owner_registry.pending_target_cwd(&requester),
+        None,
+        "no pending transition leaks for a refused prepare"
+    );
+}
+
+/// A focus failure whose holder detached while the focus was in flight takes
+/// the prepare entry's own rebind flow: same runtime instance, re-owned by
+/// the requester at the prepared generation — the same contract the direct
+/// Rebind answer has always had (spec §6.3's detached fork).
+#[tokio::test(flavor = "multi_thread")]
+async fn prepare_focus_failure_with_a_detached_holder_rebinds_via_the_prepare_flow() {
+    let fixture = Fixture::boot().await;
+    let base = format!("native-workspace-{}", fixture.workspace_id);
+    let holder = fixture.live_owner(&base);
+    let existing = fixture.spawn_stub_runtime("saved", &holder);
+    let requester = fixture.live_owner(&format!("{base}-2"));
+    let registry = fixture.state.owner_registry.clone();
+    let leaving = holder.clone();
+    fixture.surface.on_focus(move |_| {
+        registry.detach_owner(&leaving);
+    });
+    fixture.surface.fail_focus_with("the window is gone");
+
+    let result = fixture
+        .dispatch_as(
+            fixture.native_ctx(&requester),
+            "workspace_target_prepare",
+            json!({
+                "targetCwd": fixture.workspace_dir.to_string_lossy(),
+                "sessionPath": fixture.session_file.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("the takeover succeeds through the prepare rebind flow");
+
+    let generation = result["transitionGeneration"]
+        .as_u64()
+        .expect("a takeover prepares a real transition");
+    assert!(
+        result.get("focusedExisting").is_none(),
+        "a takeover is not a focus answer: {result}"
+    );
+    assert_eq!(result["targetSessionId"], json!("saved"));
+    let running = fixture.state.runtimes.running_targets();
+    assert_eq!(running.len(), 1, "the runtime is reused, not duplicated");
+    assert_eq!(
+        running[0].instance_id, existing.instance_id,
+        "the same instance survives the takeover"
+    );
+    assert_eq!(
+        running[0].owner_id.as_deref(),
+        Some(requester.as_str()),
+        "the runtime is rebound to the requesting window's owner"
+    );
+    assert_eq!(running[0].workspace_generation, generation);
     assert_eq!(
         fixture.surface.focused(),
         vec![base],

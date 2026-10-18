@@ -779,7 +779,10 @@ async fn a_second_live_owner_cannot_claim_a_running_session() {
         "the original owner keeps the single writable binding"
     );
 
-    // And the op refuses instead of creating a second binding for the session.
+    // And the op refuses instead of creating a second binding for the
+    // session: multi-window §6.3 made the refusal a real focus attempt on the
+    // holder's window — this fixture's surface fails every call and the holder
+    // stays live, so the refusal is the retryable focus error.
     let denied = fixture
         .dispatch(
             &fixture.native_ctx(&other_owner),
@@ -792,8 +795,8 @@ async fn a_second_live_owner_cannot_claim_a_running_session() {
         .await
         .expect_err("preparing a live owner's session must be refused");
     assert!(
-        denied.contains("another window"),
-        "the refusal names the existing window path: {denied}"
+        denied.starts_with("focus_window_failed"),
+        "the refusal is the retryable focus error, never a second binding: {denied}"
     );
     assert_eq!(
         fixture
