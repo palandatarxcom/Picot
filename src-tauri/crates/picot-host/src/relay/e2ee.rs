@@ -82,6 +82,14 @@ impl DaemonIdentity {
         }
     }
 
+    /// Throwaway identity for transport contract tests (`test-seams` only):
+    /// the control socket takes the identity for T5's E2EE handshake; no
+    /// test needs the persisted, validated one.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn for_tests() -> Self {
+        Self::generate()
+    }
+
     /// Structural validation for a loaded row (spec §2.3): the key fields must
     /// decode to exactly 32 bytes and `serverId` must be non-empty. Used to
     /// reject corrupt rows instead of silently re-keying.

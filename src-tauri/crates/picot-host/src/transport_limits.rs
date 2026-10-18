@@ -21,8 +21,12 @@ pub const PROGRESS_BYTES: usize = 64 * 1024;
 pub const RAW_FILE_BYTES: usize = 20 * 1024 * 1024;
 pub const EXPORT_BYTES: usize = 20 * 1024 * 1024;
 pub const SESSION_FILE_BYTES: usize = 20 * 1024 * 1024;
-#[allow(dead_code)]
 pub const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+
+// Relay control frames carry only small JSON (sync/connected/disconnected,
+// spec 2026-10-17-relay-phase2 §2.7): anything beyond this bound is a protocol
+// violation that drops the control connection (reconnect per backoff).
+pub const RELAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]

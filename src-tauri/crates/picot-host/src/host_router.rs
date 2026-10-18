@@ -117,7 +117,9 @@ impl RouterError {
     }
 }
 
-const MAX_CLIENTS: usize = 256;
+// `pub(crate)`: the relay transport bounds `sync.connectionIds` against the
+// same ceiling (spec 2026-10-17-relay-phase2 §2.7) — one constant, two gates.
+pub(crate) const MAX_CLIENTS: usize = 256;
 
 pub struct HostRouter {
     clients: HashMap<String, HostClientContext>,

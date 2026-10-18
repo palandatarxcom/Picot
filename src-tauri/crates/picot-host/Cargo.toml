@@ -43,7 +43,11 @@ async-trait = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 futures-util = "0.3"
-tokio-tungstenite = "0.24"
+# `native-tls` is mandatory for the relay dial (spec 2026-10-17-relay-phase2
+# §2.5 R3): the default build has no TLS backend and cannot reach the company
+# `wss://` endpoint. native-tls reuses the same stack reqwest 0.12 already
+# links; no second TLS implementation enters the binary.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 # Relay E2EE (spec 2026-10-17-relay-phase2 §2.4): NaCl box over X25519 —
 # wire-compatible with Paseo's tweetnacl `nacl.box`. crypto_box owns the
 # keypair types; the three below are the same crates crypto_box delegates to,
