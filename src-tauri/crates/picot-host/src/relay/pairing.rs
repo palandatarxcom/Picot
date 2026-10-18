@@ -93,11 +93,13 @@ pub struct PairingOffer {
 }
 
 /// Assemble the one-scan pairing offer (spec §2.6): the daemon identity
-/// (E2EE trust anchor), the relay endpoint, and the freshly minted pairing
-/// token rendered as the placeholder-host offer URL.
+/// (E2EE trust anchor), the relay endpoint (with the dial plan's TLS flag,
+/// so a plain-WS dev endpoint is not advertised as TLS), and the freshly
+/// minted pairing token rendered as the placeholder-host offer URL.
 pub fn build_pairing_offer(
     identity: &crate::relay::e2ee::DaemonIdentity,
     endpoint: &str,
+    use_tls: bool,
     pairing: &crate::remote_auth::Pairing,
 ) -> Result<PairingOffer, String> {
     let offer = ConnectionOfferV2 {
@@ -106,7 +108,7 @@ pub fn build_pairing_offer(
         daemon_public_key_b64: identity.public_key_b64.clone(),
         relay: RelayEndpoint {
             endpoint: endpoint.to_string(),
-            use_tls: true,
+            use_tls,
         },
         pairing_token: Some(pairing.token.clone()),
         pairing_token_expires_at: Some(pairing.expires_at),
@@ -400,7 +402,7 @@ mod tests {
             token: "picot_pair_0123456789abcdef".to_string(),
             expires_at: 1_771_000_500,
         };
-        let offer = build_pairing_offer(&identity, DEFAULT_RELAY_ENDPOINT, &pairing).unwrap();
+        let offer = build_pairing_offer(&identity, DEFAULT_RELAY_ENDPOINT, true, &pairing).unwrap();
         assert!(offer.url.starts_with("https://picot.021521.xyz/#offer="));
         assert_eq!(offer.expires_at, 1_771_000_500);
 
@@ -424,7 +426,7 @@ mod tests {
             token: "picot_pair_override".to_string(),
             expires_at: 42,
         };
-        let offer = build_pairing_offer(&identity, "localhost:9443", &pairing).unwrap();
+        let offer = build_pairing_offer(&identity, "localhost:9443", true, &pairing).unwrap();
         assert_eq!(offer.expires_at, 42);
         let parsed = parse_connection_offer(&offer.url).unwrap();
         assert_eq!(parsed.relay.endpoint, "localhost:9443");

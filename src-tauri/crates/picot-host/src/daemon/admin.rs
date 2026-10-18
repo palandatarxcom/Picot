@@ -1165,6 +1165,45 @@ async fn run_op_inner(
                 }
             }))
         }
+        // Relay lifecycle ops (plan T6 slice 1, spec §4.1): the settings UI's
+        // Pair Device block reaches the daemon through exactly these three.
+        // Mutating/minting ops are lease-gated like `agent.stop`; `status` is
+        // a read like `daemon.status`.
+        "relay.set_enabled" => {
+            require_lease(inner, conn_id)?;
+            let enabled = args
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    "relay.set_enabled requires a boolean enabled argument".to_string()
+                })?;
+            state
+                .relay
+                .set_enabled(enabled)
+                .await
+                .map_err(|error| format!("relay enablement failed: {error}"))?;
+            Ok(json!({ "enabled": enabled }))
+        }
+        "relay.status" => {
+            let status = state
+                .relay
+                .status()
+                .map_err(|error| format!("relay status unavailable: {error}"))?;
+            Ok(json!({
+                "enabled": status.enabled,
+                "state": status.state,
+                "endpoint": status.endpoint,
+                "serverId": status.server_id,
+            }))
+        }
+        "relay.offer" => {
+            require_lease(inner, conn_id)?;
+            let offer = state
+                .relay
+                .pairing_offer()
+                .map_err(|error| format!("relay pairing offer failed: {error}"))?;
+            Ok(json!({ "url": offer.url, "expiresAt": offer.expires_at }))
+        }
         "owner.create" => {
             require_lease(inner, conn_id)?;
             let label = arg_str(&args, "label")?;

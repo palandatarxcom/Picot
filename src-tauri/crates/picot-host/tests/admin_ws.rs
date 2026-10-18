@@ -23,6 +23,14 @@ use picot_host::daemon::app_surface::{AppSurface, PaneOp, SurfaceProgress};
 use picot_host::daemon::{DaemonConfig, DaemonState, DrainObserver, DrainStep};
 use picot_host::window_owner::OwnerId;
 use serde_json::{json, Value};
+#[path = "support/mock_relay.rs"]
+mod mock_relay;
+
+use mock_relay::MockRelay;
+use picot_host::relay::controller::RelayStartPlan;
+use picot_host::relay::pairing::{parse_connection_offer, PairingOffer, DEFAULT_RELAY_ENDPOINT};
+use picot_host::relay::transport::{TransportSeams, TransportTimings};
+use picot_host::remote_auth::PairingError;
 use tokio_tungstenite::tungstenite::Message;
 
 type Client =
@@ -327,6 +335,257 @@ async fn wait_until(deadline: Duration, mut predicate: impl FnMut() -> bool, wha
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("timed out waiting for {what}");
+}
+
+/// Fast transport timings so relay state transitions are observable in
+/// seconds, not the production tens-of-seconds (same shape as the relay e2e
+/// suite).
+fn relay_op_seams() -> TransportSeams {
+    TransportSeams {
+        timings: TransportTimings {
+            backoff_base: Duration::from_secs(1),
+            backoff_cap: Duration::from_secs(2),
+            ping_interval: Duration::from_millis(50),
+            stale_timeout: Duration::from_millis(400),
+            ready_timeout: Duration::from_millis(400),
+            handshake_timeout: Duration::from_secs(2),
+            data_open_timeout: Duration::from_secs(2),
+            e2ee_handshake_timeout: Duration::from_secs(5),
+        },
+        sleep: Arc::new(|duration: Duration| Box::pin(tokio::time::sleep(duration))),
+        connector: None,
+    }
+}
+
+/// Point the daemon's relay controller at `relay` over plain WS (the mock has
+/// no TLS), then enable through the admin op the way the UI will.
+async fn enable_relay_against_mock(
+    fixture: &Fixture,
+    socket: &mut Client,
+    relay: &MockRelay,
+) -> Value {
+    fixture
+        .state
+        .relay
+        .set_start_plan_for_tests(RelayStartPlan {
+            endpoint: relay.addr().to_string(),
+            use_tls: false,
+            seams: relay_op_seams(),
+        });
+    let response = request(
+        socket,
+        "r-enable",
+        "relay.set_enabled",
+        json!({ "enabled": true }),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"], json!({ "enabled": true }), "{response}");
+    response
+}
+
+/// Poll `relay.status` through the admin op until its state equals `want`.
+async fn relay_status_reaches(socket: &mut Client, want: &str, what: &str) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let status = request(socket, "r-status", "relay.status", json!({})).await;
+        assert_eq!(status["ok"], true, "{status}");
+        if status["result"]["state"] == want {
+            return status["result"].clone();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for relay state {what} (last: {status})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// One `relay.offer` round trip, asserted ok.
+async fn relay_offer(socket: &mut Client, id: &str) -> PairingOffer {
+    let response = request(socket, id, "relay.offer", json!({})).await;
+    assert_eq!(response["ok"], true, "{response}");
+    let url = response["result"]["url"]
+        .as_str()
+        .expect("offer url")
+        .to_owned();
+    let expires_at = response["result"]["expiresAt"].as_u64().expect("expiresAt");
+    PairingOffer { url, expires_at }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_status_defaults_to_disabled_and_offline() {
+    // The default endpoint comes from the production plan, which reads
+    // PICOT_RELAY_ENDPOINT; pin the env so the assertion cannot drift with
+    // the developer's shell.
+    let saved = std::env::var("PICOT_RELAY_ENDPOINT").ok();
+    std::env::remove_var("PICOT_RELAY_ENDPOINT");
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let (mut socket, _) = fixture.attach().await;
+    let response = request(&mut socket, "r1", "relay.status", json!({})).await;
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(
+        response["result"],
+        json!({
+            "enabled": false,
+            "state": "offline",
+            "endpoint": DEFAULT_RELAY_ENDPOINT,
+            "serverId": Value::Null,
+        }),
+        "{response}"
+    );
+    drop(fixture);
+    if let Some(saved) = saved {
+        std::env::set_var("PICOT_RELAY_ENDPOINT", saved);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_set_enabled_starts_the_transport_and_reaches_online() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let relay = MockRelay::start().await;
+    let (mut socket, _) = fixture.attach().await;
+    enable_relay_against_mock(&fixture, &mut socket, &relay).await;
+
+    let status = relay_status_reaches(&mut socket, "online", "online against the mock").await;
+    assert_eq!(status["enabled"], true, "{status}");
+    let server_id = status["serverId"]
+        .as_str()
+        .expect("identity minted on enable");
+    assert!(!server_id.is_empty());
+    // The enabled flag is the persisted preference (status re-reads the
+    // store), and the identity is stable across reads.
+    let again = relay_status_reaches(&mut socket, "online", "a second status read").await;
+    assert_eq!(again["serverId"], server_id, "{again}");
+
+    // The flip back to offline is the state machine's third state.
+    let response = request(
+        &mut socket,
+        "r2",
+        "relay.set_enabled",
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "{response}");
+    let status = relay_status_reaches(&mut socket, "offline", "offline after disable").await;
+    assert_eq!(status["enabled"], false, "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_disable_revokes_pending_tokens_but_keeps_paired_devices() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let relay = MockRelay::start().await;
+    let (mut socket, _) = fixture.attach().await;
+    enable_relay_against_mock(&fixture, &mut socket, &relay).await;
+    relay_status_reaches(&mut socket, "online", "online against the mock").await;
+
+    // A paired device token (the thing that must survive the flip) and a
+    // pending pairing token (the thing that must not).
+    let auth = fixture.state.relay.remote_auth_for_tests();
+    let pairing = auth.lock().unwrap().create_pairing(1_000);
+    let device_token = auth
+        .lock()
+        .unwrap()
+        .exchange(&pairing.token, "relay-op-device", 1_001)
+        .expect("seeded device token");
+    let pending = relay_offer(&mut socket, "r-offer-1").await;
+
+    let response = request(
+        &mut socket,
+        "r3",
+        "relay.set_enabled",
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(response["ok"], true, "{response}");
+
+    let offer = parse_connection_offer(&pending.url).expect("offer parses");
+    let token = offer.pairing_token.expect("token embedded");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let rejected = auth.lock().unwrap().exchange(&token, "late-device", now);
+    assert_eq!(
+        rejected.err(),
+        Some(PairingError::InvalidOrUsed),
+        "disable clears unconsumed pairing tokens (spec §2.10)"
+    );
+    assert!(
+        auth.lock().unwrap().authorize(&device_token).unwrap(),
+        "paired device tokens survive a relay disable (spec §2.10)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_offer_is_refused_while_relay_is_disabled() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let (mut socket, _) = fixture.attach().await;
+    let response = request(&mut socket, "r1", "relay.offer", json!({})).await;
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(
+        response["error"].as_str().unwrap().contains("not enabled"),
+        "the refusal must say relay is not enabled: {response}"
+    );
+    // No implicit enable: status stays disabled and no identity was minted.
+    let status = request(&mut socket, "r2", "relay.status", json!({})).await;
+    assert_eq!(status["result"]["enabled"], false, "{status}");
+    assert_eq!(status["result"]["serverId"], Value::Null, "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_pairing_offer_round_trips_and_supersedes_the_prior_token() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let relay = MockRelay::start().await;
+    let (mut socket, _) = fixture.attach().await;
+    enable_relay_against_mock(&fixture, &mut socket, &relay).await;
+    let status = relay_status_reaches(&mut socket, "online", "online against the mock").await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let first = relay_offer(&mut socket, "r-offer-1").await;
+    assert!(
+        first.url.starts_with("https://picot.021521.xyz/#offer="),
+        "{}",
+        first.url
+    );
+    assert!(
+        first.expires_at > now && first.expires_at <= now + 300,
+        "5-minute TTL: {} at {}",
+        first.expires_at,
+        now
+    );
+    let offer = parse_connection_offer(&first.url).expect("offer url round-trips");
+    assert_eq!(offer.v, 2);
+    assert_eq!(offer.server_id, status["serverId"].as_str().unwrap());
+    assert_eq!(offer.relay.endpoint, relay.addr().to_string());
+    assert_eq!(offer.pairing_token_expires_at, Some(first.expires_at));
+
+    // The second mint kills the first token (spec §2.10 `superseded`).
+    let second = relay_offer(&mut socket, "r-offer-2").await;
+    let second_token = parse_connection_offer(&second.url)
+        .unwrap()
+        .pairing_token
+        .unwrap();
+    assert_ne!(second_token, offer.pairing_token.clone().unwrap());
+    let auth = fixture.state.relay.remote_auth_for_tests();
+    assert_eq!(
+        auth.lock()
+            .unwrap()
+            .exchange(offer.pairing_token.as_deref().unwrap(), "sup", now)
+            .err(),
+        Some(PairingError::InvalidOrUsed),
+        "the first token dies the moment the second offer is minted"
+    );
+    assert!(
+        auth.lock()
+            .unwrap()
+            .exchange(&second_token, "sup", now)
+            .is_ok(),
+        "the fresh token exchanges"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -648,7 +907,7 @@ async fn daemon_stop_drains_in_order_and_clears_bookkeeping() {
     // plan D12), and asserting immediately races a loaded machine.
     wait_until(
         Duration::from_secs(10),
-        || steps.steps().len() >= 5,
+        || steps.steps().len() >= 6,
         "the drain to reach its file and exit steps",
     )
     .await;
@@ -657,6 +916,7 @@ async fn daemon_stop_drains_in_order_and_clears_bookkeeping() {
         vec![
             DrainStep::StopAcceptingAdminFrames,
             DrainStep::CloseAdminWs,
+            DrainStep::StopRelayTransport,
             DrainStep::DrainRuntimes,
             DrainStep::DrainFiles,
             DrainStep::Exit,

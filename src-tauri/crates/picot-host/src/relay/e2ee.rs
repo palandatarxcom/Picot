@@ -142,6 +142,23 @@ pub fn load_or_create_identity(store: &SharedMetadataStore) -> Result<DaemonIden
     Ok(identity)
 }
 
+/// Read the persisted identity's serverId without creating one (the
+/// `relay.status` read path): `None` before the first enable, and the same
+/// corrupt-row refusal as [`load_or_create_identity`] — status never papers
+/// over a broken trust anchor.
+pub fn peek_server_id(store: &SharedMetadataStore) -> Result<Option<String>, String> {
+    let guard = store
+        .lock()
+        .map_err(|_| "Picot metadata lock poisoned".to_string())?;
+    let Some(value) = guard.relay_pref_get(IDENTITY_PREFERENCE_KEY)? else {
+        return Ok(None);
+    };
+    let identity: DaemonIdentity = serde_json::from_value(value)
+        .map_err(|error| format!("daemon identity row is corrupt: {error}"))?;
+    identity.validate()?;
+    Ok(Some(identity.server_id))
+}
+
 /// Decode a peer public key from canonical standard base64 (Paseo
 /// `decodePublicKeyBase64` parity: strict shape plus a re-encode comparison),
 /// enforcing the exact 32-byte X25519 length.

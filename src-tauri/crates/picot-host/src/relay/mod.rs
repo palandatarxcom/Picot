@@ -10,9 +10,11 @@
 //! Submodules, mirroring the parent spec §4.1 split:
 //!
 //! - [`e2ee`] — daemon identity keypair, NaCl box crypto, E2EE handshake.
+//! - [`controller`] — enablement lifecycle, status view, pairing-offer ops.
 //! - [`pairing`] — pairing offer payload and `#offer=` fragment URL codec.
 //! - [`transport`] — control/data sockets, reconnect backoff, sync reconcile.
 
+pub mod controller;
 pub mod e2ee;
 pub mod pairing;
 pub mod transport;

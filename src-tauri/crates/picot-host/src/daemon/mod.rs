@@ -50,6 +50,7 @@ use crate::host_server::{self, HostServer};
 use crate::metadata_store::{MetadataStore, SharedMetadataStore};
 use crate::native_pi_manager::NativePiManager;
 use crate::officecli_watch::OfficecliWatchRuntime;
+use crate::relay::controller::RelayController;
 use crate::remote_auth::RemoteAuth;
 use crate::session_ui_profile_store::SessionUiProfileStore;
 use crate::skill_source_registry::SkillSourceRegistry;
@@ -64,13 +65,15 @@ use std::time::Duration;
 
 /// One step of the drain sequence, reported to a [`DrainObserver`].
 ///
-/// The order is fixed by plan Task 3: stop accepting admin frames → close the
-/// admin WS → drain runtimes → files → exit. `DrainFiles` is where T4 removes
-/// the instance file and lock.
+/// The order is fixed by plan Task 3 (extended by the relay plan T6): stop
+/// accepting admin frames → close the admin WS → stop the relay transport →
+/// drain runtimes → files → exit. `DrainFiles` is where T4 removes the
+/// instance file and lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrainStep {
     StopAcceptingAdminFrames,
     CloseAdminWs,
+    StopRelayTransport,
     DrainRuntimes,
     DrainFiles,
     Exit,
@@ -159,6 +162,9 @@ pub struct DaemonState {
     /// The app-process surface (rows A2–A12). A headless daemon supplies the
     /// admin-channel forwarding realization (T3/T5).
     pub app_surface: Arc<dyn AppSurface>,
+    /// The relay lifecycle (plan T6): enablement preference, transport
+    /// start/stop, status, and the pairing-offer face the admin ops call.
+    pub relay: Arc<RelayController>,
     /// Owner close requests awaiting a WebView settlement (R5).
     pub close_requests: OwnerCloseRequests,
     /// The admin channel, once [`Self::install_admin`] ran (T4 starts it in the
@@ -265,7 +271,7 @@ impl DaemonState {
             HostServer::start(
                 cfg.static_dir.clone(),
                 runtimes.clone(),
-                remote_auth,
+                Arc::clone(&remote_auth),
                 Arc::clone(&shared_metadata),
             )
             .await?,
@@ -307,6 +313,21 @@ impl DaemonState {
         let environment_installer = crate::pi_launch::resolve_bundled_pi(&cfg.static_dir)
             .map(|binary| Arc::new(environment_install::Installer::new(binary)))
             .map_err(|error| format!("the embedded Pi is unavailable: {error}"));
+        // Relay lifecycle (plan T6): the controller shares the host's
+        // RemoteAuth pool and feeds decrypted channels back through the host
+        // session bridge. Boot honors the persisted enable flag; a corrupt
+        // identity row refuses the start (logged, never re-keyed) and leaves
+        // the daemon otherwise up.
+        let relay = Arc::new(RelayController::new(
+            Arc::clone(&shared_metadata),
+            host.relay_session_sink(),
+            Arc::clone(&remote_auth),
+        ));
+        if relay.enabled().unwrap_or(false) {
+            if let Err(error) = relay.set_enabled(true).await {
+                log::warn!("[picot-daemon] relay auto-start skipped: {error}");
+            }
+        }
         Ok(Self {
             host_events,
             runtimes,
@@ -320,6 +341,7 @@ impl DaemonState {
             skill_sources,
             install_secret: Arc::new(HostInstallSecret::generate()),
             host,
+            relay,
             environment_installer,
             ephemeral_registry,
             terminals,
@@ -559,8 +581,8 @@ impl DaemonState {
     }
 
     /// Stop everything the process owns, in the drain order the plan fixes:
-    /// stop accepting admin frames → close the admin WS → drain runtimes →
-    /// files → exit.
+    /// stop accepting admin frames → close the admin WS → stop the relay
+    /// transport → drain runtimes → files → exit.
     ///
     /// T4 extends this with the instance file + lock. "Accepted" is not
     /// "completed" (plan D12): signalling the listener is a request; callers
@@ -592,6 +614,11 @@ impl DaemonState {
         if let Some(admin) = self.admin() {
             admin.close_connections();
         }
+        // Relay stop sits after the admin close (plan T6 drain order): no
+        // admin op can race the teardown, and the stop itself is a local
+        // close — an unreachable relay can never stall the shutdown.
+        self.observe_drain(DrainStep::StopRelayTransport);
+        self.relay.stop_transport().await;
         self.observe_drain(DrainStep::DrainRuntimes);
         self.drain_runtimes().await;
         self.observe_drain(DrainStep::DrainFiles);
