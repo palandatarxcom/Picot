@@ -791,6 +791,34 @@
         "suspended": "Suspended",
         "crashed": "Crashed",
         "stopped": "Stopped"
+      },
+      "pairDevice": {
+        "title": "Pair a device",
+        "subtitle": "Connect to this Picot from another device.",
+        "open": "Set up",
+        "enableTitle": "Enable remote pairing?",
+        "enableDescription": "The daemon connects out to the company relay ({endpoint}). The channel is end-to-end encrypted — the relay only ever sees ciphertext. A paired device gets full access to this Picot.",
+        "keepRunningHint": "Quitting Picot stops the daemon, which also drops every remote connection. Keep \u201cKeep agents running after quitting\u201d on to stay reachable.",
+        "notNow": "Not now",
+        "enable": "Enable",
+        "offerTitle": "Pair a device",
+        "requiresClient": "Scanning needs a Picot client app, which is not available yet. The code and link below are for when it ships.",
+        "state": {
+          "online": "Relay connected",
+          "offline": "Relay not connected",
+          "connecting": "Connecting to relay"
+        },
+        "urlLabel": "Pairing link",
+        "copy": "Copy link",
+        "copied": "Copied",
+        "regenerate": "New code",
+        "regenerateNotice": "A new pairing code was minted; the previous one no longer works.",
+        "securityWarning": "Treat the pairing code like a password: anyone holding it can access everything in this Picot.",
+        "disable": "Turn off",
+        "readFailed": "Could not read the relay state: {reason}",
+        "enableFailed": "Could not enable remote pairing: {reason}",
+        "offerFailed": "Could not create a pairing code: {reason}",
+        "disableFailed": "Could not turn off remote pairing: {reason}"
       }
     },
     "extensions": "Extension packages",

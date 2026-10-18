@@ -791,6 +791,34 @@
         "suspended": "Suspendido",
         "crashed": "Bloqueado",
         "stopped": "Detenido"
+      },
+      "pairDevice": {
+        "title": "Vincular un dispositivo",
+        "subtitle": "Conéctate a este Picot desde otro dispositivo.",
+        "open": "Configurar",
+        "enableTitle": "¿Activar el emparejamiento remoto?",
+        "enableDescription": "El daemon se conecta al relay de la empresa ({endpoint}). El canal está cifrado de extremo a extremo: el relay solo ve texto cifrado. Un dispositivo vinculado obtiene acceso completo a este Picot.",
+        "keepRunningHint": "Salir de Picot detiene el daemon y con él todas las conexiones remotas. Mantén activado «Mantener agentes ejecutándose tras salir» para seguir accesible.",
+        "notNow": "Ahora no",
+        "enable": "Activar",
+        "offerTitle": "Vincular un dispositivo",
+        "requiresClient": "El escaneo requiere la app cliente de Picot, que aún no está disponible. El código y el enlace de abajo son para cuando se publique.",
+        "state": {
+          "online": "Relay conectado",
+          "offline": "Relay sin conexión",
+          "connecting": "Conectando al relay"
+        },
+        "urlLabel": "Enlace de emparejamiento",
+        "copy": "Copiar enlace",
+        "copied": "Copiado",
+        "regenerate": "Nuevo código",
+        "regenerateNotice": "Se emitió un código nuevo; el anterior ya no funciona.",
+        "securityWarning": "Trata el código de emparejamiento como una contraseña: quien lo tenga puede acceder a todo lo que hay en este Picot.",
+        "disable": "Desactivar",
+        "readFailed": "No se pudo leer el estado del relay: {reason}",
+        "enableFailed": "No se pudo activar el emparejamiento remoto: {reason}",
+        "offerFailed": "No se pudo crear el código de emparejamiento: {reason}",
+        "disableFailed": "No se pudo desactivar el emparejamiento remoto: {reason}"
       }
     },
     "extensions": "Paquetes de extensión",

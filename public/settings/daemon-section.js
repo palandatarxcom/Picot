@@ -3,6 +3,7 @@
 // ABOUTME: permanent running-agents list with its per-runtime stop.
 
 import { t as i18n, onLocaleChange } from "../i18n.js";
+import { setupPairDeviceSection } from "./pair-device-section.js";
 
 /**
  * How often the status row refreshes while the Settings panel is open. The
@@ -149,6 +150,11 @@ export function setupDaemonSection({
   let stoppingId = null;
   let pollTimer = null;
 
+  // The Pair Device block lives in this same section (relay Phase 2, spec
+  // §3.2): its lifecycle and poll are this section's, so its reads ride
+  // refreshAll and its leave rides this section's leave.
+  const pairDevice = setupPairDeviceSection({ root, t });
+
   function setNotice(message) {
     if (!message) {
       noticeEl.textContent = "";
@@ -219,6 +225,15 @@ export function setupDaemonSection({
     }
     render();
     return status;
+  }
+
+  /**
+   * One poll tick: the daemon row first, then the pair block with the fresh
+   * status document (its consent warning reads keepRunningAfterQuit from it).
+   */
+  async function refreshAll() {
+    const fresh = await refresh();
+    await pairDevice.refresh(fresh);
   }
 
   function stopPolling() {
@@ -479,15 +494,16 @@ export function setupDaemonSection({
       closeConfirm();
       closeStopConfirm();
       confirmRowText();
-      await refresh();
+      await refreshAll();
       stopPolling();
       pollTimer = setInterval(() => {
-        void refresh();
+        void refreshAll();
       }, POLL_INTERVAL_MS);
     },
     /** Close the section: stop polling and drop the pending confirm. */
     leave() {
       active = false;
+      pairDevice.leave();
       stopPolling();
       closeConfirm();
       closeStopConfirm();

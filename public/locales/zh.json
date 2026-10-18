@@ -791,6 +791,34 @@
         "suspended": "已挂起",
         "crashed": "已崩溃",
         "stopped": "已停止"
+      },
+      "pairDevice": {
+        "title": "配对设备",
+        "subtitle": "从其他设备连接这台 Picot。",
+        "open": "开始配对",
+        "enableTitle": "启用远程配对？",
+        "enableDescription": "守护进程会主动连接公司中继（{endpoint}）。通道端到端加密，中继只能看到密文。配对成功的设备将拥有这台 Picot 的完整访问权。",
+        "keepRunningHint": "退出 Picot 会停掉守护进程，远程连接也会随之中断。想保持可连接，请打开「退出后保持代理运行」。",
+        "notNow": "暂不",
+        "enable": "启用",
+        "offerTitle": "配对设备",
+        "requiresClient": "扫码需要 Picot 客户端，目前尚未发布。下方的配对码和链接供客户端上线后使用。",
+        "state": {
+          "online": "中继已连接",
+          "offline": "中继未连接",
+          "connecting": "正在连接中继"
+        },
+        "urlLabel": "配对链接",
+        "copy": "复制链接",
+        "copied": "已复制",
+        "regenerate": "重新生成",
+        "regenerateNotice": "已生成新的配对码，旧配对码已作废。",
+        "securityWarning": "配对码等同于密码：拿到它的人可以完全访问这台 Picot，请勿转发或截图外发。",
+        "disable": "停用",
+        "readFailed": "无法读取中继状态：{reason}",
+        "enableFailed": "无法启用远程配对：{reason}",
+        "offerFailed": "无法生成配对码：{reason}",
+        "disableFailed": "无法停用远程配对：{reason}"
       }
     },
     "extensions": "扩展包",

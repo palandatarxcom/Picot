@@ -1354,6 +1354,136 @@
                     >
                       Restart now
                     </button>
+            <!-- Settings → General → Daemon → Pair Device (relay Phase 2,
+                 spec §3.2): Paseo's two states — a collapsed row while relay
+                 is off (opens the consent copy), the offer state (state line +
+                 QR + read-only link + warning) while it is on. Wired by
+                 daemon-section alongside its own lifecycle. -->
+            <div class="settings-row" id="setting-pair-device">
+              <span class="settings-label settings-label-stack">
+                <span
+                  class="settings-label-main"
+                  data-i18n="settings.daemon.pairDevice.title"
+                  >Pair a device</span
+                >
+                <span
+                  class="settings-label-sub"
+                  data-i18n="settings.daemon.pairDevice.subtitle"
+                  >Connect to this Picot from another device.</span
+                >
+              </span>
+              <button
+                class="settings-value-btn"
+                id="btn-pair-device-open"
+                data-i18n="settings.daemon.pairDevice.open"
+              >
+                Set up
+              </button>
+            </div>
+            <p
+              class="settings-help hidden"
+              id="pair-device-notice"
+              aria-live="polite"
+            ></p>
+            <div class="settings-row" id="pair-device-consent" hidden>
+              <div class="daemon-confirm">
+                <span
+                  class="settings-label-main"
+                  id="pair-device-consent-title"
+                ></span>
+                <p class="settings-help pair-device-consent-copy">
+                  <span
+                    class="pair-device-shield"
+                    id="pair-device-shield"
+                    aria-hidden="true"
+                  ></span>
+                  <span id="pair-device-consent-text"></span>
+                </p>
+                <p
+                  class="settings-help"
+                  id="pair-device-keep-running-hint"
+                  hidden
+                ></p>
+                <div class="daemon-confirm-actions">
+                  <button
+                    class="settings-value-btn"
+                    id="btn-pair-device-cancel"
+                    data-i18n="settings.daemon.pairDevice.notNow"
+                  >
+                    Not now
+                  </button>
+                  <button
+                    class="settings-value-btn is-primary"
+                    id="btn-pair-device-enable"
+                    data-i18n="settings.daemon.pairDevice.enable"
+                  >
+                    Enable
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="settings-row" id="pair-device-offer" hidden>
+              <div class="daemon-agents">
+                <span
+                  class="settings-label-main"
+                  data-i18n="settings.daemon.pairDevice.offerTitle"
+                  >Pair a device</span
+                >
+                <span class="settings-label-sub" id="pair-device-state"></span>
+                <p
+                  class="settings-help"
+                  data-i18n="settings.daemon.pairDevice.requiresClient"
+                >
+                  Scanning needs a Picot client app, which is not available
+                  yet.
+                </p>
+                <div class="pair-device-offer-body">
+                  <canvas
+                    id="pair-device-qr"
+                    class="hidden"
+                    width="200"
+                    height="200"
+                  ></canvas>
+                  <div class="pair-device-link">
+                    <input
+                      class="pair-device-url"
+                      id="pair-device-url"
+                      readonly
+                      data-i18n-aria-label="settings.daemon.pairDevice.urlLabel"
+                    />
+                    <div class="daemon-confirm-actions">
+                      <button
+                        class="settings-value-btn"
+                        id="btn-pair-device-copy"
+                        data-i18n="settings.daemon.pairDevice.copy"
+                      >
+                        Copy link
+                      </button>
+                      <button
+                        class="settings-value-btn"
+                        id="btn-pair-device-regenerate"
+                        data-i18n="settings.daemon.pairDevice.regenerate"
+                      >
+                        New code
+                      </button>
+                      <button
+                        class="settings-value-btn"
+                        id="btn-pair-device-disable"
+                        data-i18n="settings.daemon.pairDevice.disable"
+                      >
+                        Turn off
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <p
+                  class="settings-help pair-device-warning"
+                  data-i18n="settings.daemon.pairDevice.securityWarning"
+                >
+                  Treat the pairing code like a password.
+                </p>
+              </div>
+            </div>
                   </div>
                 </div>
               </div>

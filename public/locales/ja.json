@@ -791,6 +791,34 @@
         "suspended": "一時停止中",
         "crashed": "クラッシュ",
         "stopped": "停止"
+      },
+      "pairDevice": {
+        "title": "デバイスをペアリング",
+        "subtitle": "別のデバイスからこの Picot に接続します。",
+        "open": "設定する",
+        "enableTitle": "リモートペアリングを有効にしますか？",
+        "enableDescription": "デーモンは会社のリレー（{endpoint}）へ外向きに接続します。経路はエンドツーエンドで暗号化され、リレーが見るのは暗号文だけです。ペアリングしたデバイスはこの Picot へ完全にアクセスできます。",
+        "keepRunningHint": "Picot を終了するとデーモンも停止し、リモート接続はすべて切れます。接続を維持するには「終了後もエージェントを動かし続ける」をオンにしてください。",
+        "notNow": "今はしない",
+        "enable": "有効にする",
+        "offerTitle": "デバイスをペアリング",
+        "requiresClient": "スキャンには Picot クライアントアプリが必要で、まだ公開されていません。下のコードとリンクは公開後のために示しています。",
+        "state": {
+          "online": "リレーに接続済み",
+          "offline": "リレー未接続",
+          "connecting": "リレーに接続中"
+        },
+        "urlLabel": "ペアリングリンク",
+        "copy": "リンクをコピー",
+        "copied": "コピーしました",
+        "regenerate": "新しいコード",
+        "regenerateNotice": "新しいペアリングコードを発行しました。以前のコードは無効です。",
+        "securityWarning": "ペアリングコードはパスワードと同じ扱いです。持っている人はこの Picot のすべてにアクセスできます。",
+        "disable": "オフにする",
+        "readFailed": "リレーの状態を読み取れませんでした：{reason}",
+        "enableFailed": "リモートペアリングを有効にできませんでした：{reason}",
+        "offerFailed": "ペアリングコードを作成できませんでした：{reason}",
+        "disableFailed": "リモートペアリングをオフにできませんでした：{reason}"
       }
     },
     "extensions": "拡張パッケージ",

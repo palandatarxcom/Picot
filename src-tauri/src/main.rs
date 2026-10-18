@@ -16,7 +16,8 @@ mod daemon_client;
 
 use daemon_client::admin_client::{AdminClient, SurfaceExecutor};
 use daemon_client::commands::{
-    daemon_agent_stop, daemon_restart, daemon_set_keep_running, daemon_status,
+    daemon_agent_stop, daemon_restart, daemon_set_keep_running, daemon_status, relay_offer,
+    relay_set_enabled, relay_status,
 };
 use daemon_client::exit_waiter::{ExitWaiter, ProcessIdentity};
 use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
@@ -3253,7 +3254,10 @@ fn main() {
             daemon_status,
             daemon_set_keep_running,
             daemon_restart,
-            daemon_agent_stop
+            daemon_agent_stop,
+            relay_status,
+            relay_set_enabled,
+            relay_offer
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

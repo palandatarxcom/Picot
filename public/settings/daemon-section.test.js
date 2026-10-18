@@ -139,6 +139,13 @@ function mountInvoke({
 } = {}) {
   const calls = [];
   const invoke = vi.fn(async (command, args) => {
+    // The Pair Device block rides this section's lifecycle; its relay reads
+    // are answered but not recorded — its behavior has its own suite.
+    if (command === "relay_status") {
+      return { enabled: false, state: "offline", endpoint: "paseo.021521.xyz:443", serverId: null };
+    }
+    if (command === "relay_set_enabled") return { enabled: args?.enabled };
+    if (command === "relay_offer") throw new Error("relay is not enabled");
     calls.push({ command, args });
     if (command === "daemon_status") {
       if (status instanceof Error) throw status;
@@ -639,10 +646,11 @@ describe("locale coverage", () => {
     // Every branch that renders copy, through the real module + real markup.
     await renderEveryBranch();
 
-    const keys = new Set([
-      ...requested,
-      ...MARKUP_KEYS.filter((key) => key.startsWith(SECTION_KEYS)),
-    ]);
+    // The pairDevice subtree has its own coverage suite
+    // (pair-device-section.test.js): its keys are excluded on both sides.
+    const isDaemonKey = (key) =>
+      key.startsWith(SECTION_KEYS) && !key.startsWith(`${SECTION_KEYS}pairDevice.`);
+    const keys = new Set([...requested, ...MARKUP_KEYS].filter(isDaemonKey));
     expect(keys.size).toBeGreaterThan(10);
     for (const key of requested) {
       expect(key.startsWith(SECTION_KEYS)).toBe(true);
@@ -659,7 +667,7 @@ describe("locale coverage", () => {
       }
     }
     // No unused copy in en.json (the reference locale).
-    const declared = leafKeys(EN.settings.daemon, SECTION_KEYS);
+    const declared = leafKeys(EN.settings.daemon, SECTION_KEYS).filter(isDaemonKey);
     expect([...declared].sort()).toEqual([...keys].sort());
   });
 });

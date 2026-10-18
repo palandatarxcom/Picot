@@ -10,6 +10,8 @@
 //! | `daemon_status` | the settings section's state: the daemon's own facts plus the app-private `keepRunningAfterQuit` (plan T10: the policy is merged app-side, which is the R2 get-gap) |
 //! | `daemon_set_keep_running` | writes the policy file and **nothing else** — no probe, no request, no restart (spec §3.2.2) |
 //! | `daemon_restart` | shells into [`crate::run_restart`]'s T9 transaction |
+//! | `daemon_agent_stop` | stops one exact Pi runtime (closing a session tab) |
+//! | `relay_status` / `relay_set_enabled` / `relay_offer` | the Pair Device block's three relay ops (relay Phase 2, plan T6), forwarded over the daemon's admin channel |
 //!
 //! Two rules are load-bearing, because they are caller-validation rules rather
 //! than UI concerns:
@@ -172,6 +174,45 @@ pub async fn daemon_agent_stop(
     agent_stop_payload(reply)
 }
 
+/// The Pair Device block's state read (relay Phase 2, plan T6): the daemon's
+/// `relay.status` op forwarded over the admin channel. The daemon owns the
+/// facts; this command owns only the caller check.
+#[tauri::command]
+pub async fn relay_status(window: tauri::WebviewWindow, app: AppHandle) -> Result<Value, String> {
+    let link = caller_link(&app, &window)?;
+    let reply = link.client().request("relay.status", json!({})).await;
+    relay_status_payload(reply)
+}
+
+/// Enable or disable the daemon's outbound relay (the Pair Device consent's
+/// Enable and the offer state's Turn-off). The daemon owns everything this
+/// does — persisting the choice, starting/stopping the transport, clearing
+/// unconsumed pairing tokens on disable — so this command only carries the
+/// caller check.
+#[tauri::command]
+pub async fn relay_set_enabled(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    enabled: bool,
+) -> Result<Value, String> {
+    let link = caller_link(&app, &window)?;
+    let reply = link
+        .client()
+        .request("relay.set_enabled", json!({ "enabled": enabled }))
+        .await;
+    relay_set_enabled_payload(reply)
+}
+
+/// Mint a fresh one-scan pairing offer (the QR/copy URL plus its expiry).
+/// Each mint supersedes the previous unconsumed token (plan D12), so this is
+/// a pass-through of exactly `{url, expiresAt}`.
+#[tauri::command]
+pub async fn relay_offer(window: tauri::WebviewWindow, app: AppHandle) -> Result<Value, String> {
+    let link = caller_link(&app, &window)?;
+    let reply = link.client().request("relay.offer", json!({})).await;
+    relay_offer_payload(reply)
+}
+
 /// Validate the caller against the two injected states and hand back the
 /// daemon link. Every command starts here; none of them trusts an argument for
 /// its own identity.
@@ -232,6 +273,48 @@ pub fn agent_stop_payload(reply: Result<Value, String>) -> Result<Value, String>
             "sessionId": stopped.get("sessionId").cloned().unwrap_or(Value::Null),
             "instanceId": stopped.get("instanceId").cloned().unwrap_or(Value::Null),
         }
+    }))
+}
+
+/// The `relay.status` reply, forwarded by name: the offer state row renders
+/// exactly `enabled`/`state`/`endpoint`/`serverId` (`serverId` is `None`
+/// before the first enable and forwards as null). Nothing else from the
+/// daemon's reply reaches the WebView.
+pub fn relay_status_payload(reply: Result<Value, String>) -> Result<Value, String> {
+    let reply = reply?;
+    Ok(json!({
+        "enabled": reply.get("enabled").cloned().unwrap_or(Value::Null),
+        "state": reply.get("state").cloned().unwrap_or(Value::Null),
+        "endpoint": reply.get("endpoint").cloned().unwrap_or(Value::Null),
+        "serverId": reply.get("serverId").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+/// The `relay.set_enabled` confirmation: the persisted flag the daemon echoes,
+/// and nothing else. A reply without the echo is a failure, not a success the
+/// panel would render as its new state.
+pub fn relay_set_enabled_payload(reply: Result<Value, String>) -> Result<Value, String> {
+    let reply = reply?;
+    let enabled = reply
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "the daemon did not confirm the relay enablement".to_string())?;
+    Ok(json!({ "enabled": enabled }))
+}
+
+/// The `relay.offer` result: the QR/copy URL and its expiry. A reply without
+/// a usable URL is a failure, never a silent empty offer the panel would
+/// render as a dead QR.
+pub fn relay_offer_payload(reply: Result<Value, String>) -> Result<Value, String> {
+    let reply = reply?;
+    let url = reply
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "the daemon returned no pairing offer URL".to_string())?;
+    Ok(json!({
+        "url": url,
+        "expiresAt": reply.get("expiresAt").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -518,6 +601,93 @@ mod tests {
         let bare = agent_stop_payload(Ok(json!({"accepted": true})))
             .expect_err("an unconfirmed stop is a failure");
         assert!(bare.contains("did not confirm"), "{bare}");
+    }
+
+    // ─── The relay payloads (plan T6 slice 2) ──────────────────────────────
+
+    /// The status the Pair Device panel renders, forwarded by name, with the
+    /// pre-enable `serverId: null` preserved. Whatever else the daemon's
+    /// reply grows stays behind.
+    #[test]
+    fn the_relay_status_payload_forwards_the_four_fields_only() {
+        let payload = relay_status_payload(Ok(json!({
+            "enabled": true,
+            "state": "connecting",
+            "endpoint": "paseo.021521.xyz:443",
+            "serverId": null,
+            // Never forwarded, whatever the daemon happens to add later.
+            "pairingToken": "picot_pair_secret",
+        })))
+        .expect("a status reply");
+        assert_eq!(payload["enabled"], true);
+        assert_eq!(payload["state"], "connecting");
+        assert_eq!(payload["endpoint"], "paseo.021521.xyz:443");
+        assert_eq!(payload["serverId"], Value::Null);
+        let mut keys = payload
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["enabled", "endpoint", "serverId", "state"],
+            "the payload carries the state row and nothing else: {payload}"
+        );
+        let encoded = payload.to_string();
+        assert!(!encoded.contains("picot_pair_secret"), "{encoded}");
+    }
+
+    #[test]
+    fn a_relay_status_refusal_stays_a_refusal() {
+        assert_eq!(
+            relay_status_payload(Err("relay status unavailable: lock poisoned".to_string())),
+            Err("relay status unavailable: lock poisoned".to_string())
+        );
+    }
+
+    #[test]
+    fn the_relay_set_enabled_payload_requires_the_daemons_echo() {
+        assert_eq!(
+            relay_set_enabled_payload(Ok(json!({ "enabled": true }))).unwrap()["enabled"],
+            true
+        );
+        let bare = relay_set_enabled_payload(Ok(json!({ "accepted": true })))
+            .expect_err("a reply without the echo is a failure");
+        assert!(bare.contains("did not confirm"), "{bare}");
+        assert_eq!(
+            relay_set_enabled_payload(Err("relay enablement failed".to_string())),
+            Err("relay enablement failed".to_string())
+        );
+    }
+
+    /// The offer the QR renders: the URL is the payload (it *is* the pairing
+    /// credential) but anything else the daemon's reply carries stays behind.
+    #[test]
+    fn the_relay_offer_payload_forwards_the_url_and_expiry_only() {
+        let payload = relay_offer_payload(Ok(json!({
+            "url": "https://picot.021521.xyz/#offer=abc",
+            "expiresAt": 4000000000u64,
+            "serverId": "srv-1",
+        })))
+        .expect("an offer");
+        assert_eq!(payload["url"], "https://picot.021521.xyz/#offer=abc");
+        assert_eq!(payload["expiresAt"], 4000000000u64);
+        let mut keys = payload
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["expiresAt", "url"],
+            "the payload carries the offer and nothing else: {payload}"
+        );
+        let bare = relay_offer_payload(Ok(json!({ "expiresAt": 4000000000u64 })))
+            .expect_err("an offer without a URL is a failure");
+        assert!(bare.contains("no pairing offer URL"), "{bare}");
+        assert!(relay_offer_payload(Ok(json!({ "url": "" }))).is_err());
     }
 
     // ─── The restart report ─────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-# The three daemon admin commands (plan D8/T10). Their identifiers must stay in
+# The daemon admin and relay commands (plan D8/T10, relay Phase 2 plan T6). Their identifiers must stay in
 # step with `daemon_client::commands::COMMAND_*` and the `generate_handler!`
 # block: scripts/check-tauri-permissions.js fails when a registered command is
 # missing here, or when its allow-* entry is missing from [default] below.
@@ -27,6 +27,23 @@ identifier = "allow-daemon-agent-stop"
 description = "Allow stopping one exact Pi runtime by its full identity (closing a session tab)"
 commands.allow = ["daemon_agent_stop"]
 
+# The Pair Device block's three relay commands (relay Phase 2, plan T6): the
+# same caller check as the daemon commands above gates each one.
+[[permission]]
+identifier = "allow-relay-status"
+description = "Allow reading the daemon's relay state (Settings → General → Daemon → Pair Device)"
+commands.allow = ["relay_status"]
+
+[[permission]]
+identifier = "allow-relay-set-enabled"
+description = "Allow enabling or disabling the daemon's outbound relay (Settings → General → Daemon → Pair Device)"
+commands.allow = ["relay_set_enabled"]
+
+[[permission]]
+identifier = "allow-relay-offer"
+description = "Allow minting a one-scan relay pairing offer (Settings → General → Daemon → Pair Device)"
+commands.allow = ["relay_offer"]
+
 # Permission set that bundles all custom command permissions.
 # Referenced from capabilities/default.json as "pi-desktop:default".
 [default]
@@ -36,4 +53,7 @@ permissions = [
   "allow-daemon-set-keep-running",
   "allow-daemon-restart",
   "allow-daemon-agent-stop",
+  "allow-relay-status",
+  "allow-relay-set-enabled",
+  "allow-relay-offer",
 ]

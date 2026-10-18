@@ -3291,6 +3291,44 @@ body.landing-mode #landing {
 .daemon-agent-stop {
   margin-inline-start: var(--space-2);
 }
+
+/* Settings → General → Daemon → Pair Device: the consent's shield badge and
+   the offer body (QR beside the read-only link and its action row). */
+.pair-device-consent-copy {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.pair-device-shield {
+  display: inline-flex;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.pair-device-offer-body {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.pair-device-link {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 220px;
+}
+
+.pair-device-url {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
 .daemon-confirm-actions {
   display: flex;
   justify-content: flex-end;
