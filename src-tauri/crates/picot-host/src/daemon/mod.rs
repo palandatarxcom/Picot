@@ -543,6 +543,14 @@ impl DaemonState {
                 &self.app_surface,
             )),
         ));
+        // Multi-window §7: a clicked notification routes through one
+        // app-side decision point, so the activation travels the same channel
+        // every other forwarded row uses.
+        self.host.set_notification_forwarder(Arc::new(
+            crate::daemon::surface_forward::AppSurfaceNotificationForwarder::new(Arc::clone(
+                &self.app_surface,
+            )),
+        ));
     }
 
     /// The host origin every op resolves against (`http://127.0.0.1:<port>`).

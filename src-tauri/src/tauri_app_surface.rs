@@ -95,6 +95,14 @@ impl AppSurface for TauriAppSurface {
         window.set_focus().map_err(|error| error.to_string())
     }
 
+    /// Multi-window §7 — the single decision point. The daemon only carried
+    /// the click over; the ledger, the live routes and the focus stamps the
+    /// decision needs are all here, so the snapshot, the pick and the
+    /// execution happen in the app (see `notification_executor`).
+    async fn notification_activated(&self, payload: Value) -> Result<(), String> {
+        crate::daemon_client::notification_executor::route_click(&self.app, &payload).await
+    }
+
     /// Row A10 — settle the approval, then close. The pending map (D4) is
     /// keyed by owner: the label the daemon passes is resolved app-side, where
     /// the registry lives, exactly as the app's own close delegate does. The

@@ -35,6 +35,7 @@ import {
 } from "./i18n.js";
 import { createIcon, replaceButtonGlyph, setButtonIcon } from "./icons.js";
 import { setupLandingConfigRuntime } from "./landing/landing-config-runtime.js";
+import { setupNotificationWindowEvents } from "./notification-window-events.js";
 import { renderPackageInstallFailure } from "./packages/install-status.js";
 import {
   createPreferencesClient,
@@ -148,6 +149,13 @@ function renderLandingNotice(message) {
   notice.textContent = message;
   notice.classList.remove("hidden");
 }
+
+// A landing window never navigates in-window, but it can be the carrier of
+// the notification click's open request (multi-window §7 rule 3).
+setupNotificationWindowEvents({
+  transport,
+  onNotice: (message) => renderLandingNotice(message),
+});
 
 // Null-safe navigation snapshot: chat fields are absent at landing; only the
 // sidebar state (expansion/search/scroll) carries across the transition.

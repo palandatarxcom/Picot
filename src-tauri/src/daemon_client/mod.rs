@@ -66,6 +66,7 @@ pub mod commands;
 pub mod exit_waiter;
 pub mod manager;
 pub mod navigation_mirror;
+pub mod notification_executor;
 pub mod notification_routing;
 pub mod quit_policy;
 pub mod restart;

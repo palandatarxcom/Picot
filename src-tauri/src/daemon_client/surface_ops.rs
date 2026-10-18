@@ -91,6 +91,12 @@ impl SurfaceExecutor for ForwardedSurfaceOps {
                     .await?;
                 Ok(Value::Null)
             }
+            wire::OP_NOTIFICATION_ACTIVATED => {
+                self.surface
+                    .notification_activated(arg(&args, wire::ARG_PAYLOAD)?)
+                    .await?;
+                Ok(Value::Null)
+            }
             wire::OP_CLOSE_WINDOW => {
                 self.surface
                     .close_window(
@@ -204,6 +210,11 @@ mod tests {
 
         async fn focus_window(&self, label: &str) -> Result<(), String> {
             self.record("focus_window", json!(label));
+            Ok(())
+        }
+
+        async fn notification_activated(&self, payload: Value) -> Result<(), String> {
+            self.record("notification_activated", payload);
             Ok(())
         }
 
@@ -321,6 +332,21 @@ mod tests {
         .expect("focus_window");
         run(
             Arc::clone(&surface),
+            wire::OP_NOTIFICATION_ACTIVATED,
+            json!({
+                "payload": {
+                    "type": "notification_activated",
+                    "workspaceId": "w1",
+                    "sessionId": "s1",
+                    "sessionFile": "/tmp/sessions/w1/s1.jsonl",
+                    "cwd": "/tmp/proj",
+                }
+            }),
+        )
+        .await
+        .expect("notification_activated");
+        run(
+            Arc::clone(&surface),
             wire::OP_CLOSE_WINDOW,
             json!({"label": "native-landing", "requestId": "close-1"}),
         )
@@ -384,7 +410,7 @@ mod tests {
         .expect("download_and_install_update");
 
         let calls = surface.calls();
-        assert_eq!(calls.len(), 13, "one call per forwarded row: {calls:?}");
+        assert_eq!(calls.len(), 14, "one call per forwarded row: {calls:?}");
         assert_eq!(calls[0].0, "open_workspace_window");
         assert_eq!(
             calls[0].1,
@@ -404,9 +430,24 @@ mod tests {
         );
         assert_eq!(calls[2].0, "focus_window");
         assert_eq!(calls[2].1, json!("native-workspace-w1"));
-        assert_eq!(calls[3].1, json!(["native-landing", "close-1"]));
         assert_eq!(
-            calls[7].1,
+            calls[3].0, "notification_activated",
+            "the notification op is decoded between focus_window and close_window"
+        );
+        assert_eq!(
+            calls[3].1,
+            json!({
+                "type": "notification_activated",
+                "workspaceId": "w1",
+                "sessionId": "s1",
+                "sessionFile": "/tmp/sessions/w1/s1.jsonl",
+                "cwd": "/tmp/proj",
+            }),
+            "the payload reaches the surface exactly as the daemon sent it"
+        );
+        assert_eq!(calls[4].1, json!(["native-landing", "close-1"]));
+        assert_eq!(
+            calls[8].1,
             json!({
                 "kind": "create",
                 "paneId": "p1",
@@ -416,10 +457,10 @@ mod tests {
             }),
             "the pane op survives the round trip with its exact shape"
         );
-        assert_eq!(calls[8].0, "pick_folder");
-        assert_eq!(calls[9].1, json!("/tmp/images"));
+        assert_eq!(calls[9].0, "pick_folder");
+        assert_eq!(calls[10].1, json!("/tmp/images"));
         assert_eq!(
-            calls[10].1,
+            calls[11].1,
             json!([
                 "http://127.0.0.1:51000",
                 "/v2/session-export/0123456789abcdef0123456789abcdef",
@@ -427,7 +468,7 @@ mod tests {
                 null
             ])
         );
-        assert_eq!(calls[12].0, "download_and_install_update");
+        assert_eq!(calls[13].0, "download_and_install_update");
     }
 
     #[tokio::test]

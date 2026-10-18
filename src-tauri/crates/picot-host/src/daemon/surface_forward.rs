@@ -38,9 +38,10 @@ pub mod wire {
     pub const APP_SURFACE_UNAVAILABLE: &str = "app_surface_unavailable";
 
     /// The `app_surface_request` op names: the plan's table order with the
-    /// multi-window §6.3 `focus_window` op appended (the table predates
-    /// multi-window; the fixture in `tests/admin_surface.rs` pins this list).
-    pub const SURFACE_OPS: [&str; 13] = [
+    /// multi-window §6.3 `focus_window` and §7 `notification_activated` ops
+    /// appended (the table predates multi-window; the fixture in
+    /// `tests/admin_surface.rs` pins this list).
+    pub const SURFACE_OPS: [&str; 14] = [
         "open_workspace_window",
         "open_devtools",
         "close_window",
@@ -54,6 +55,7 @@ pub mod wire {
         "check_for_update",
         "download_and_install_update",
         "focus_window",
+        "notification_activated",
     ];
 
     pub const OP_OPEN_WORKSPACE_WINDOW: &str = SURFACE_OPS[0];
@@ -69,6 +71,7 @@ pub mod wire {
     pub const OP_CHECK_FOR_UPDATE: &str = SURFACE_OPS[10];
     pub const OP_DOWNLOAD_AND_INSTALL_UPDATE: &str = SURFACE_OPS[11];
     pub const OP_FOCUS_WINDOW: &str = SURFACE_OPS[12];
+    pub const OP_NOTIFICATION_ACTIVATED: &str = SURFACE_OPS[13];
 
     pub const ARG_HOST_ORIGIN: &str = "hostOrigin";
     pub const ARG_TARGET: &str = "target";
@@ -81,6 +84,7 @@ pub mod wire {
     pub const ARG_FILE_NAME: &str = "fileName";
     pub const ARG_OP: &str = "op";
     pub const ARG_ERROR: &str = "error";
+    pub const ARG_PAYLOAD: &str = "payload";
 }
 
 /// The typed, fail-closed error for a forwarded row the app cannot serve.
@@ -184,6 +188,14 @@ impl AppSurface for AdminForwardingSurface {
     async fn focus_window(&self, label: &str) -> Result<(), String> {
         self.forward_void(wire::OP_FOCUS_WINDOW, json!({ wire::ARG_LABEL: label }))
             .await
+    }
+
+    async fn notification_activated(&self, payload: Value) -> Result<(), String> {
+        self.forward_void(
+            wire::OP_NOTIFICATION_ACTIVATED,
+            json!({ wire::ARG_PAYLOAD: payload }),
+        )
+        .await
     }
 
     async fn close_window(&self, label: &str, request_id: &str) -> Result<(), String> {
@@ -290,6 +302,27 @@ impl AppSurfacePaneForwarder {
 impl crate::host_server::PaneForwarder for AppSurfacePaneForwarder {
     async fn forward_pane(&self, op: PaneOp) -> Result<Value, String> {
         self.surface.pane(op).await
+    }
+}
+
+/// The daemon's [`crate::host_server::NotificationForwarder`]: the same
+/// forwarding realization — a notification-click activation travels to the app
+/// as one `app_surface_request` op beside the data-plane broadcast it shadows
+/// (multi-window §7).
+pub struct AppSurfaceNotificationForwarder {
+    surface: Arc<dyn AppSurface>,
+}
+
+impl AppSurfaceNotificationForwarder {
+    pub fn new(surface: Arc<dyn AppSurface>) -> Self {
+        Self { surface }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::host_server::NotificationForwarder for AppSurfaceNotificationForwarder {
+    async fn notification_activated(&self, payload: Value) -> Result<(), String> {
+        self.surface.notification_activated(payload).await
     }
 }
 

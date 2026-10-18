@@ -76,6 +76,20 @@ pub trait PaneForwarder: Send + Sync {
     /// Run one child-webview op app-side; `Err` carries the app's message.
     async fn forward_pane(&self, op: PaneOp) -> Result<Value, String>;
 }
+
+/// Notification-click forwarding (multi-window §7).
+///
+/// Every client still receives the `notification_activated` broadcast (a
+/// plain browser tab has no app process to decide for it), but inside the app
+/// exactly one window may move: the decision needs the app's window facts
+/// (ledger, live routes, focus stamps), so the click is forwarded over this
+/// seam and routed there. A host without a forwarder keeps the broadcast-only
+/// behavior — no window moves app-side, which is today's single-window norm.
+#[async_trait::async_trait]
+pub trait NotificationForwarder: Send + Sync {
+    /// Carry one activation over, with the payload exactly as broadcast.
+    async fn notification_activated(&self, payload: Value) -> Result<(), String>;
+}
 // JSON string escaping can inflate each payload byte up to sixfold
 // (\uXXXX); the semantic paste bound in paste_offload stays authoritative,
 // so the transport limit only needs headroom for the encoded form.
@@ -150,6 +164,9 @@ struct HostState {
     /// The host's only pane path: forward each `browser_pane_*` op to the
     /// app's `AppSurface::pane` (review B1). Set with the control handler.
     pane_forwarder: Mutex<Option<Arc<dyn PaneForwarder>>>,
+    /// Notification-click forwarding (multi-window §7): set with the control
+    /// handler, beside the pane forwarder.
+    notification_forwarder: Mutex<Option<Arc<dyn NotificationForwarder>>>,
     officecli_watches: Mutex<Option<Arc<crate::officecli_watch::OfficecliWatchRuntime>>>,
     runtimes: NativePiManager,
     auth: Arc<Mutex<RemoteAuth>>,
@@ -275,6 +292,7 @@ impl HostServer {
             desktop_capabilities: Mutex::new(HostCapabilityStore::default()),
             owner_registry: Mutex::new(None),
             pane_forwarder: Mutex::new(None),
+            notification_forwarder: Mutex::new(None),
             officecli_watches: Mutex::new(None),
             runtimes,
             auth,
@@ -528,6 +546,16 @@ impl HostServer {
     /// for these ops, which is the pre-B1 behavior.
     pub fn set_pane_forwarder(&self, forwarder: Arc<dyn PaneForwarder>) {
         if let Ok(mut slot) = self.state.pane_forwarder.lock() {
+            *slot = Some(forwarder);
+        }
+    }
+
+    /// Attach the notification-click forwarder after host bind (multi-window
+    /// §7). Same lifecycle as the pane forwarder: installed with the control
+    /// handler, so any host that can show a notification can also route the
+    /// click app-side.
+    pub fn set_notification_forwarder(&self, forwarder: Arc<dyn NotificationForwarder>) {
+        if let Ok(mut slot) = self.state.notification_forwarder.lock() {
             *slot = Some(forwarder);
         }
     }
@@ -2438,6 +2466,27 @@ fn pane_forwarder(state: &HostState) -> Result<Arc<dyn PaneForwarder>, (&'static
         ))
 }
 
+/// Fan out one notification activation (multi-window §7): the broadcast every
+/// client already knows, plus the app-surface forward that lets the app's
+/// single decision point move exactly one window. A host with no forwarder
+/// keeps the broadcast-only behavior.
+async fn dispatch_notification_activation(
+    host_events: &crate::host_control::HostEventSink,
+    forwarder: Option<Arc<dyn NotificationForwarder>>,
+    payload: Value,
+) {
+    host_events.broadcast_native_event(payload.clone());
+    let Some(forwarder) = forwarder else {
+        return;
+    };
+    // The click already happened; a forwarding failure (no app attached, a
+    // busy channel) is logged, never retried — the broadcast half still went
+    // out, which is the pre-multi-window behavior.
+    if let Err(error) = forwarder.notification_activated(payload).await {
+        log::warn!("[picot] cannot forward the notification activation: {error}");
+    }
+}
+
 /// Forward one pane op to the app's `AppSurface::pane`; the app's message
 /// travels back as the `browser_pane_failed` error.
 async fn forward_browser_pane(
@@ -3480,8 +3529,18 @@ async fn dispatch(
                         .workspace_root(workspace_id)
                         .ok()
                         .map(|path| path.to_string_lossy().into_owned());
-                    let host_events = state.host_events.clone();
                     let ws_id = workspace_id.to_string();
+                    let forwarder = state
+                        .notification_forwarder
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone());
+                    let host_events = state.host_events.clone();
+                    // wait_for_action's callback is sync and runs on the
+                    // notify-rust thread; the forward half is async (the admin
+                    // channel), so the runtime handle crosses over and the
+                    // dispatch runs as its own task.
+                    let runtime = tokio::runtime::Handle::current();
                     // wait_for_action blocks until the user clicks; one thread
                     // per notification is fine at task-completion volume.
                     std::thread::spawn(move || {
@@ -3489,13 +3548,22 @@ async fn dispatch(
                             if action == "__closed" {
                                 return;
                             }
-                            host_events.broadcast_native_event(json!({
+                            let payload = json!({
                                 "type": "notification_activated",
                                 "workspaceId": ws_id,
                                 "sessionId": session_id,
                                 "sessionFile": session_file,
                                 "cwd": cwd,
-                            }));
+                            });
+                            let host_events = host_events.clone();
+                            runtime.spawn(async move {
+                                dispatch_notification_activation(
+                                    &host_events,
+                                    forwarder.clone(),
+                                    payload,
+                                )
+                                .await;
+                            });
                         });
                     });
                     Ok(response)
@@ -4386,6 +4454,110 @@ mod tests {
         // Reads only: the OnceLock is process-global and a set here would
         // leak into every other test in this binary.
         assert_eq!(notification_bundle_identifier(), "com.palandata.picot");
+    }
+
+    #[tokio::test]
+    async fn a_notification_activation_broadcasts_and_reaches_the_forwarder() {
+        use crate::host_server::NotificationForwarder;
+
+        struct Recorder(Mutex<Vec<Value>>);
+        #[async_trait::async_trait]
+        impl NotificationForwarder for Recorder {
+            async fn notification_activated(&self, payload: Value) -> Result<(), String> {
+                self.0.lock().unwrap().push(payload);
+                Ok(())
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-notify-{nonce}"));
+        let public = temp.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::write(public.join("index.html"), "Picot").unwrap();
+        let metadata = Arc::new(Mutex::new(
+            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+        ));
+        let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+        let host = HostServer::start_with_session_root(
+            public,
+            NativePiManager::new(4),
+            auth,
+            metadata,
+            Some(temp.join("sessions")),
+        )
+        .await
+        .unwrap();
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        host.set_notification_forwarder(Arc::clone(&recorder) as Arc<dyn NotificationForwarder>);
+
+        let mut events = host.event_sink().subscribe_for_tests();
+        let payload = json!({
+            "type": "notification_activated",
+            "workspaceId": "w1",
+            "sessionId": "20261017_090000_aaa",
+            "sessionFile": "/tmp/sessions/w1/20261017_090000_aaa.jsonl",
+            "cwd": "/tmp/proj",
+        });
+        let sink = host.event_sink();
+        let forwarded: Arc<dyn NotificationForwarder> = recorder.clone();
+        super::dispatch_notification_activation(&sink, Some(forwarded), payload.clone()).await;
+
+        // Broadcast half: every client (WebView and browser tab alike) sees
+        // the same native event as before.
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the broadcast is immediate")
+            .expect("the sink is live");
+        assert_eq!(event.owner, None, "a native broadcast has no owner");
+        assert_eq!(event.value, payload);
+        // Forward half: the app's single decision point gets the same payload.
+        assert_eq!(
+            recorder.0.lock().unwrap().as_slice(),
+            &[payload],
+            "the forwarder sees exactly one activation, unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notification_activation_without_a_forwarder_still_broadcasts() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-notify-bare-{nonce}"));
+        let public = temp.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::write(public.join("index.html"), "Picot").unwrap();
+        let metadata = Arc::new(Mutex::new(
+            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+        ));
+        let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+        let host = HostServer::start_with_session_root(
+            public,
+            NativePiManager::new(4),
+            auth,
+            metadata,
+            Some(temp.join("sessions")),
+        )
+        .await
+        .unwrap();
+
+        let mut events = host.event_sink().subscribe_for_tests();
+        let sink = host.event_sink();
+        super::dispatch_notification_activation(
+            &sink,
+            None,
+            json!({"type": "notification_activated"}),
+        )
+        .await;
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the broadcast still goes out")
+            .expect("the sink is live");
+        assert_eq!(event.value["type"], "notification_activated");
     }
 
     use super::{

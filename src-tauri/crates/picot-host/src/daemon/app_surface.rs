@@ -248,6 +248,20 @@ pub trait AppSurface: Send + Sync {
     /// window past a live holder.
     async fn focus_window(&self, label: &str) -> Result<(), String>;
 
+    /// Multi-window §7 — one notification-click activation, passed through
+    /// with the payload exactly as the daemon broadcast it. The decision
+    /// (which window moves) and the execution belong to the app: the ledger,
+    /// the live routes and the focus stamps live there, so the daemon only
+    /// carries the click over.
+    ///
+    /// Defaults to a refusal so the test fixtures that never see a click stay
+    /// untouched; both production realizations override it (the forwarding
+    /// surface on the daemon, the routing executor on the app).
+    async fn notification_activated(&self, payload: Value) -> Result<(), String> {
+        let _ = payload;
+        Err("notification_activated needs the Picot app".to_string())
+    }
+
     /// Row A10 — settle the pending close that `window_close_approve`
     /// approves (the pending map lives app-side, D4) and close the window.
     ///

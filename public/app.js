@@ -69,6 +69,7 @@ import {
   isSelectedModel,
   selectModel,
 } from "./models/selection.js";
+import { setupNotificationWindowEvents } from "./notification-window-events.js";
 import { renderPackageInstallFailure } from "./packages/install-status.js";
 import {
   createPreferencesClient,
@@ -2834,10 +2835,14 @@ wsClient.addEventListener("runtimeError", (e) => {
   promptDelivery.rejectByRequestId(requestId, { code, message });
 });
 
-// A task-completion OS notification was clicked: route this window to the
-// finished session (cross-workspace switches ride handleSessionSelect's own
-// transition logic).
+// A task-completion OS notification was clicked. Inside the app the click is
+// routed by the app-side Rust executor (multi-window §7's single decision
+// point): this window is a passive receiver, or every window would move. A
+// plain browser tab — no app process to decide — keeps the self-routing
+// fallback (the __TAURI__ presence check mirrors the daemon section's
+// ipcAvailable idea).
 wsClient.addEventListener("notificationActivated", (e) => {
+  if (window.__TAURI__) return;
   const { sessionFile, cwd } = e.detail || {};
   if (!sessionFile) return;
   // Re-selecting the already-active session would bump restore tokens and
@@ -2849,6 +2854,18 @@ wsClient.addEventListener("notificationActivated", (e) => {
   } catch (error) {
     console.error("[Notifications] failed to route to the finished session:", error);
   }
+});
+
+// The receiving half of the Rust executor's picks (multi-window §7): rule 2's
+// in-window navigation and rule 3's open-chain request arrive as DOM events.
+setupNotificationWindowEvents({
+  handleSessionSelect,
+  transport,
+  onNotice: (message) => {
+    if (typeof messageRenderer?.renderSystemMessage === "function") {
+      messageRenderer.renderSystemMessage(message);
+    }
+  },
 });
 
 wsClient.addEventListener("runtimeEvent", (e) => {

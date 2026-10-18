@@ -146,8 +146,8 @@ fn keys(value: &Value) -> Vec<String> {
 }
 
 /// Engineering-lesson #1: the op names are copied by hand from the plan's
-/// `app_surface_request` table (plus the multi-window §6.3 `focus_window`).
-/// A renamed op — or a 14th one — fails here.
+/// `app_surface_request` table (plus the multi-window §6.3 `focus_window` and
+/// §7 `notification_activated`). A renamed op — or a 15th one — fails here.
 #[test]
 fn surface_op_names_match_the_protocol_table() {
     assert_eq!(
@@ -166,6 +166,7 @@ fn surface_op_names_match_the_protocol_table() {
             "check_for_update",
             "download_and_install_update",
             "focus_window",
+            "notification_activated",
         ]
     );
 }
@@ -502,6 +503,38 @@ async fn forwarded_rows_carry_their_arguments_on_the_wire() {
     let (frame, outcome) = round_trip(&mut app, call).await;
     assert_eq!(frame["op"], "pick_image_files");
     assert_eq!(frame["args"], json!({"initialDir": "/tmp/images"}));
+    outcome.expect("the op completes");
+    // notification_activated (multi-window §7): the payload passes through
+    // exactly as the daemon broadcast it — the app decides, the daemon only
+    // carries the click.
+    let call = {
+        let surface = Arc::clone(&surface);
+        async move {
+            surface
+                .notification_activated(json!({
+                    "type": "notification_activated",
+                    "workspaceId": "w1",
+                    "sessionId": "s1",
+                    "sessionFile": "/tmp/sessions/w1/s1.jsonl",
+                    "cwd": "/tmp/proj",
+                }))
+                .await?;
+            Ok(Value::Null)
+        }
+    };
+    let (frame, outcome) = round_trip(&mut app, call).await;
+    assert_eq!(frame["op"], "notification_activated");
+    assert_eq!(
+        frame["args"]["payload"],
+        json!({
+            "type": "notification_activated",
+            "workspaceId": "w1",
+            "sessionId": "s1",
+            "sessionFile": "/tmp/sessions/w1/s1.jsonl",
+            "cwd": "/tmp/proj",
+        }),
+        "the activation payload must survive the wire unchanged"
+    );
     outcome.expect("the op completes");
 
     fixture.state.shutdown_graceful("test").await;
