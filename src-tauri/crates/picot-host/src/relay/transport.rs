@@ -1,12 +1,15 @@
-// ABOUTME: Relay control transport: outbound control-socket state machine (spec §2.5).
-// ABOUTME: Control half only; per-client data sockets + E2EE land in plan T5.
+// ABOUTME: Relay transport: control-socket state machine (spec §2.5) plus
+// ABOUTME: per-client data sockets with bounded-queue eviction (spec §2.7).
 
 //! The daemon holds exactly one outbound control WebSocket to the relay:
 //! `ws(s)://<endpoint>/ws?serverId=<id>&role=server&v=2`. The relay pushes
 //! `sync` (full connectionId list) on connect plus `connected`/`disconnected`
 //! deltas; the transport reconciles them against its live set and reports
-//! additions/removals to the [`RelaySessionSink`] (T5 turns those into
-//! data-socket dials and E2EE channels).
+//! additions/removals to the [`ConnectionLifecycle`] driver, which dials one
+//! data socket per connectionId (`…&connectionId=<id>`, 15s open timeout) and
+//! hands the write path to the [`RelaySessionSink`] via [`RelayDataHandle`].
+//! Data sockets survive control reconnects; `sync` reconcile closes the ones
+//! the relay no longer lists.
 //!
 //! Parameters are Paseo's, copied verbatim (spec §2.5 / plan T4):
 //! reconnect backoff `min(30s, 1s × attempt)`, WS ping every 10s, 30s stale
@@ -21,9 +24,12 @@
 //! that drop the control connection (reconnect per backoff). Outbound frames
 //! go through a bounded queue of `OUTBOUND_QUEUE_CAPACITY`; a full queue
 //! closes the offending connection — for the control socket that means drop
-//! and reconnect.
+//! and reconnect, for a data socket eviction of that connection only. The
+//! same caps ride the WebSocket read config (max message and frame size) so
+//! oversized input dies at the protocol layer, with the explicit checks as
+//! the documented second layer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,12 +42,15 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::host_router::MAX_CLIENTS;
 use crate::relay::e2ee::DaemonIdentity;
-use crate::transport_limits::{OUTBOUND_QUEUE_CAPACITY, RELAY_CONTROL_FRAME_BYTES};
+use crate::transport_limits::{
+    OUTBOUND_QUEUE_CAPACITY, RELAY_CONTROL_FRAME_BYTES, RELAY_DATA_FRAME_TEXT_BYTES,
+};
 
 /// Reconnect backoff: `min(30s, 1s × attempt)` (relay-transport.ts:338).
 pub const CONTROL_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -55,6 +64,8 @@ pub const CONTROL_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(8);
 /// WS handshake (dial → upgrade) deadline: 10s.
 pub const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-client data-socket open timeout: 15s (relay-transport.ts:361).
+pub const DATA_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `min(cap, base × attempt)` — linear, per the copied parameter.
 pub fn control_backoff(attempt: u32, base: Duration, cap: Duration) -> Duration {
@@ -79,17 +90,66 @@ pub struct RelayConfig {
     pub server_id: String,
 }
 
-/// Consumer-facing surface of the transport. T5 replaces the bare
-/// `open_session` with the full data-socket + E2EE channel handoff.
+/// Write-path handle for one relay data connection, handed to the sink on
+/// `open_session`. This slice carries the bare socket queue; slice b (E2EE)
+/// swaps in an encrypted-channel handle at this same position.
+#[derive(Clone)]
+pub struct RelayDataHandle {
+    connection_id: String,
+    out: mpsc::Sender<Message>,
+    close: watch::Sender<bool>,
+}
+
+impl RelayDataHandle {
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    /// Queue one outbound text frame on the bounded queue
+    /// (`OUTBOUND_QUEUE_CAPACITY`). `false`: the queue is full or the writer
+    /// is gone — the connection is closing and the frame is dropped
+    /// (spec §2.7: a full queue closes that data connection only).
+    pub fn send(&self, text: String) -> bool {
+        match self.out.try_send(Message::Text(text)) {
+            Ok(()) => true,
+            Err(_) => {
+                self.close();
+                false
+            }
+        }
+    }
+
+    /// Close this data connection (idempotent).
+    pub fn close(&self) {
+        let _ = self.close.send(true);
+    }
+}
+
+/// Consumer-facing surface of the transport.
 #[async_trait]
 pub trait RelaySessionSink: Send + Sync {
     async fn on_connection_state(&self, state: ConnectionState);
-    /// The relay reports a live connectionId the transport has no socket for
-    /// (`sync` reconcile gap or a `connected` delta).
-    async fn open_session(&self, connection_id: String);
-    /// The relay reports a connectionId going away (`disconnected` delta or
-    /// `sync` reconcile removal).
+    /// A relay connectionId is live and its data socket is open.
+    async fn open_session(&self, connection_id: String, socket: RelayDataHandle);
+    /// One inbound text frame off that connection's data socket. Raw text in
+    /// this slice; slice b delivers decrypted plaintext here (handshake
+    /// gating included).
+    async fn data_frame(&self, connection_id: &str, payload: String);
+    /// The connection went away (`disconnected` delta, `sync` reconcile
+    /// removal, socket death, or bounded-queue eviction). May fire more than
+    /// once per id (relay report racing socket death); sinks must be
+    /// idempotent.
     async fn close_session(&self, connection_id: &str);
+}
+
+/// Control-side driver for per-connection resources: the control loop calls
+/// open/close as the relay's sync and deltas move connectionIds. The
+/// production implementation dials and tears down data sockets; unit tests
+/// record the calls.
+#[async_trait]
+trait ConnectionLifecycle: Send + Sync {
+    async fn open(&self, connection_id: String);
+    async fn close(&self, connection_id: &str);
 }
 
 /// Injectable timers (defaults are the spec §2.5 values; tests shrink them).
@@ -101,6 +161,7 @@ pub struct TransportTimings {
     pub stale_timeout: Duration,
     pub ready_timeout: Duration,
     pub handshake_timeout: Duration,
+    pub data_open_timeout: Duration,
 }
 
 impl Default for TransportTimings {
@@ -112,6 +173,7 @@ impl Default for TransportTimings {
             stale_timeout: CONTROL_STALE_TIMEOUT,
             ready_timeout: CONTROL_READY_TIMEOUT,
             handshake_timeout: CONTROL_HANDSHAKE_TIMEOUT,
+            data_open_timeout: DATA_OPEN_TIMEOUT,
         }
     }
 }
@@ -194,10 +256,20 @@ async fn run_control_loop(
 ) {
     let timings = seams.timings;
     let mut live: HashSet<String> = HashSet::new();
+    // Data sockets outlive any single control cycle (reconnects reconcile
+    // drift via `sync`), so their registry sits outside the cycle loop.
+    let manager = DataSocketManager {
+        config: config.clone(),
+        seams: seams.clone(),
+        sink: Arc::clone(&sink),
+        registry: Arc::new(DataConnections::default()),
+        shutdown: shutdown.clone(),
+    };
     let mut failed_attempts: u32 = 0;
     while !*shutdown.borrow() {
         sink.on_connection_state(ConnectionState::Connecting).await;
-        let outcome = run_control_cycle(&config, &sink, &seams, &mut shutdown, &mut live).await;
+        let outcome =
+            run_control_cycle(&config, &sink, &seams, &mut shutdown, &mut live, &manager).await;
         match outcome {
             CycleOutcome::Stopped => return,
             CycleOutcome::Dropped { reached_online } => {
@@ -237,6 +309,7 @@ async fn run_control_cycle(
     seams: &TransportSeams,
     shutdown: &mut watch::Receiver<bool>,
     live: &mut HashSet<String>,
+    manager: &DataSocketManager,
 ) -> CycleOutcome {
     // Dial under the shutdown flag: stop() must not wait out a handshake.
     let dial = dial_control(config, seams);
@@ -284,7 +357,7 @@ async fn run_control_cycle(
             frame = inbound.next() => match frame {
                 Some(Ok(Message::Text(text))) => {
                     last_seen = tokio::time::Instant::now();
-                    match handle_control_frame(&text, live, sink.as_ref()).await {
+                    match handle_control_frame(&text, live, manager).await {
                         Ok(()) => {
                             if !online_reported {
                                 online_reported = true;
@@ -327,24 +400,73 @@ fn try_enqueue(out_tx: &mpsc::Sender<Message>, message: Message) -> bool {
 
 type ControlStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-async fn dial_control(config: &RelayConfig, seams: &TransportSeams) -> Result<ControlStream, ()> {
+/// `ws(s)://<endpoint>/ws?serverId=&role=server&v=2` (the control socket).
+fn control_url(config: &RelayConfig) -> String {
     let scheme = if config.use_tls { "wss" } else { "ws" };
     let server_id = utf8_percent_encode(&config.server_id, NON_ALPHANUMERIC);
-    let url = format!(
+    format!(
         "{scheme}://{}/ws?serverId={server_id}&role=server&v=2",
         config.endpoint
-    );
+    )
+}
+
+/// The per-connection data-socket dial:
+/// `ws(s)://<endpoint>/ws?serverId=&role=server&v=2&connectionId=`.
+fn data_url(config: &RelayConfig, connection_id: &str) -> String {
+    let scheme = if config.use_tls { "wss" } else { "ws" };
+    let server_id = utf8_percent_encode(&config.server_id, NON_ALPHANUMERIC);
+    let connection_id = utf8_percent_encode(connection_id, NON_ALPHANUMERIC);
+    format!(
+        "{scheme}://{}/ws?serverId={server_id}&role=server&v=2&connectionId={connection_id}",
+        config.endpoint
+    )
+}
+
+/// Dial one relay WebSocket under an open timeout and a read cap: oversized
+/// inbound input dies at the protocol layer (the explicit per-kind checks
+/// are the second, documented layer).
+async fn dial_ws(
+    url: String,
+    open_timeout: Duration,
+    max_message_bytes: usize,
+    connector: Option<Connector>,
+) -> Result<ControlStream, ()> {
     let request = url.into_client_request().map_err(|_| ())?;
-    let dial = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        None,
-        false,
-        seams.connector.clone(),
-    );
-    match tokio::time::timeout(seams.timings.handshake_timeout, dial).await {
+    let config = WebSocketConfig {
+        max_message_size: Some(max_message_bytes),
+        max_frame_size: Some(max_message_bytes),
+        ..WebSocketConfig::default()
+    };
+    let dial =
+        tokio_tungstenite::connect_async_tls_with_config(request, Some(config), false, connector);
+    match tokio::time::timeout(open_timeout, dial).await {
         Ok(Ok((stream, _response))) => Ok(stream),
         _ => Err(()),
     }
+}
+
+async fn dial_control(config: &RelayConfig, seams: &TransportSeams) -> Result<ControlStream, ()> {
+    dial_ws(
+        control_url(config),
+        seams.timings.handshake_timeout,
+        RELAY_CONTROL_FRAME_BYTES,
+        seams.connector.clone(),
+    )
+    .await
+}
+
+async fn dial_data(
+    config: &RelayConfig,
+    seams: &TransportSeams,
+    connection_id: &str,
+) -> Result<ControlStream, ()> {
+    dial_ws(
+        data_url(config, connection_id),
+        seams.timings.data_open_timeout,
+        RELAY_DATA_FRAME_TEXT_BYTES,
+        seams.connector.clone(),
+    )
+    .await
 }
 
 /// Handle one relay→daemon control frame. `Err(())` is a protocol violation:
@@ -352,7 +474,7 @@ async fn dial_control(config: &RelayConfig, seams: &TransportSeams) -> Result<Co
 async fn handle_control_frame(
     text: &str,
     live: &mut HashSet<String>,
-    sink: &dyn RelaySessionSink,
+    driver: &dyn ConnectionLifecycle,
 ) -> Result<(), ()> {
     if text.len() > RELAY_CONTROL_FRAME_BYTES {
         return Err(());
@@ -380,13 +502,13 @@ async fn handle_control_frame(
             // deterministic reporting.
             for id in declared_order {
                 if !live.contains(&id) {
-                    sink.open_session(id.clone()).await;
+                    driver.open(id.clone()).await;
                 }
             }
             let mut removed: Vec<String> = live.difference(&desired).cloned().collect();
             removed.sort();
             for id in removed {
-                sink.close_session(&id).await;
+                driver.close(&id).await;
             }
             *live = desired;
             Ok(())
@@ -397,7 +519,7 @@ async fn handle_control_frame(
                 .and_then(Value::as_str)
                 .ok_or(())?;
             if live.insert(id.to_string()) {
-                sink.open_session(id.to_string()).await;
+                driver.open(id.to_string()).await;
             }
             Ok(())
         }
@@ -407,11 +529,189 @@ async fn handle_control_frame(
                 .and_then(Value::as_str)
                 .ok_or(())?;
             if live.remove(id) {
-                sink.close_session(id).await;
+                driver.close(id).await;
             }
             Ok(())
         }
         _ => Err(()),
+    }
+}
+
+/// Live data-connection registry: connectionId → its close switch. Control
+/// removals take the entry out (the task then stays silent — control already
+/// delivered `close_session`); self-initiated teardowns (eviction, frame
+/// violations, peer death) remove their own entry and notify.
+#[derive(Default)]
+struct DataConnections {
+    entries: std::sync::Mutex<HashMap<String, watch::Sender<bool>>>,
+}
+
+impl DataConnections {
+    fn insert(&self, connection_id: String, close: watch::Sender<bool>) {
+        self.entries.lock().unwrap().insert(connection_id, close);
+    }
+
+    /// Signal the connection task to close and drop the registry entry.
+    fn close(&self, connection_id: &str) {
+        if let Some(close) = self.entries.lock().unwrap().remove(connection_id) {
+            let _ = close.send(true);
+        }
+    }
+
+    /// Remove only if this entry still owns the id (no replacement happened):
+    /// tells the caller whether it owes the sink a `close_session`.
+    fn remove_if_owner(&self, connection_id: &str, close: &watch::Sender<bool>) -> bool {
+        let mut entries = self.entries.lock().unwrap();
+        if entries
+            .get(connection_id)
+            .is_some_and(|current| current.same_channel(close))
+        {
+            entries.remove(connection_id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Production [`ConnectionLifecycle`]: one data socket per connectionId.
+struct DataSocketManager {
+    config: RelayConfig,
+    seams: TransportSeams,
+    sink: Arc<dyn RelaySessionSink>,
+    registry: Arc<DataConnections>,
+    shutdown: watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl ConnectionLifecycle for DataSocketManager {
+    async fn open(&self, connection_id: String) {
+        let (close_tx, _close_rx) = watch::channel(false);
+        // The entry exists from dial start so a same-id close can cancel an
+        // in-flight dial.
+        self.registry
+            .insert(connection_id.clone(), close_tx.clone());
+        tokio::spawn(run_data_connection(DataConnection {
+            config: self.config.clone(),
+            seams: self.seams.clone(),
+            sink: Arc::clone(&self.sink),
+            registry: Arc::clone(&self.registry),
+            connection_id,
+            close: close_tx,
+            shutdown: self.shutdown.clone(),
+        }));
+    }
+
+    async fn close(&self, connection_id: &str) {
+        // Registry entry first: the task's teardown sees a missing entry and
+        // stays silent (this call owns the sink notification).
+        self.registry.close(connection_id);
+        self.sink.close_session(connection_id).await;
+    }
+}
+
+struct DataConnection {
+    config: RelayConfig,
+    seams: TransportSeams,
+    sink: Arc<dyn RelaySessionSink>,
+    registry: Arc<DataConnections>,
+    connection_id: String,
+    close: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+}
+
+/// One per-client data socket: dial, hand the write path to the sink, pump
+/// inbound frames, enforce the data-side bounds, tear down locally.
+async fn run_data_connection(conn: DataConnection) {
+    let mut close_rx = conn.close.subscribe();
+    let mut shutdown = conn.shutdown.clone();
+    if *shutdown.borrow() || *close_rx.borrow() {
+        conn.registry
+            .remove_if_owner(&conn.connection_id, &conn.close);
+        return;
+    }
+    let dial = dial_data(&conn.config, &conn.seams, &conn.connection_id);
+    let stream = tokio::select! {
+        _ = shutdown.changed() => {
+            conn.registry.remove_if_owner(&conn.connection_id, &conn.close);
+            return;
+        }
+        _ = close_rx.changed() => {
+            conn.registry.remove_if_owner(&conn.connection_id, &conn.close);
+            return;
+        }
+        stream = dial => match stream {
+            Ok(stream) => stream,
+            Err(()) => {
+                // Dial failure: nothing opened, nothing to report. The relay
+                // still lists the client; its own `disconnected` heals state.
+                conn.registry.remove_if_owner(&conn.connection_id, &conn.close);
+                return;
+            }
+        },
+    };
+    // Cancellation may have landed while the dial resolved.
+    if *shutdown.borrow() || *close_rx.borrow() {
+        conn.registry
+            .remove_if_owner(&conn.connection_id, &conn.close);
+        return;
+    }
+
+    let (socket_sink, socket_stream) = stream.split();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+    let writer = tokio::spawn(bounded_writer(socket_sink, out_rx));
+    let handle = RelayDataHandle {
+        connection_id: conn.connection_id.clone(),
+        out: out_tx,
+        close: conn.close.clone(),
+    };
+    conn.sink
+        .open_session(conn.connection_id.clone(), handle)
+        .await;
+
+    let mut inbound = socket_stream;
+    let mut notify_close = false;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break, // stopping: no close_session
+            _ = close_rx.changed() => {
+                notify_close = true;
+                break;
+            }
+            frame = inbound.next() => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    // Spec §2.7: ciphertext text beyond the wire cap can
+                    // never decode to a legal plaintext — close the
+                    // connection (control and siblings stay).
+                    if text.len() > RELAY_DATA_FRAME_TEXT_BYTES {
+                        notify_close = true;
+                        break;
+                    }
+                    conn.sink.data_frame(&conn.connection_id, text).await;
+                }
+                // The data protocol is text-only; binary is a violation.
+                Some(Ok(Message::Binary(_))) => {
+                    notify_close = true;
+                    break;
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                    notify_close = true;
+                    break;
+                }
+                // ping/pong: connection liveness only.
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    writer.abort();
+    // Self-initiated teardown notifies; a control-directed close already did
+    // (its registry entry is gone, so ownership check fails).
+    if notify_close
+        && conn
+            .registry
+            .remove_if_owner(&conn.connection_id, &conn.close)
+    {
+        conn.sink.close_session(&conn.connection_id).await;
     }
 }
 
@@ -443,96 +743,128 @@ mod tests {
     #[tokio::test]
     async fn sync_reconcile_and_delta_semantics() {
         #[derive(Default)]
-        struct Recorder {
+        struct RecordingDriver {
             opens: std::sync::Mutex<Vec<String>>,
             closes: std::sync::Mutex<Vec<String>>,
         }
         #[async_trait]
-        impl RelaySessionSink for Recorder {
-            async fn on_connection_state(&self, _state: ConnectionState) {}
-            async fn open_session(&self, connection_id: String) {
+        impl ConnectionLifecycle for RecordingDriver {
+            async fn open(&self, connection_id: String) {
                 self.opens.lock().unwrap().push(connection_id);
             }
-            async fn close_session(&self, connection_id: &str) {
+            async fn close(&self, connection_id: &str) {
                 self.closes.lock().unwrap().push(connection_id.to_string());
             }
         }
-        let sink = Arc::new(Recorder::default());
+        let driver = Arc::new(RecordingDriver::default());
         let mut live = HashSet::new();
 
         handle_control_frame(
             "{\"type\":\"sync\",\"connectionIds\":[\"c1\",\"c2\"]}",
             &mut live,
-            sink.as_ref(),
+            driver.as_ref(),
         )
         .await
         .unwrap();
         handle_control_frame(
             "{\"type\":\"connected\",\"connectionId\":\"c3\"}",
             &mut live,
-            sink.as_ref(),
+            driver.as_ref(),
         )
         .await
         .unwrap();
         handle_control_frame(
             "{\"type\":\"connected\",\"connectionId\":\"c3\"}",
             &mut live,
-            sink.as_ref(),
+            driver.as_ref(),
         )
         .await
         .unwrap();
         handle_control_frame(
             "{\"type\":\"disconnected\",\"connectionId\":\"c1\"}",
             &mut live,
-            sink.as_ref(),
+            driver.as_ref(),
         )
         .await
         .unwrap();
         handle_control_frame(
             "{\"type\":\"sync\",\"connectionIds\":[\"c2\"]}",
             &mut live,
-            sink.as_ref(),
+            driver.as_ref(),
         )
         .await
         .unwrap();
 
-        assert_eq!(*sink.opens.lock().unwrap(), vec!["c1", "c2", "c3"]);
-        assert_eq!(*sink.closes.lock().unwrap(), vec!["c1", "c3"]);
+        assert_eq!(*driver.opens.lock().unwrap(), vec!["c1", "c2", "c3"]);
+        assert_eq!(*driver.closes.lock().unwrap(), vec!["c1", "c3"]);
         assert_eq!(live, HashSet::from(["c2".to_string()]));
     }
 
     #[tokio::test]
     async fn protocol_violations_reject_the_frame() {
         #[derive(Default)]
-        struct Noop;
+        struct NoopDriver;
         #[async_trait]
-        impl RelaySessionSink for Noop {
-            async fn on_connection_state(&self, _state: ConnectionState) {}
-            async fn open_session(&self, _connection_id: String) {}
-            async fn close_session(&self, _connection_id: &str) {}
+        impl ConnectionLifecycle for NoopDriver {
+            async fn open(&self, _connection_id: String) {}
+            async fn close(&self, _connection_id: &str) {}
         }
-        let sink = Arc::new(Noop);
+        let driver = Arc::new(NoopDriver);
         let mut live = HashSet::new();
         // Unknown type, malformed JSON, non-string id, sync without list.
         assert!(
-            handle_control_frame("{\"type\":\"mystery\"}", &mut live, sink.as_ref())
+            handle_control_frame("{\"type\":\"mystery\"}", &mut live, driver.as_ref())
                 .await
                 .is_err()
         );
-        assert!(handle_control_frame("not json", &mut live, sink.as_ref())
+        assert!(handle_control_frame("not json", &mut live, driver.as_ref())
             .await
             .is_err());
         assert!(handle_control_frame(
             "{\"type\":\"connected\",\"connectionId\":42}",
             &mut live,
-            sink.as_ref()
+            driver.as_ref()
         )
         .await
         .is_err());
         assert!(
-            handle_control_frame("{\"type\":\"sync\"}", &mut live, sink.as_ref())
+            handle_control_frame("{\"type\":\"sync\"}", &mut live, driver.as_ref())
                 .await
                 .is_err()
         );
     }
+}
+
+#[test]
+fn relay_urls_carry_the_v2_query_contract() {
+    let config = RelayConfig {
+        endpoint: "relay.example:443".into(),
+        use_tls: true,
+        server_id: "srv id".into(),
+    };
+    assert_eq!(
+        control_url(&config),
+        "wss://relay.example:443/ws?serverId=srv%20id&role=server&v=2"
+    );
+    assert_eq!(
+        data_url(&config, "c 1"),
+        "wss://relay.example:443/ws?serverId=srv%20id&role=server&v=2&connectionId=c%201"
+    );
+}
+
+#[tokio::test]
+async fn data_handle_send_signals_close_on_full_queue() {
+    let (close_tx, close_rx) = watch::channel(false);
+    let (out_tx, _out_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+    let handle = RelayDataHandle {
+        connection_id: "c1".into(),
+        out: out_tx,
+        close: close_tx,
+    };
+    assert_eq!(handle.connection_id(), "c1");
+    for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+        assert!(handle.send("x".into()));
+    }
+    assert!(!handle.send("overflow".into()));
+    assert!(*close_rx.borrow(), "full queue closes the connection");
 }

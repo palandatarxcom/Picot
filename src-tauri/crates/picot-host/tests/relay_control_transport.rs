@@ -1,6 +1,7 @@
-// ABOUTME: Relay control-transport contract tests against a mock relay (plan T4 slice 1).
-// ABOUTME: Control socket only: online/offline, sync reconcile, backoff, stale,
-// ABOUTME: ready timeout, frame bounds. Data sockets + E2EE are T5.
+// ABOUTME: Relay transport contract tests against a mock relay (plan T4 + T5a).
+// ABOUTME: Control socket: online/offline, sync reconcile, backoff, stale,
+// ABOUTME: ready timeout, frame bounds. Data sockets: dial contract, echo
+// ABOUTME: round-trips, slow-consumer eviction, inbound length bounds.
 
 //! Every assertion runs on injected seams, never wall-clock luck (plan T4
 //! risk: "all timing asserts must run on injected clocks/delay"): reconnect
@@ -11,15 +12,17 @@
 #[path = "support/mock_relay.rs"]
 mod mock_relay;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mock_relay::{MockRelay, SilentMode};
 use picot_host::relay::e2ee::DaemonIdentity;
 use picot_host::relay::transport::{
-    ConnectionState, RelayConfig, RelaySessionSink, RelayTransport, SleepFn, TransportSeams,
-    TransportTimings,
+    ConnectionState, RelayConfig, RelayDataHandle, RelaySessionSink, RelayTransport, SleepFn,
+    TransportSeams, TransportTimings,
 };
+use picot_host::transport_limits::RELAY_DATA_FRAME_TEXT_BYTES;
 use tokio::sync::mpsc;
 
 /// Records every state transition; tests await them with generous timeouts.
@@ -35,12 +38,62 @@ impl RelaySessionSink for RecordingSink {
     async fn on_connection_state(&self, state: ConnectionState) {
         let _ = self.states.send(state);
     }
-    async fn open_session(&self, connection_id: String) {
+    async fn open_session(&self, connection_id: String, _socket: RelayDataHandle) {
         let _ = self.opens.send(connection_id);
     }
+    async fn data_frame(&self, _connection_id: &str, _payload: String) {}
     async fn close_session(&self, connection_id: &str) {
         let _ = self.closes.send(connection_id.to_string());
     }
+}
+
+/// The data-side sink for the integration tests: echoes every inbound frame
+/// back through the handle it was handed — the same shape the slice-b
+/// session bridge will have (the sink owns the outbound path).
+struct EchoSink {
+    states: mpsc::UnboundedSender<ConnectionState>,
+    opens: mpsc::UnboundedSender<String>,
+    closes: mpsc::UnboundedSender<String>,
+    handles: Mutex<HashMap<String, RelayDataHandle>>,
+}
+
+#[async_trait::async_trait]
+impl RelaySessionSink for EchoSink {
+    async fn on_connection_state(&self, state: ConnectionState) {
+        let _ = self.states.send(state);
+    }
+    async fn open_session(&self, connection_id: String, socket: RelayDataHandle) {
+        let _ = self.opens.send(connection_id.clone());
+        self.handles.lock().unwrap().insert(connection_id, socket);
+    }
+    async fn data_frame(&self, connection_id: &str, payload: String) {
+        if let Some(handle) = self.handles.lock().unwrap().get(connection_id) {
+            handle.send(payload);
+        }
+    }
+    async fn close_session(&self, connection_id: &str) {
+        let _ = self.closes.send(connection_id.to_string());
+        self.handles.lock().unwrap().remove(connection_id);
+    }
+}
+
+/// EchoSink plus its three record channels.
+fn echo_sink() -> (
+    Arc<EchoSink>,
+    mpsc::UnboundedReceiver<ConnectionState>,
+    mpsc::UnboundedReceiver<String>,
+    mpsc::UnboundedReceiver<String>,
+) {
+    let (state_tx, states) = mpsc::unbounded_channel();
+    let (open_tx, opens) = mpsc::unbounded_channel();
+    let (close_tx, closes) = mpsc::unbounded_channel();
+    let sink = Arc::new(EchoSink {
+        states: state_tx,
+        opens: open_tx,
+        closes: close_tx,
+        handles: Mutex::new(HashMap::new()),
+    });
+    (sink, states, opens, closes)
 }
 
 /// Fake clock for the backoff path: records the requested sleep instead of
@@ -71,6 +124,7 @@ fn test_timings() -> TransportTimings {
         stale_timeout: Duration::from_millis(400),
         ready_timeout: Duration::from_millis(400),
         handshake_timeout: Duration::from_secs(2),
+        data_open_timeout: Duration::from_secs(2),
     }
 }
 
@@ -177,28 +231,34 @@ async fn sync_connected_disconnected_route_to_sink() {
     });
     let transport = start_transport(&relay, sink, test_timings(), default_sleep());
     let _ = recv_state(&mut states).await;
-    let _ = recv_state(&mut states).await; // Online
+    // Two real clients: the mock reports `connected` per client, the daemon
+    // opens (and now dials data sockets for) each id.
+    let client_one = relay.connect_client().await;
+    let first = recv_open(&mut opens).await;
+    let client_two = relay.connect_client().await;
+    let second = recv_open(&mut opens).await;
 
-    // sync reconcile: unknown ids open, missing ids close (spec §2.5).
-    relay.send_control("{\"type\":\"sync\",\"connectionIds\":[\"c1\",\"c2\"]}");
-    assert_eq!(recv_open(&mut opens).await, "c1");
-    assert_eq!(recv_open(&mut opens).await, "c2");
-    relay.send_control("{\"type\":\"sync\",\"connectionIds\":[\"c1\"]}");
-    assert_eq!(recv_close(&mut closes).await, "c2");
+    // sync reconcile against the live set: already-known ids open nothing,
+    // ids the relay drops close (spec §2.5).
+    relay.send_control(&format!(
+        "{{\"type\":\"sync\",\"connectionIds\":[\"{first}\"]}}"
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(opens.try_recv().is_err(), "known ids open nothing on sync");
+    assert_eq!(recv_close(&mut closes).await, second);
 
     // connected/disconnected deltas; duplicate connected is idempotent.
-    let client = relay.connect_client().await;
-    let id = recv_open(&mut opens).await;
     relay.send_control(&format!(
-        "{{\"type\":\"connected\",\"connectionId\":\"{id}\"}}"
+        "{{\"type\":\"connected\",\"connectionId\":\"{first}\"}}"
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         opens.try_recv().is_err(),
         "duplicate connected opens nothing"
     );
-    client.close().await;
-    assert_eq!(recv_close(&mut closes).await, id);
+    client_one.close().await;
+    assert_eq!(recv_close(&mut closes).await, first);
+    drop(client_two);
 
     transport.stop().await;
 }
@@ -401,6 +461,161 @@ async fn stop_closes_locally_without_reconnect() {
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(relay.control_upgrades(), 1, "no reconnect after stop");
+}
+
+#[tokio::test]
+async fn data_socket_dials_with_v2_contract_and_round_trips_frames() {
+    let relay = MockRelay::start().await;
+    let (sink, mut states, mut opens, _closes) = echo_sink();
+    let transport = start_transport(&relay, sink, test_timings(), default_sleep());
+    let _ = recv_state(&mut states).await;
+    let _ = recv_state(&mut states).await; // Online
+
+    let mut client = relay.connect_client().await;
+    let id = recv_open(&mut opens).await;
+    // The data dial carries the full v2 query contract for its connection.
+    until("data dial recorded with contract query", || {
+        relay
+            .data_dials()
+            .iter()
+            .any(|(server_id, connection_id)| server_id == "test-server-id" && connection_id == &id)
+    })
+    .await;
+
+    client.send_text("ping-1").await;
+    assert_eq!(client.recv_text().await, "ping-1");
+
+    // Each client is an independent data socket.
+    let mut second = relay.connect_client().await;
+    let second_id = recv_open(&mut opens).await;
+    assert_ne!(id, second_id);
+    second.send_text("ping-2").await;
+    assert_eq!(second.recv_text().await, "ping-2");
+    client.send_text("ping-3").await;
+    assert_eq!(client.recv_text().await, "ping-3");
+
+    transport.stop().await;
+}
+
+#[tokio::test]
+async fn client_disconnect_closes_the_data_session() {
+    let relay = MockRelay::start().await;
+    let (sink, mut states, mut opens, mut closes) = echo_sink();
+    let transport = start_transport(&relay, sink, test_timings(), default_sleep());
+    let _ = recv_state(&mut states).await;
+    let _ = recv_state(&mut states).await; // Online
+
+    let client = relay.connect_client().await;
+    let id = recv_open(&mut opens).await;
+    client.close().await;
+    assert_eq!(recv_close(&mut closes).await, id);
+
+    transport.stop().await;
+}
+
+#[tokio::test]
+async fn sync_removal_closes_only_that_data_socket() {
+    let relay = MockRelay::start().await;
+    let (sink, mut states, mut opens, mut closes) = echo_sink();
+    let transport = start_transport(&relay, sink, test_timings(), default_sleep());
+    let _ = recv_state(&mut states).await;
+    let _ = recv_state(&mut states).await; // Online
+
+    let mut first = relay.connect_client().await;
+    let first_id = recv_open(&mut opens).await;
+    let mut second = relay.connect_client().await;
+    let second_id = recv_open(&mut opens).await;
+
+    // A sync that drops first_id severs only that data connection.
+    relay.send_control(&format!(
+        "{{\"type\":\"sync\",\"connectionIds\":[\"{second_id}\"]}}"
+    ));
+    assert_eq!(recv_close(&mut closes).await, first_id);
+    first.expect_close().await;
+
+    second.send_text("still-here").await;
+    assert_eq!(second.recv_text().await, "still-here");
+
+    transport.stop().await;
+}
+
+#[tokio::test]
+async fn slow_consumer_is_evicted_without_touching_control_or_peers() {
+    let relay = MockRelay::start().await;
+    let (sink, mut states, mut opens, mut closes) = echo_sink();
+    let transport = start_transport(&relay, sink, test_timings(), default_sleep());
+    let _ = recv_state(&mut states).await;
+    let _ = recv_state(&mut states).await; // Online
+
+    let mut stalled = relay.connect_client().await;
+    let stalled_id = recv_open(&mut opens).await;
+    let mut healthy = relay.connect_client().await;
+    let healthy_id = recv_open(&mut opens).await;
+    assert_ne!(stalled_id, healthy_id);
+
+    // The stalled client never reads; the daemon's echoes fill its bounded
+    // outbound queue (OUTBOUND_QUEUE_CAPACITY) through the mock's bounded
+    // pipes → eviction closes that data connection only (spec §2.7).
+    let payload = "x".repeat(64 * 1024);
+    let sender = tokio::spawn(async move {
+        for _ in 0..800 {
+            stalled.send_text(&payload).await;
+        }
+    });
+
+    let evicted = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let id = closes.recv().await.expect("transport task alive");
+            if id == stalled_id {
+                return id;
+            }
+        }
+    })
+    .await
+    .expect("slow consumer evicted within timeout");
+    assert_eq!(evicted, stalled_id);
+
+    // Control is untouched: no reconnect, no state transition.
+    assert_eq!(relay.control_upgrades(), 1, "control socket survives");
+    assert!(
+        states.try_recv().is_err(),
+        "no Offline/Connecting transition from data eviction"
+    );
+
+    // The reading peer keeps working.
+    healthy.send_text("still-here").await;
+    assert_eq!(healthy.recv_text().await, "still-here");
+
+    sender.abort();
+    transport.stop().await;
+}
+
+#[tokio::test]
+async fn inbound_data_frame_length_bound_closes_connection_beyond_limit() {
+    let relay = MockRelay::start().await;
+    let (sink, mut states, mut opens, mut closes) = echo_sink();
+    let transport = start_transport(&relay, sink, test_timings(), default_sleep());
+    let _ = recv_state(&mut states).await;
+    let _ = recv_state(&mut states).await; // Online
+
+    let mut client = relay.connect_client().await;
+    let id = recv_open(&mut opens).await;
+    client.send_text("ok").await;
+    assert_eq!(client.recv_text().await, "ok");
+
+    // At the limit exactly: the frame transits and echoes (the wire cap is
+    // base64-of-the-plaintext-cap; derivation in transport_limits).
+    let at_limit = "x".repeat(RELAY_DATA_FRAME_TEXT_BYTES);
+    client.send_text(&at_limit).await;
+    assert_eq!(client.recv_text().await.len(), RELAY_DATA_FRAME_TEXT_BYTES);
+
+    // One byte over: that data connection closes; control stays up.
+    client.send_text(&format!("{at_limit}y")).await;
+    client.expect_close().await;
+    assert_eq!(recv_close(&mut closes).await, id);
+    assert_eq!(relay.control_upgrades(), 1, "control socket survives");
+
+    transport.stop().await;
 }
 
 fn default_sleep() -> SleepFn {
