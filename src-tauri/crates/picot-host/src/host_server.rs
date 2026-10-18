@@ -2463,8 +2463,15 @@ async fn convert_office_preview(
     path: &str,
 ) -> Result<Value, (&'static str, String)> {
     let context = context.ok_or(("unauthenticated", "Authentication required".into()))?;
-    let scope = preview_scope_from(context)
-        .ok_or(("unauthorized_target", "Workspace is not authorized".into()))?;
+    // Desktop keeps its handshake-binding scope; a device principal (Gate B)
+    // scopes to its owner's current registered workspace — the data-plane
+    // admission already matched the frame's workspaceId against that same
+    // snapshot.
+    let scope = match context.kind {
+        crate::host_router::ClientKind::Desktop => preview_scope_from(context),
+        _ => remote_registered_binding(state, context),
+    }
+    .ok_or(("unauthorized_target", "Workspace is not authorized".into()))?;
     if !preview_scope_valid(state, &scope) {
         return Err(("unauthorized_target", "Workspace is not authorized".into()));
     }
@@ -2558,10 +2565,38 @@ enum PreviewTaskResult {
 
 fn dialog_response_allowed(context: Option<&HostClientContext>, live_owner: Option<&str>) -> bool {
     let Some(context) = context else { return false };
-    let Some(owner) = context.owner_id.as_ref() else {
+    let Some(owner) = context.data_plane_owner() else {
         return false;
     };
-    context.kind == crate::host_router::ClientKind::Desktop && live_owner == Some(owner.as_str())
+    live_owner == Some(owner)
+}
+
+/// The data-plane authority of a remote device principal (Gate B): the
+/// registry's current snapshot of its owner is the only binding a remote
+/// context has — re-read on every check, so an owner unregister or a
+/// workspace transition invalidates remote admission on the next frame.
+fn remote_registered_binding(
+    state: &HostState,
+    context: &HostClientContext,
+) -> Option<PreviewScope> {
+    let owner = context.data_plane_owner()?;
+    let owner_id = crate::window_owner::OwnerId::from_string(owner.to_owned());
+    let current = state
+        .owner_registry
+        .lock()
+        .ok()
+        .and_then(|registry| registry.clone())
+        .map(|registry| registry.owner_current_workspace(&owner_id));
+    match current {
+        Some(crate::window_owner::OwnerWorkspaceSnapshot::Registered {
+            wid, generation, ..
+        }) => Some(PreviewScope {
+            owner: owner_id,
+            workspace_id: wid,
+            generation,
+        }),
+        _ => None,
+    }
 }
 
 /// Wire frames carry only the routing triple (workspace/session/instance).
@@ -2576,7 +2611,7 @@ fn authorize_target(
     let Some(context) = context else {
         return false;
     };
-    let Some(owner) = context.owner_id.as_ref() else {
+    let Some(owner) = context.data_plane_owner() else {
         return false;
     };
     if !crate::host_router::admits(context, crate::host_router::RequestFace::RuntimeCommand) {
@@ -2588,32 +2623,44 @@ fn authorize_target(
     if live.workspace_id != target.workspace_id || live.instance_id != target.instance_id {
         return false;
     }
-    if live.owner_id.as_deref() != Some(owner.as_str()) {
+    if live.owner_id.as_deref() != Some(owner) {
         return false;
     }
     // Re-read registry authority for every admission. Handshake context is only
     // an identity proof; workspace/generation can change while socket remains open.
-    let current = state
-        .owner_registry
-        .lock()
-        .ok()
-        .and_then(|registry| registry.clone())
-        .map(|registry| registry.owner_current_workspace(owner));
-    matches!(
-        current,
-        Some(crate::window_owner::OwnerWorkspaceSnapshot::Registered {
-            wid,
-            generation,
-            ..
-        }) if wid == live.workspace_id && generation == live.workspace_generation
-    )
+    // The device-principal arm (Gate B) rides the same registry-vs-live
+    // comparison: a paired device may touch only the owner's current,
+    // generation-matched runtime.
+    remote_registered_binding(state, context).is_some_and(|binding| {
+        binding.workspace_id == live.workspace_id && binding.generation == live.workspace_generation
+    })
 }
 
 fn operation_scope(
+    state: &HostState,
     context: Option<&HostClientContext>,
     session_id: &str,
+    workspace_id: &str,
 ) -> Result<crate::operation_registry::OperationScope, (&'static str, String)> {
     let context = context.ok_or(("unauthenticated", "Authentication required".into()))?;
+    if context.kind == crate::host_router::ClientKind::Remote {
+        // Gate B: a device principal has no handshake binding — the registry
+        // re-read is its authority, and the caller's workspace (already
+        // matched against that snapshot) is the scope it rides.
+        let binding = remote_registered_binding(state, context).ok_or((
+            "not_registered",
+            "Paired owner has no registered workspace".into(),
+        ))?;
+        if binding.workspace_id != workspace_id {
+            return Err(("stale_generation", "Workspace is not authorized".into()));
+        }
+        return Ok(crate::operation_registry::OperationScope::new(
+            binding.owner.as_str(),
+            workspace_id,
+            session_id,
+            binding.generation,
+        ));
+    }
     let owner = context.owner_id.as_ref().ok_or((
         "unauthorized_target",
         "Registered desktop owner required".into(),
@@ -2940,7 +2987,7 @@ async fn dispatch(
                 .get("command")
                 .cloned()
                 .ok_or(("invalid_command", "Runtime command is required".into()))?;
-            let scope = operation_scope(context, &target.session_id)?;
+            let scope = operation_scope(state, context, &target.session_id, &target.workspace_id)?;
             if command.get("type").and_then(Value::as_str) == Some("extension_ui_response") {
                 // Ownership and the full routing target are resolved host-side;
                 // the wire target carries only the routing triple, so it can
@@ -3574,9 +3621,22 @@ async fn dispatch(
                 ) {
                     return true;
                 }
-                current_registered_context(state, ctx)
-                    && ctx.workspace_id.as_deref()
-                        == frame.get("workspaceId").and_then(Value::as_str)
+                // Workspace-bound ops: the desktop owner matches its live
+                // handshake binding; a device principal (Gate B) has none, so
+                // the frame's workspaceId must equal its owner's current
+                // registered workspace — the registry re-read makes a
+                // transition or unregister invalidate the next frame.
+                match ctx.kind {
+                    crate::host_router::ClientKind::Desktop => {
+                        current_registered_context(state, ctx)
+                            && ctx.workspace_id.as_deref()
+                                == frame.get("workspaceId").and_then(Value::as_str)
+                    }
+                    _ => remote_registered_binding(state, ctx).is_some_and(|binding| {
+                        Some(binding.workspace_id.as_str())
+                            == frame.get("workspaceId").and_then(Value::as_str)
+                    }),
+                }
             });
             if !authorized {
                 return Err(("unauthorized_target", "Workspace is not authorized".into()));
@@ -4297,7 +4357,7 @@ async fn dispatch(
                         "File writes require idempotencyKey".into(),
                     ))?;
                     // Plan §14: writes walk the mutation/Operation Registry.
-                    let scope = operation_scope(context, "workspace-files")?;
+                    let scope = operation_scope(state, context, "workspace-files", workspace_id)?;
                     let root = state
                         .data
                         .workspace_root(workspace_id)
@@ -4359,7 +4419,7 @@ async fn dispatch(
                         "idempotency_key_required",
                         "File mutations require idempotencyKey".into(),
                     ))?;
-                    let scope = operation_scope(context, "workspace-files")?;
+                    let scope = operation_scope(state, context, "workspace-files", workspace_id)?;
                     let root = state
                         .data
                         .workspace_root(workspace_id)
@@ -4408,7 +4468,7 @@ async fn dispatch(
                         "idempotency_key_required",
                         "File mutations require idempotencyKey".into(),
                     ))?;
-                    let scope = operation_scope(context, "workspace-files")?;
+                    let scope = operation_scope(state, context, "workspace-files", workspace_id)?;
                     let root = state
                         .data
                         .workspace_root(workspace_id)
@@ -4449,7 +4509,7 @@ async fn dispatch(
                         "idempotency_key_required",
                         "File mutations require idempotencyKey".into(),
                     ))?;
-                    let scope = operation_scope(context, "workspace-files")?;
+                    let scope = operation_scope(state, context, "workspace-files", workspace_id)?;
                     let root = state
                         .data
                         .workspace_root(workspace_id)
@@ -8540,6 +8600,240 @@ mod tests {
             .cloned()
             .expect("legacy remote session registered");
         assert_eq!(legacy_context.device, None);
+        let _ = legacy.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    /// Gate B matrix (spec §2.8): the paired device rides its owner's data
+    /// plane — subscribe, runtime round-trip, snapshot read, workspace-bound
+    /// and owner-scoped data ops — while the management plane keeps
+    /// rejecting it, the legacy token stays data-plane-refused, and losing
+    /// the owner registration invalidates admission on the next frame.
+    #[tokio::test]
+    async fn remote_device_principal_rides_the_owner_data_plane() {
+        use tokio_tungstenite::tungstenite::Message;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-gate-b-{nonce}"));
+        let public = temp.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::create_dir_all(temp.join("ws")).unwrap();
+        fs::write(public.join("index.html"), "Picot").unwrap();
+        let metadata = Arc::new(Mutex::new(
+            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+        ));
+        let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+        let runtimes = NativePiManager::new(8);
+        let registry = Arc::new(crate::window_owner::WindowOwnerRegistry::default());
+        let (owner, _capability) = registry
+            .create_owner_with_workspace(
+                "gate-b-window".into(),
+                temp.join("ws").canonicalize().unwrap(),
+                0,
+                "http://127.0.0.1:1".into(),
+                Some("gate-b-workspace".into()),
+                crate::window_owner::TemporaryKind::DefaultStartup,
+            )
+            .unwrap();
+        let target = crate::runtime_coordinator::RuntimeTarget::with_owner(
+            "gate-b-workspace",
+            "gate-b-session",
+            "gate-b-instance",
+            owner.as_str(),
+            0,
+        );
+        let mut fake = runtimes.register_in_memory(target.clone()).unwrap();
+        // Answer every runtime request the session pipeline dispatches.
+        tokio::spawn(async move {
+            while let Some(request) = fake.read_request().await {
+                let _ = fake
+                    .write_frame(json!({
+                        "id": request["id"],
+                        "type": "response",
+                        "success": true,
+                        "data": { "sessionId": "gate-b-session" },
+                    }))
+                    .await;
+            }
+        });
+        let host = HostServer::start(public, runtimes, Arc::clone(&auth), Arc::clone(&metadata))
+            .await
+            .unwrap();
+        host.set_owner_registry(Arc::clone(&registry));
+
+        // Owner-stamped pairing: exchange mints the device token whose
+        // principal is (device, owner).
+        let pairing = auth.lock().unwrap().create_pairing(1, Some(owner.as_str()));
+        let device_token = auth
+            .lock()
+            .unwrap()
+            .exchange(&pairing.token, "gate-b-phone", 2)
+            .expect("owner-stamped exchange");
+
+        let (mut remote, _) = tokio_tungstenite::connect_async(
+            host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
+        )
+        .await
+        .unwrap();
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "hello", "protocolVersion": 2, "clientType": "remote",
+                    "clientId": "gate-b-remote", "deviceToken": device_token
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let ack: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(ack["type"], "hello_ack");
+
+        let wire_target = json!({
+            "workspaceId": "gate-b-workspace",
+            "sessionId": "gate-b-session",
+            "instanceId": "gate-b-instance"
+        });
+        // Event subscriptions ride the owner's live runtime.
+        remote
+            .send(Message::Text(
+                json!({ "type": "runtime_subscribe", "requestId": "sub", "target": wire_target })
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let subscribed: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(subscribed["type"], "runtime_subscribed", "{subscribed}");
+
+        // A runtime round-trip through the owner's runtime (get_state is a
+        // read: no idempotencyKey needed).
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_request", "requestId": "cmd-1", "target": wire_target,
+                    "idempotencyKey": "cmd-1-key", "command": { "type": "get_state" }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let reply: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(reply["requestId"], "cmd-1", "{reply}");
+        assert_eq!(reply["type"], "runtime_response", "{reply}");
+
+        // Snapshot read rides the same runtime.
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_snapshot_request", "requestId": "snap-1",
+                    "target": wire_target
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let snapshot: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(snapshot["requestId"], "snap-1", "{snapshot}");
+        assert_eq!(snapshot["type"], "runtime_snapshot");
+
+        // Workspace-bound data op: the frame workspaceId equals the owner's
+        // current registered workspace.
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "data_request", "requestId": "data-1",
+                    "operation": "workspace_info", "workspaceId": "gate-b-workspace"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let data: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(data["requestId"], "data-1", "{data}");
+        assert_ne!(data["error"]["code"], "unauthorized_target");
+
+        // The management plane keeps rejecting the device class.
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "host_request", "requestId": "manage-1",
+                    "operation": "preference_get", "args": {}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let refusal: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(refusal["error"]["code"], "forbidden_class", "{refusal}");
+
+        // Losing the owner registration invalidates the data plane on the
+        // very next frame (registry re-read, not a cached handshake).
+        host.set_owner_registry(Arc::new(crate::window_owner::WindowOwnerRegistry::default()));
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "data_request", "requestId": "data-2",
+                    "operation": "workspace_info", "workspaceId": "gate-b-workspace"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let stale: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(stale["error"]["code"], "unauthorized_target", "{stale}");
+        let _ = remote.close(None).await;
+
+        // The legacy token (no owner stamp) authenticates but every
+        // data-plane face refuses it.
+        let legacy_pairing = auth.lock().unwrap().create_pairing(3, None);
+        let legacy_token = auth
+            .lock()
+            .unwrap()
+            .exchange(&legacy_pairing.token, "gate-b-legacy", 4)
+            .expect("legacy exchange");
+        let (mut legacy, _) = tokio_tungstenite::connect_async(
+            host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
+        )
+        .await
+        .unwrap();
+        legacy
+            .send(Message::Text(
+                json!({
+                    "type": "hello", "protocolVersion": 2, "clientType": "remote",
+                    "clientId": "gate-b-legacy", "deviceToken": legacy_token
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let legacy_ack: Value =
+            serde_json::from_str(legacy.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(legacy_ack["type"], "hello_ack");
+        legacy
+            .send(Message::Text(
+                json!({
+                    "type": "data_request", "requestId": "legacy-1",
+                    "operation": "workspace_info", "workspaceId": "gate-b-workspace"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let legacy_reply: Value =
+            serde_json::from_str(legacy.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(
+            legacy_reply["error"]["code"], "unauthorized_target",
+            "{legacy_reply}"
+        );
         let _ = legacy.close(None).await;
         host.stop();
         let _ = fs::remove_dir_all(temp);

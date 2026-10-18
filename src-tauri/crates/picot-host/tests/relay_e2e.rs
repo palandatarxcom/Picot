@@ -43,6 +43,48 @@ struct E2e {
     temp: PathBuf,
 }
 
+/// The paired owner's live workspace + runtime the remote data plane rides
+/// (Gate B): one in-memory runtime owned by a registered desktop owner, and
+/// a responder task answering every runtime request the session dispatches.
+fn seed_owner_runtime(
+    temp: &std::path::Path,
+    runtimes: &picot_host::native_pi_manager::NativePiManager,
+) -> (Arc<picot_host::window_owner::WindowOwnerRegistry>, String) {
+    let registry = Arc::new(picot_host::window_owner::WindowOwnerRegistry::default());
+    fs::create_dir_all(temp.join("ws")).unwrap();
+    let (owner, _capability) = registry
+        .create_owner_with_workspace(
+            "relay-e2e-window".into(),
+            temp.join("ws").canonicalize().unwrap(),
+            0,
+            "http://127.0.0.1:1".into(),
+            Some("relay-e2e-workspace".into()),
+            picot_host::window_owner::TemporaryKind::DefaultStartup,
+        )
+        .unwrap();
+    let target = picot_host::runtime_coordinator::RuntimeTarget::with_owner(
+        "relay-e2e-workspace",
+        "relay-e2e-session",
+        "relay-e2e-instance",
+        owner.as_str(),
+        0,
+    );
+    let mut fake = runtimes.register_in_memory(target).unwrap();
+    tokio::spawn(async move {
+        while let Some(request) = fake.read_request().await {
+            let _ = fake
+                .write_frame(serde_json::json!({
+                    "id": request["id"],
+                    "type": "response",
+                    "success": true,
+                    "data": { "sessionId": "relay-e2e-session" },
+                }))
+                .await;
+        }
+    });
+    (registry, owner.as_str().to_owned())
+}
+
 fn e2e_timings() -> TransportTimings {
     TransportTimings {
         backoff_base: Duration::from_secs(1),
@@ -72,9 +114,14 @@ async fn e2e_setup(label: &str, e2ee_handshake_timeout: Duration) -> E2e {
         MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
     ));
     let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
-    // Seed the device token straight through the existing exchange machinery
-    // (plan T5 step 1a: "do NOT use the pairing path — that is T7").
-    let pairing = auth.lock().unwrap().create_pairing(1_000, None);
+    let runtimes = NativePiManager::new(4);
+    // The paired owner's live runtime (Gate B data plane) plus an
+    // owner-stamped device token.
+    let (registry, owner) = seed_owner_runtime(&temp, &runtimes);
+    let pairing = auth
+        .lock()
+        .unwrap()
+        .create_pairing(1_000, Some(owner.as_str()));
     let device_token = auth
         .lock()
         .unwrap()
@@ -83,13 +130,14 @@ async fn e2e_setup(label: &str, e2ee_handshake_timeout: Duration) -> E2e {
 
     let host = HostServer::start_with_session_root(
         public,
-        NativePiManager::new(4),
+        runtimes,
         Arc::clone(&auth),
         Arc::clone(&metadata),
         Some(temp.join("sessions")),
     )
     .await
     .expect("host server starts");
+    host.set_owner_registry(registry);
 
     let relay = MockRelay::start().await;
     let identity = DaemonIdentity::for_tests();
@@ -206,6 +254,115 @@ async fn handshake_then_full_session_round_trip_over_e2ee() {
     let response = recv_json(&mut client, &shared).await;
     assert_eq!(response["requestId"], "r1", "response correlates");
     assert_eq!(response["error"]["code"], "forbidden_class");
+
+    teardown(e2e).await;
+}
+
+/// (a2) Gate B positive business round-trip (plan T9 step 1): a paired
+/// device rides its owner's data plane end to end — subscribe, runtime
+/// request, snapshot, workspace-bound data op — over the E2EE relay channel.
+#[tokio::test]
+async fn paired_device_rides_the_owner_data_plane_over_the_relay() {
+    let e2e = e2e_setup("gate-b", Duration::from_secs(5)).await;
+    let (mut client, _id) = connect_client(&e2e.relay).await;
+    let shared = e2ee_client::handshake(&mut client, &e2e.identity.public_key_b64).await;
+
+    e2ee_client::send_sealed(
+        &mut client,
+        &shared,
+        &remote_hello("gate-b-phone", &e2e.device_token),
+    )
+    .await;
+    let ack = recv_json(&mut client, &shared).await;
+    assert_eq!(ack["type"], "hello_ack");
+
+    let wire_target = json!({
+        "workspaceId": "relay-e2e-workspace",
+        "sessionId": "relay-e2e-session",
+        "instanceId": "relay-e2e-instance"
+    });
+    e2ee_client::send_sealed(
+        &mut client,
+        &shared,
+        &json!({
+            "type": "runtime_subscribe", "requestId": "sub", "target": wire_target
+        })
+        .to_string(),
+    )
+    .await;
+    let subscribed = recv_json(&mut client, &shared).await;
+    assert_eq!(subscribed["type"], "runtime_subscribed", "{subscribed}");
+
+    e2ee_client::send_sealed(
+        &mut client,
+        &shared,
+        &json!({
+            "type": "runtime_request", "requestId": "cmd-1", "target": wire_target,
+            "idempotencyKey": "cmd-1-key", "command": { "type": "get_state" }
+        })
+        .to_string(),
+    )
+    .await;
+    let reply = recv_json(&mut client, &shared).await;
+    assert_eq!(reply["type"], "runtime_response", "{reply}");
+
+    e2ee_client::send_sealed(
+        &mut client,
+        &shared,
+        &json!({
+            "type": "runtime_snapshot_request", "requestId": "snap-1", "target": wire_target
+        })
+        .to_string(),
+    )
+    .await;
+    let snapshot = recv_json(&mut client, &shared).await;
+    assert_eq!(snapshot["type"], "runtime_snapshot", "{snapshot}");
+
+    e2ee_client::send_sealed(
+        &mut client,
+        &shared,
+        &json!({
+            "type": "data_request", "requestId": "data-1",
+            "operation": "workspace_info", "workspaceId": "relay-e2e-workspace"
+        })
+        .to_string(),
+    )
+    .await;
+    let data = recv_json(&mut client, &shared).await;
+    assert_eq!(data["requestId"], "data-1", "{data}");
+    assert_ne!(data["error"]["code"], "unauthorized_target");
+
+    // Reverse: the management plane still rejects the paired device, and a
+    // token without the owner stamp loses the whole data plane.
+    e2ee_client::send_sealed(
+        &mut client,
+        &shared,
+        &json!({
+            "type": "host_request", "requestId": "manage-1",
+            "operation": "preference_get"
+        })
+        .to_string(),
+    )
+    .await;
+    let refusal = recv_json(&mut client, &shared).await;
+    assert_eq!(refusal["error"]["code"], "forbidden_class", "{refusal}");
+
+    // Reverse: a remote hello without a valid device token never gains a
+    // session at all — no data plane exists to refuse (spec §2.8).
+    let (mut rogue, _id) = connect_client(&e2e.relay).await;
+    let rogue_shared = e2ee_client::handshake(&mut rogue, &e2e.identity.public_key_b64).await;
+    e2ee_client::send_sealed(
+        &mut rogue,
+        &rogue_shared,
+        &remote_hello("rogue-phone", "not-a-device-token"),
+    )
+    .await;
+    let rejected = recv_json(&mut rogue, &rogue_shared).await;
+    assert_eq!(
+        rejected["error"]["code"], "unauthorized_device",
+        "{rejected}"
+    );
+    rogue.expect_close().await;
 
     teardown(e2e).await;
 }

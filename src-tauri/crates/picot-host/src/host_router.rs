@@ -82,8 +82,8 @@ impl HostClientContext {
     }
 
     /// A remote session whose device token carried the pairing owner stamp
-    /// (Gate B slice A modeling). Admission behavior is unchanged until the
-    /// matrix widens; the context just remembers whose device this is.
+    /// (Gate B): the device rides that owner's data plane without ever
+    /// becoming a desktop owner itself.
     pub fn remote_device(client_id: impl Into<String>, device: DevicePrincipal) -> Self {
         Self {
             client_id: client_id.into(),
@@ -92,6 +92,17 @@ impl HostClientContext {
             device: Some(device),
             workspace_id: None,
             workspace_generation: None,
+        }
+    }
+
+    /// Whose data plane this context may touch: the desktop owner's own
+    /// binding, or the pairing-stamped owner of a remote device principal.
+    /// `None` for legacy remote tokens and the public classes.
+    pub fn data_plane_owner(&self) -> Option<&str> {
+        match self.kind {
+            ClientKind::Desktop => self.owner_id.as_ref().map(|owner| owner.as_str()),
+            ClientKind::Remote => self.device.as_ref().map(|device| device.owner_id.as_str()),
+            ClientKind::Unpaired => None,
         }
     }
 }
@@ -119,13 +130,17 @@ pub enum RequestFace {
 pub fn admits(context: &HostClientContext, face: RequestFace) -> bool {
     match face {
         // Management plane is desktop-only (spec §2.8): a paired device
-        // never reaches host_request regardless of its owner binding.
+        // never reaches host_request/host_control regardless of its owner
+        // binding — rejection is permanent for the Remote class.
         RequestFace::HostRequest => context.kind == ClientKind::Desktop,
-        RequestFace::HostControl
-        | RequestFace::RuntimeCommand
-        | RequestFace::RuntimeSubscribe
-        | RequestFace::DataRequest => {
+        RequestFace::HostControl => {
             context.kind == ClientKind::Desktop && context.owner_id.is_some()
+        }
+        // Data plane follows the principal (Gate B slice B): a paired device
+        // rides the same runtime/data faces as its desktop owner; the
+        // owner-registered/workspace checks stay with the callers.
+        RequestFace::RuntimeCommand | RequestFace::RuntimeSubscribe | RequestFace::DataRequest => {
+            context.data_plane_owner().is_some()
         }
     }
 }
@@ -437,30 +452,17 @@ fn validate_target(target: &Value) -> Result<(), RouterError> {
 #[cfg(test)]
 mod admission_tests {
     #[test]
-    fn admission_matrix_locks_current_semantics() {
+    fn admission_matrix_grants_the_owner_data_plane_to_device_principals() {
         use crate::host_router::{
             admits, ClientKind, DevicePrincipal, HostClientContext, RequestFace,
         };
         use crate::window_owner::OwnerWorkspaceSnapshot;
 
-        let faces = [
-            RequestFace::HostRequest,
-            RequestFace::HostControl,
-            RequestFace::RuntimeCommand,
-            RequestFace::RuntimeSubscribe,
-            RequestFace::DataRequest,
-        ];
         let desktop = HostClientContext::desktop(
             "d",
             crate::window_owner::OwnerId::from_string("owner".into()),
             OwnerWorkspaceSnapshot::NoWorkspace,
         );
-        for face in faces {
-            assert!(admits(&desktop, face), "desktop owner admits {face:?}");
-        }
-        // A device principal exists (Gate B slice A modeling) but admits
-        // nothing yet: host_request stays forbidden_class and the data-plane
-        // faces widen only in slice B (spec §2.8).
         let bound = HostClientContext::remote_device(
             "r",
             DevicePrincipal {
@@ -468,15 +470,34 @@ mod admission_tests {
                 owner_id: "owner".into(),
             },
         );
-        for face in faces {
+
+        // Gate B (spec §2.8): the paired device rides the owner's full data
+        // plane — runtime ops, snapshot/reads, event subscriptions — while
+        // both management faces reject the Remote class permanently.
+        for face in [
+            RequestFace::RuntimeCommand,
+            RequestFace::RuntimeSubscribe,
+            RequestFace::DataRequest,
+        ] {
+            assert!(admits(&desktop, face), "desktop owner admits {face:?}");
+            assert!(admits(&bound, face), "paired device admits {face:?}");
+        }
+        for face in [RequestFace::HostRequest, RequestFace::HostControl] {
+            assert!(admits(&desktop, face), "desktop owner admits {face:?}");
             assert!(
                 !admits(&bound, face),
-                "remote device must not admit {face:?}"
+                "management face {face:?} must reject the device principal"
             );
         }
         // Legacy remote (device token without owner binding) and the public
         // classes are refused everywhere, exactly as today.
-        for face in faces {
+        for face in [
+            RequestFace::HostRequest,
+            RequestFace::HostControl,
+            RequestFace::RuntimeCommand,
+            RequestFace::RuntimeSubscribe,
+            RequestFace::DataRequest,
+        ] {
             assert!(
                 !admits(&HostClientContext::remote("r"), face),
                 "remote {face:?}"
