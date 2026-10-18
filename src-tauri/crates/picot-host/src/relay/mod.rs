@@ -17,4 +17,5 @@
 pub mod controller;
 pub mod e2ee;
 pub mod pairing;
+pub mod smoke_client;
 pub mod transport;

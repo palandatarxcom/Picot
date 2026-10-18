@@ -1770,12 +1770,44 @@ pub(crate) async fn run_session<S, E>(
     }
     // Gate B (spec §2.8): a device-token hello resolves the pairing-bound
     // principal — which device, and the owner whose pairing minted the token.
-    let (device_principal, device_token) =
+    let (device_principal, device_token, pairing_minted) =
         if hello.get("clientType").and_then(Value::as_str) == Some("remote") {
-            let token = hello
-                .get("deviceToken")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            // T7 one-scan pairing (spec §2.6): a pairingToken hello runs the
+            // same RemoteAuth::exchange as POST /v2/auth/exchange right here
+            // (relay channels have no HTTP), and hello_ack returns the minted
+            // token. Failure — unknown/used/expired token, missing deviceId —
+            // is the existing unauthorized_device path; a pairingToken hello
+            // never falls back to a presented deviceToken.
+            let pairing_hello = hello.get("pairingToken").and_then(Value::as_str);
+            let token = if let Some(pairing_token) = pairing_hello {
+                let minted = hello
+                    .get("deviceId")
+                    .and_then(Value::as_str)
+                    .and_then(|device_id| {
+                        state
+                            .auth
+                            .lock()
+                            .ok()?
+                            .exchange(pairing_token, device_id, now_seconds())
+                            .ok()
+                    });
+                if minted.is_none() {
+                    let _ = send_error(
+                        &mut socket,
+                        None,
+                        "unauthorized_device",
+                        "Pairing token rejected",
+                    )
+                    .await;
+                    return;
+                }
+                minted
+            } else {
+                hello
+                    .get("deviceToken")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
             let principal = token
                 .as_deref()
                 .and_then(|token| state.auth.lock().ok()?.authenticate(token).ok().flatten());
@@ -1789,9 +1821,9 @@ pub(crate) async fn run_session<S, E>(
                 .await;
                 return;
             }
-            (principal, token)
+            (principal, token, pairing_hello.is_some())
         } else {
-            (None, None)
+            (None, None, false)
         };
     // T10 (spec §2.9): a remote-authenticated session is kickable. The DB
     // re-check right after registration closes the revoke-vs-hello race: a
@@ -1894,12 +1926,16 @@ pub(crate) async fn run_session<S, E>(
         let _ = send_error(&mut socket, None, "handshake_rejected", &message).await;
         return;
     }
+    // A one-scan pairing hello gets the freshly minted device token back in
+    // the ack (spec §2.6); returning devices already hold theirs.
+    let mut hello_ack = json!({ "type": "hello_ack", "protocolVersion": PROTOCOL_VERSION });
+    if pairing_minted {
+        if let Some(token) = device_token.as_deref() {
+            hello_ack["deviceToken"] = json!(token);
+        }
+    }
     if socket
-        .send(Message::Text(
-            json!({ "type": "hello_ack", "protocolVersion": PROTOCOL_VERSION })
-                .to_string()
-                .into(),
-        ))
+        .send(Message::Text(hello_ack.to_string().into()))
         .await
         .is_err()
     {
