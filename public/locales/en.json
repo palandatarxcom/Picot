@@ -648,6 +648,8 @@
     "deleteWorkspaceNameWarning": "Workspace name does not match.",
     "deleteWorkspaceNameLabel": "Workspace name",
     "openInFinder": "Open in Finder",
+    "openInNewWindow": "Open in New Window",
+    "openInNewWindowFailed": "Could not open in a new window. Try again.",
     "workspaceActions": "Workspace actions",
     "sessionCountTotal": "{count} sessions",
     "repository": "Repository",

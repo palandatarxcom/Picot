@@ -261,6 +261,16 @@ function handleRegisterWorkspace(targetCwd) {
   return enterWorkspace(targetCwd || "", { forceNewSession: true });
 }
 
+// Multi-window §5 entry 2: workspace-level "open in new window" rides the
+// openWorkspace spawn+window chain; row clicks keep switching in place.
+function openWorkspaceInNewWindow(workspace) {
+  const path = workspace?.path || "";
+  if (!path) return;
+  transport
+    .openWorkspace(path, { openWindow: true })
+    .catch(() => renderLandingNotice(t("sidebar.openInNewWindowFailed")));
+}
+
 const sidebar = new SessionSidebar(
   document.getElementById("session-list"),
   handleSessionSelect,
@@ -268,6 +278,7 @@ const sidebar = new SessionSidebar(
   {
     transport,
     onRegisterWorkspace: handleRegisterWorkspace,
+    onOpenWorkspaceNewWindow: openWorkspaceInNewWindow,
     // The empty-registry "+ 添加项目" button opens the same picker flow as
     // the sidebar + buttons; without this seam the button renders dead.
     onOpenProject: () => addProjectViaPicker(),

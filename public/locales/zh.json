@@ -648,6 +648,8 @@
     "deleteWorkspaceNameWarning": "工作区名称不匹配。",
     "deleteWorkspaceNameLabel": "工作区名称",
     "openInFinder": "在访达中打开",
+    "openInNewWindow": "在新窗口打开",
+    "openInNewWindowFailed": "无法在新窗口打开，请重试",
     "workspaceActions": "工作区操作",
     "sessionCountTotal": "{count} 个会话",
     "repository": "仓库",

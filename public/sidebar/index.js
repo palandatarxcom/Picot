@@ -78,6 +78,10 @@ export class SessionSidebar {
     this.isFocusActive = options.isFocusActive || null;
     this.onFocusRefresh = options.onFocusRefresh || null;
     this.onWorkspaceFocus = options.onWorkspaceFocus || null;
+    // Multi-window §5 entry 2: workspace-level "open in new window". Only the
+    // landing wires it (project list); app windows keep the spec's three
+    // entries via the session menu below.
+    this.onOpenWorkspaceNewWindow = options.onOpenWorkspaceNewWindow || null;
     // Explicit focus-enable seam. Landing passes `() => source === "registry"`
     // to enable Focus for every registered row (there is no active session or
     // current workspace); callers that omit it keep the classic
@@ -1108,6 +1112,18 @@ export class SessionSidebar {
         label: t("sidebar.openInFinder"),
         action: () => this.onOpenProject?.(workspace),
       },
+      // Multi-window §5 entry 2 (landing project list): registry-backed rows
+      // only — open_workspace fails closed for unregistered roots, so a
+      // live-only row would render a permanently dead item.
+      ...(registryRow && this.isRegistryAvailable() && this.onOpenWorkspaceNewWindow
+        ? [
+            {
+              iconKind: "external-link",
+              label: t("sidebar.openInNewWindow"),
+              action: () => this.onOpenWorkspaceNewWindow(workspace),
+            },
+          ]
+        : []),
       // Stop Running (plan T7/D6, Dr. Lin decision 2): the one user path that
       // ends a single workspace's Pi runtime. Closing a window detaches
       // instead of stopping, so without this entry a background workspace's
@@ -1589,6 +1605,36 @@ export class SessionSidebar {
     const menu = document.createElement("div");
     menu.className = "sidebar-context-menu";
     menu.setAttribute("role", "menu");
+    if (typeof this.transport?.openWorkspace === "function") {
+      // Multi-window §5 entry 3: any session can ask for its own window. The
+      // daemon's reuse/focus chain (§6) decides spawn vs. focus — a live
+      // holder elsewhere comes back as focusedExisting and is only toasted.
+      const openInWindow = document.createElement("button");
+      openInWindow.type = "button";
+      openInWindow.className = "context-menu-item";
+      openInWindow.setAttribute("role", "menuitem");
+      openInWindow.textContent = t("sidebar.openInNewWindow");
+      openInWindow.addEventListener("click", async (clickEvent) => {
+        clickEvent.stopPropagation();
+        this.closeContextMenu();
+        const project = this.projects.find((candidate) =>
+          (candidate.sessions || []).some((row) => row.filePath === session.filePath),
+        );
+        const cwd = project?.path || session?.cwd || "";
+        try {
+          const result = await this.transport.openWorkspace(cwd, {
+            sessionPath: session.filePath,
+            openWindow: true,
+          });
+          if (result?.focusedExisting) {
+            this.onSessionNotice?.(t("workspace.focusedExisting"));
+          }
+        } catch {
+          this.onSessionNotice?.(t("sidebar.openInNewWindowFailed"));
+        }
+      });
+      menu.appendChild(openInWindow);
+    }
     const rename = document.createElement("button");
     rename.type = "button";
     rename.className = "context-menu-item";

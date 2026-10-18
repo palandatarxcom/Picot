@@ -126,6 +126,7 @@ vi.mock("./sidebar/index.js", () => ({
         onWorkspaceFocus: options.onWorkspaceFocus,
         canFocusWorkspace: options.canFocusWorkspace,
         isCurrentWorkspace: options.isCurrentWorkspace,
+        onOpenWorkspaceNewWindow: options.onOpenWorkspaceNewWindow,
         expandedWorkspaces: new Set(),
         searchQuery: "",
         projects: [],
@@ -175,6 +176,7 @@ function makeTransportStub() {
       return { targetOrigin: "http://127.0.0.1:9", workspaceGeneration: generation };
     },
     cancelWorkspaceTransition: async () => {},
+    openWorkspace: vi.fn(async () => ({ workspaceId: "wid-2", sessionId: "sid-2" })),
   };
 }
 
@@ -649,4 +651,26 @@ test("a focused-away prepare lands as a notice with no navigation or commit", as
   const notice = document.getElementById("landing-notice");
   expect(notice.classList.contains("hidden")).toBe(false);
   expect(notice.textContent).toContain("another window");
+});
+
+test("workspace open-in-new-window goes through transport.openWorkspace, never the in-place chain", async () => {
+  await bootLanding();
+  const assigns = trackNavigation();
+  await harness.sidebarInstance.onOpenWorkspaceNewWindow({ path: "/tmp/ws" });
+  expect(harness.transport.openWorkspace).toHaveBeenCalledWith("/tmp/ws", { openWindow: true });
+  // In-place switching (prepare/commit/navigate) must not run.
+  expect(harness.prepares).toEqual([]);
+  expect(harness.commits).toEqual([]);
+  expect(assigns).toEqual([]);
+});
+
+test("workspace open-in-new-window failure lands in the landing notice", async () => {
+  await bootLanding();
+  harness.transport.openWorkspace = vi.fn(async () => {
+    throw new Error("workspace is not registered");
+  });
+  await harness.sidebarInstance.onOpenWorkspaceNewWindow({ path: "/tmp/gone" });
+  const notice = document.getElementById("landing-notice");
+  expect(notice.classList.contains("hidden")).toBe(false);
+  expect(notice.textContent).toContain("new window");
 });

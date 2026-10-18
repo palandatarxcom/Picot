@@ -648,6 +648,8 @@
     "deleteWorkspaceNameWarning": "ワークスペース名が一致しません。",
     "deleteWorkspaceNameLabel": "ワークスペース名",
     "openInFinder": "Finderで開く",
+    "openInNewWindow": "新しいウィンドウで開く",
+    "openInNewWindowFailed": "新しいウィンドウで開けませんでした。再試行してください",
     "workspaceActions": "ワークスペースの操作",
     "sessionCountTotal": "{count}件のセッション",
     "repository": "リポジトリ",

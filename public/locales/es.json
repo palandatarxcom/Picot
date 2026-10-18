@@ -648,6 +648,8 @@
     "deleteWorkspaceNameWarning": "El nombre del espacio de trabajo no coincide.",
     "deleteWorkspaceNameLabel": "Nombre del espacio de trabajo",
     "openInFinder": "Abrir en Finder",
+    "openInNewWindow": "Abrir en una ventana nueva",
+    "openInNewWindowFailed": "No se pudo abrir en una ventana nueva. Inténtalo de nuevo.",
     "workspaceActions": "Acciones del espacio de trabajo",
     "sessionCountTotal": "{count} sesiones",
     "repository": "Repositorio",
