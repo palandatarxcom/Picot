@@ -45,8 +45,15 @@ async-trait = "0.1"
 futures-util = "0.3"
 tokio-tungstenite = "0.24"
 # Relay E2EE (spec 2026-10-17-relay-phase2 §2.4): NaCl box over X25519 —
-# wire-compatible with Paseo's tweetnacl `nacl.box`.
+# wire-compatible with Paseo's tweetnacl `nacl.box`. crypto_box owns the
+# keypair types; the three below are the same crates crypto_box delegates to,
+# used directly for the raw X25519 all-zero rejection (curve25519-dalek), the
+# `box.before` precompute (salsa20 hsalsa), and precomputed-key
+# encrypt/decrypt (crypto_secretbox = tweetnacl box.after/open.after).
 crypto_box = "0.9"
+curve25519-dalek = "4"
+salsa20 = "0.10"
+crypto_secretbox = "0.1"
 percent-encoding = "2"
 semver = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
