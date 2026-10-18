@@ -21,6 +21,7 @@ use daemon_client::commands::{
 use daemon_client::exit_waiter::{ExitWaiter, ProcessIdentity};
 use daemon_client::manager::{DaemonManager, EnsureOutcome, ManagerConfig};
 use daemon_client::navigation_mirror::NavigationMirror;
+use daemon_client::notification_routing::FocusTimes;
 use daemon_client::quit_policy::{self, QuitOutcome};
 use daemon_client::restart::{
     CapturedView, ManagerSpawner, OwnerBinding, RestartConfig, RestartCoordinator, RestartLink,
@@ -2010,6 +2011,9 @@ fn setup_daemon_runtime(
     // by the restart transaction's capture. Managed before the daemon boots, so
     // the landing window's row can be written as it opens.
     app.manage(WindowLedger::new());
+    // Per-window focus stamps (multi-window §7): the notification-click route
+    // ranks candidate windows by most-recently-focused.
+    app.manage(FocusTimes::new());
     // The app's navigation/authorization image and the pump that executes
     // forwarded surface ops.
     let mirror = Arc::new(NavigationMirror::new());
@@ -2435,6 +2439,11 @@ fn handle_window_destroyed(window: &tauri::Window) {
     // longer has must not be migrated by a later restart.
     if let Some(ledger) = window.try_state::<WindowLedger>() {
         ledger.forget(label);
+    }
+    // The focus stamp dies with the window too: a rebuilt label must not
+    // inherit the destroyed window's recency (multi-window §7).
+    if let Some(focus_times) = window.try_state::<FocusTimes>() {
+        focus_times.forget(label);
     }
     let Some(link) = window.app_handle().try_state::<DaemonLink>() else {
         return;
@@ -3221,6 +3230,11 @@ fn main() {
                 handle_window_destroyed(window);
             }
             tauri::WindowEvent::Focused(true) => {
+                // The §7 focus stamp: which window was looked at last decides
+                // which one a clicked notification routes to.
+                if let Some(focus_times) = window.try_state::<FocusTimes>() {
+                    focus_times.record(window.label());
+                }
                 // Menu state tracks the focused owner's binding; a landing
                 // window's focus also evaluates (its binding can change).
                 update_new_session_menu_state(window.app_handle());
