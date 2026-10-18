@@ -11,6 +11,9 @@
 //! - Render the QR/copy URL: `<base>/#offer=<base64url>` with unpadded
 //!   URL-safe base64 (`A-Za-z0-9-_`), matching Paseo
 //!   `encodeOfferToFragmentUrl` byte-for-byte in construction.
+//! - Assemble the one-scan pairing offer (spec §2.6): daemon identity +
+//!   relay endpoint + freshly minted pairing token → `{url, expiresAt}`;
+//!   `PICOT_RELAY_ENDPOINT` overrides the default endpoint (spec §4).
 //! - Parse a pasted URL (locating `#offer=` anywhere, Paseo
 //!   `parseConnectionOfferFromUrl` shape) or a bare base64url payload;
 //!   reject `v != 2`, empty `serverId`/`daemonPublicKeyB64`/`relay.endpoint`,
@@ -68,6 +71,50 @@ pub fn encode_offer_payload(offer: &ConnectionOfferV2) -> Result<String, String>
 pub fn offer_url(offer: &ConnectionOfferV2, base: &str) -> Result<String, String> {
     let base = base.strip_suffix('/').unwrap_or(base);
     Ok(format!("{base}/#offer={}", encode_offer_payload(offer)?))
+}
+
+/// Effective relay endpoint (spec §4): a non-empty `PICOT_RELAY_ENDPOINT`
+/// overrides the company-relay constant (dev/self-hosted smoke; never in UI).
+/// Same env-consumption shape as `vcc_config::config_file`.
+pub fn relay_endpoint() -> String {
+    std::env::var("PICOT_RELAY_ENDPOINT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_RELAY_ENDPOINT.to_string())
+}
+
+/// The `relay_pairing_offer` op result (spec §4.1): the QR/copy URL plus the
+/// token's expiry, so the UI can grey the code out the instant it dies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingOffer {
+    pub url: String,
+    pub expires_at: u64,
+}
+
+/// Assemble the one-scan pairing offer (spec §2.6): the daemon identity
+/// (E2EE trust anchor), the relay endpoint, and the freshly minted pairing
+/// token rendered as the placeholder-host offer URL.
+pub fn build_pairing_offer(
+    identity: &crate::relay::e2ee::DaemonIdentity,
+    endpoint: &str,
+    pairing: &crate::remote_auth::Pairing,
+) -> Result<PairingOffer, String> {
+    let offer = ConnectionOfferV2 {
+        v: 2,
+        server_id: identity.server_id.clone(),
+        daemon_public_key_b64: identity.public_key_b64.clone(),
+        relay: RelayEndpoint {
+            endpoint: endpoint.to_string(),
+            use_tls: true,
+        },
+        pairing_token: Some(pairing.token.clone()),
+        pairing_token_expires_at: Some(pairing.expires_at),
+    };
+    Ok(PairingOffer {
+        url: offer_url(&offer, APP_BASE_URL)?,
+        expires_at: pairing.expires_at,
+    })
 }
 
 /// Parse a connection offer from a full URL (anywhere containing `#offer=`)
@@ -134,6 +181,28 @@ impl ConnectionOfferV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_store::{MetadataStore, SharedMetadataStore};
+    use crate::relay::e2ee::load_or_create_identity;
+    use crate::remote_auth::Pairing;
+    use std::sync::{Arc, Mutex};
+
+    /// DaemonIdentity's secret key is module-private, and the loader is the
+    /// production construction path — tests use it verbatim on a temp store.
+    fn test_identity() -> crate::relay::e2ee::DaemonIdentity {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "picot-pairing-offer-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let store: SharedMetadataStore = Arc::new(Mutex::new(
+            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+        ));
+        load_or_create_identity(&store).unwrap()
+    }
 
     /// Paseo daemon public key literal: canonical padded standard base64 of
     /// 32 bytes (tweetnacl `nacl.util.encodeBase64` output shape).
@@ -322,5 +391,43 @@ mod tests {
         let parsed = parse_connection_offer(&extended).unwrap();
         assert_eq!(parsed.pairing_token.as_deref(), Some("picot_pair_x"));
         assert_eq!(parsed.pairing_token_expires_at, None);
+    }
+
+    #[test]
+    fn build_pairing_offer_round_trips_all_fields() {
+        let identity = test_identity();
+        let pairing = Pairing {
+            token: "picot_pair_0123456789abcdef".to_string(),
+            expires_at: 1_771_000_500,
+        };
+        let offer = build_pairing_offer(&identity, DEFAULT_RELAY_ENDPOINT, &pairing).unwrap();
+        assert!(offer.url.starts_with("https://picot.021521.xyz/#offer="));
+        assert_eq!(offer.expires_at, 1_771_000_500);
+
+        let parsed = parse_connection_offer(&offer.url).unwrap();
+        assert_eq!(parsed.v, 2);
+        assert_eq!(parsed.server_id, identity.server_id);
+        assert_eq!(parsed.daemon_public_key_b64, identity.public_key_b64);
+        assert_eq!(parsed.relay.endpoint, DEFAULT_RELAY_ENDPOINT);
+        assert!(parsed.relay.use_tls);
+        assert_eq!(
+            parsed.pairing_token.as_deref(),
+            Some("picot_pair_0123456789abcdef")
+        );
+        assert_eq!(parsed.pairing_token_expires_at, Some(1_771_000_500));
+    }
+
+    #[test]
+    fn build_pairing_offer_carries_endpoint_override_and_expires_at() {
+        let identity = test_identity();
+        let pairing = Pairing {
+            token: "picot_pair_override".to_string(),
+            expires_at: 42,
+        };
+        let offer = build_pairing_offer(&identity, "localhost:9443", &pairing).unwrap();
+        assert_eq!(offer.expires_at, 42);
+        let parsed = parse_connection_offer(&offer.url).unwrap();
+        assert_eq!(parsed.relay.endpoint, "localhost:9443");
+        assert_eq!(parsed.pairing_token_expires_at, Some(42));
     }
 }

@@ -49,11 +49,28 @@ impl RemoteAuth {
     }
 
     pub fn create_pairing(&mut self, now: u64) -> Pairing {
-        self.pending.retain(|_, expires_at| *expires_at > now);
+        // Lazy cleanup shares the rejection boundary (`now > expires_at` is
+        // dead): a token at now == expires_at is still redeemable (spec
+        // 2026-10-17-relay-phase2 §2.10).
+        self.pending.retain(|_, expires_at| *expires_at >= now);
         let token = format!("picot_pair_{}", Uuid::new_v4().simple());
         let expires_at = now + PAIRING_LIFETIME_SECONDS;
         self.pending.insert(hash(&token), expires_at);
         Pairing { token, expires_at }
+    }
+
+    /// Invalidate every unconsumed pairing token (spec §2.10 `superseded`
+    /// on re-mint and the relay-off state). Paired device tokens survive.
+    pub fn revoke_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Mint a pairing token superseding any unconsumed one first, so at
+    /// most one unconsumed token exists at any time (spec §2.6/§2.10; both
+    /// mint points share this pending pool, spec §6).
+    pub fn mint_fresh_pairing_token(&mut self, now: u64) -> Pairing {
+        self.revoke_pending();
+        self.create_pairing(now)
     }
 
     pub fn exchange(
@@ -176,6 +193,49 @@ mod tests {
             !String::from_utf8_lossy(&fs::read(temp.join("picot.sqlite3")).unwrap())
                 .contains(&device_token)
         );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn revoke_pending_supersedes_every_unconsumed_token() {
+        let (mut auth, _store, temp) = shared_auth();
+        let first = auth.create_pairing(1_000);
+        let second = auth.create_pairing(1_100);
+        auth.revoke_pending();
+        assert_eq!(
+            auth.exchange(&first.token, "phone", 1_200),
+            Err(PairingError::InvalidOrUsed)
+        );
+        assert_eq!(
+            auth.exchange(&second.token, "phone", 1_201),
+            Err(PairingError::InvalidOrUsed)
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn mint_fresh_pairing_token_leaves_at_most_one_unconsumed_token() {
+        let (mut auth, _store, temp) = shared_auth();
+        let stale = auth.mint_fresh_pairing_token(1_000);
+        let fresh = auth.mint_fresh_pairing_token(1_100);
+        assert_eq!(
+            auth.exchange(&stale.token, "phone", 1_101),
+            Err(PairingError::InvalidOrUsed)
+        );
+        assert!(auth.exchange(&fresh.token, "phone", 1_102).is_ok());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn now_equal_to_expires_at_is_still_redeemable_for_cleanup_and_exchange() {
+        let (mut auth, _store, temp) = shared_auth();
+        let pairing = auth.create_pairing(4_000);
+        assert_eq!(pairing.expires_at, 4_300);
+        // The lazy cleanup inside create_pairing runs at now == expires_at
+        // and must keep the token: cleanup and rejection share one boundary
+        // (spec 2026-10-17-relay-phase2 §2.10, `now == expires_at` usable).
+        let _next = auth.create_pairing(4_300);
+        assert!(auth.exchange(&pairing.token, "phone", 4_300).is_ok());
         fs::remove_dir_all(temp).unwrap();
     }
 

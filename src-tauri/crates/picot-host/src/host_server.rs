@@ -3011,7 +3011,7 @@ async fn dispatch(
                     .auth
                     .lock()
                     .map_err(|_| ("auth_unavailable", "Remote auth unavailable".into()))?
-                    .create_pairing(now_seconds());
+                    .mint_fresh_pairing_token(now_seconds());
                 return Ok(json!({
                     "type": "host_response",
                     "requestId": request_id,
