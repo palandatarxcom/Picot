@@ -18,6 +18,15 @@ test-seams = []
 # reach `test-seams` from a `tests/` target, which is compiled without
 # `cfg(test)`.
 picot-host = { path = ".", features = ["test-seams"] }
+# TLS contract tests (plan T4 step 1): rcgen mints the in-process test CA +
+# server pair, and the mock's listener accepts TLS through the same
+# native-tls stack the daemon dials with. The server key is RSA — minted by
+# the pure-Rust `rsa` crate (rcgen's ring backend cannot generate RSA) — a
+# shape SecurityFramework's PKCS#8 identity import accepts.
+rcgen = "0.14"
+rsa = "0.9"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 
 # Phase 1 (plan D1, Dr. Lin decision 4): no `tauri` dependency here, directly or
 # transitively. scripts/check-daemon-no-tauri.js enforces this in `bun run test`.

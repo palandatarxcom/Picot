@@ -32,6 +32,147 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+
+// ── TLS contract fixtures (plan T4 step 1) ─────────────────────────────────
+//
+// rcgen mints the test CA and the server certificate in-process, so no PEM
+// fixture ever lands in the repo. The CA signs the server cert exactly as a
+// company relay's would, and the daemon's connector trusts only the CA.
+
+/// The certificate pair the TLS contract cases need.
+#[allow(dead_code)] // shared support: per-target subset usage
+pub struct TestCertificate {
+    /// CA certificate PEM — the only root the fixture connector trusts.
+    pub ca_pem: String,
+    /// Server certificate PEM for the listener's identity.
+    pub server_pem: String,
+    /// Server key PEM for the listener's identity.
+    pub server_key_pem: String,
+}
+
+#[allow(dead_code)] // shared support: per-target subset usage
+pub fn test_certificate() -> TestCertificate {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
+
+    let ca_key = KeyPair::generate().expect("CA key");
+    let mut ca_params = CertificateParams::default();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Picot relay test CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+
+    // The server key is RSA: SecurityFramework (native-tls's macOS backend)
+    // rejects PKCS#8 EC keys at identity import (`errSecUnknownFormat`) while
+    // PKCS#8 RSA imports cleanly — native-tls's own from_pkcs8 tests rely on
+    // the same combination. rcgen's ring backend cannot generate RSA keys, so
+    // the pure-Rust `rsa` crate mints it and rcgen only loads it.
+    use rsa::pkcs8::EncodePrivateKey;
+
+    let mut rng = rand::thread_rng();
+    let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("server RSA key generation");
+    let server_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &rsa_key
+            .to_pkcs8_der()
+            .expect("server key PKCS#8 export")
+            .as_bytes()
+            .into(),
+        &rcgen::PKCS_RSA_SHA256,
+    )
+    .expect("server key load");
+    // SANs cover both dial forms the transport can produce for loopback.
+    let mut server_params =
+        CertificateParams::new(["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("server params");
+    // The key usages a TLS server certificate is validated against.
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let issuer = Issuer::new(ca_params, ca_key);
+    let server = server_params
+        .signed_by(&server_key, &issuer)
+        .expect("server certificate");
+
+    TestCertificate {
+        ca_pem: ca.pem(),
+        server_pem: server.pem(),
+        server_key_pem: server_key.serialize_pem(),
+    }
+}
+
+/// A TLS-listening relay for the transport's TLS contract cases (spec §2.5,
+/// D10): the control-socket behavior of the plaintext mock (upgrade → initial
+/// `sync`) over a native-tls listener holding the test certificate. Data
+/// sockets stay out of scope — TLS sits below the WS layer the plaintext
+/// mock's data paths already cover.
+pub struct TlsMockRelay {
+    addr: std::net::SocketAddr,
+    upgrades: Arc<AtomicU32>,
+}
+
+#[allow(dead_code)] // shared support: per-target subset usage
+impl TlsMockRelay {
+    /// Bind an ephemeral loopback TLS port serving the control contract.
+    pub async fn start(cert: &TestCertificate) -> TlsMockRelay {
+        let identity = native_tls::Identity::from_pkcs8(
+            cert.server_pem.as_bytes(),
+            cert.server_key_pem.as_bytes(),
+        )
+        .expect("server identity");
+        let acceptor = tokio_native_tls::TlsAcceptor::from(
+            native_tls::TlsAcceptor::new(identity).expect("TLS acceptor"),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind TLS mock relay");
+        let addr = listener.local_addr().expect("TLS mock relay port");
+        let upgrades = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&upgrades);
+        tokio::spawn(async move {
+            loop {
+                // Serial by design: the daemon holds one control socket, and
+                // a rejected handshake (the default-connector case) returns
+                // the loop to accept at once.
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    continue;
+                };
+                let Ok(mut socket) = tokio_tungstenite::accept_async(tls).await else {
+                    continue;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let sync = "{\"type\":\"sync\",\"connectionIds\":[]}";
+                if socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        sync.to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                // Pump reads so the daemon's WS pings get answered while
+                // the control socket lives.
+                while let Some(Ok(_)) = socket.next().await {}
+            }
+        });
+        TlsMockRelay { addr, upgrades }
+    }
+
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    /// Completed WS upgrades over TLS — a rejected TLS handshake never counts.
+    pub fn control_upgrades(&self) -> u32 {
+        self.upgrades.load(Ordering::SeqCst)
+    }
+}
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;

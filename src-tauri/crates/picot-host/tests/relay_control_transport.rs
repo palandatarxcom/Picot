@@ -746,6 +746,115 @@ async fn inbound_plaintext_length_bound_closes_connection_beyond_limit() {
     transport.stop().await;
 }
 
+// ── TLS contract (plan T4 step 1, spec §2.5 D10) ───────────────────────────
+//
+// The mock answers wss:// dials with a certificate from an in-process test
+// CA. The two cases pin the dial's TLS behavior:
+//
+// - a connector trusting the fixture CA completes the handshake and the
+//   control contract (state Online over TLS);
+// - the production default connector (native-tls system roots) rejects the
+//   same self-signed chain before any WS upgrade and backs off per §2.5.
+
+#[tokio::test]
+async fn tls_dial_with_fixture_ca_connector_reaches_online() {
+    let cert = mock_relay::test_certificate();
+    let relay = mock_relay::TlsMockRelay::start(&cert).await;
+    let tls = native_tls::TlsConnector::builder()
+        .add_root_certificate(
+            native_tls::Certificate::from_pem(cert.ca_pem.as_bytes()).expect("fixture CA cert"),
+        )
+        .build()
+        .expect("fixture-CA connector");
+    let (state_tx, mut states) = mpsc::unbounded_channel();
+    let (open_tx, _opens) = mpsc::unbounded_channel();
+    let (close_tx, _closes) = mpsc::unbounded_channel();
+    let sink = Arc::new(RecordingSink {
+        states: state_tx,
+        opens: open_tx,
+        closes: close_tx,
+    });
+    let transport = RelayTransport::start_with_seams(
+        RelayConfig {
+            endpoint: relay.addr().to_string(),
+            use_tls: true,
+            server_id: "test-server-id".into(),
+        },
+        test_identity(),
+        sink,
+        TransportSeams {
+            timings: test_timings(),
+            sleep: default_sleep(),
+            connector: Some(tokio_tungstenite::Connector::NativeTls(tls)),
+        },
+    );
+
+    // Handshake + upgrade + initial `sync` all happen over TLS: Online is the
+    // proof the fixture CA chain validated end to end.
+    assert_eq!(recv_state(&mut states).await, ConnectionState::Connecting);
+    assert_eq!(recv_state(&mut states).await, ConnectionState::Online);
+    assert_eq!(relay.control_upgrades(), 1);
+
+    transport.stop().await;
+}
+
+#[tokio::test]
+async fn tls_dial_with_default_connector_is_rejected_and_backs_off() {
+    let cert = mock_relay::test_certificate();
+    let relay = mock_relay::TlsMockRelay::start(&cert).await;
+    let (state_tx, mut states) = mpsc::unbounded_channel();
+    let (open_tx, _opens) = mpsc::unbounded_channel();
+    let (close_tx, _closes) = mpsc::unbounded_channel();
+    let sink = Arc::new(RecordingSink {
+        states: state_tx,
+        opens: open_tx,
+        closes: close_tx,
+    });
+    let recorder = RecordingSleep::default();
+    let transport = RelayTransport::start_with_seams(
+        RelayConfig {
+            endpoint: relay.addr().to_string(),
+            use_tls: true,
+            server_id: "test-server-id".into(),
+        },
+        test_identity(),
+        sink,
+        TransportSeams {
+            timings: test_timings(),
+            sleep: recorder.seam(),
+            // Production default: native-tls system trust store — the test
+            // CA is not in it, so the chain must be rejected at the TLS
+            // handshake, before any WebSocket upgrade.
+            connector: None,
+        },
+    );
+
+    assert_eq!(recv_state(&mut states).await, ConnectionState::Connecting);
+    assert_eq!(recv_state(&mut states).await, ConnectionState::Offline);
+    until("three rejected dials recorded backoff", || {
+        recorder.durations().len() >= 3
+    })
+    .await;
+    assert_eq!(
+        relay.control_upgrades(),
+        0,
+        "an untrusted chain must never complete a WS upgrade"
+    );
+    assert_eq!(
+        recorder.durations()[0],
+        Duration::from_secs(1),
+        "rejected dial backs off from base × 1"
+    );
+    while let Ok(state) = states.try_recv() {
+        assert_ne!(
+            state,
+            ConnectionState::Online,
+            "untrusted CA never reaches Online"
+        );
+    }
+
+    transport.stop().await;
+}
 fn default_sleep() -> SleepFn {
     Arc::new(|duration: Duration| Box::pin(tokio::time::sleep(duration)))
 }
