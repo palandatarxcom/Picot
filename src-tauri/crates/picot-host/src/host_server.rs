@@ -17,7 +17,7 @@ use crate::transport_limits::{
 };
 use crate::window_owner::WindowOwnerRegistry;
 use axum::body::{Body, Bytes};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::Query;
 use axum::extract::{DefaultBodyLimit, Json, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, PRAGMA};
@@ -155,7 +155,7 @@ fn fingerprint_static_dir(static_dir: &std::path::Path) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
-struct HostState {
+pub(crate) struct HostState {
     router: Mutex<HostRouter>,
     static_dir: PathBuf,
     #[allow(dead_code)]
@@ -1520,7 +1520,10 @@ fn outbound_message(value: Value, kind: PayloadKind) -> Message {
     Message::Text(value.to_string().into())
 }
 
-async fn send_checked(socket: &mut WebSocket, value: Value, kind: PayloadKind) -> bool {
+async fn send_checked<S, E>(socket: &mut S, value: Value, kind: PayloadKind) -> bool
+where
+    S: futures_util::Stream<Item = Result<Message, E>> + futures_util::Sink<Message> + Unpin,
+{
     socket.send(outbound_message(value, kind)).await.is_ok()
 }
 
@@ -1530,10 +1533,40 @@ async fn websocket_upgrade(
 ) -> Response {
     websocket
         .max_message_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_websocket(socket, state))
+        .on_upgrade(move |socket| run_session(socket, state, SessionTransport::Loopback))
 }
 
-async fn handle_websocket(mut socket: WebSocket, state: Arc<HostState>) {
+/// Where a session socket came from (relay plan D2). The axum upgrade path is
+/// always [`SessionTransport::Loopback`]; the `Relay` arm is the seam task T5
+/// consumes to register relay sessions under a host-assigned internal id and
+/// admit `remote` hellos only — nothing reads it before that task lands.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Relay arm + fields are consumed by relay task T5
+pub(crate) enum SessionTransport {
+    Loopback,
+    Relay {
+        routing_id: String,
+        declared_client_id: Option<String>,
+    },
+}
+
+/// The whole WS session pipeline (hello → hello_ack → event subscriptions →
+/// request loop), generic over the socket halves so the stream source is
+/// replaceable: axum's upgraded TCP socket today, a relay data socket after
+/// E2EE termination (spec §2.2 — the Paseo `attachSocket(transport:"relay")`
+/// counterpart). Errors from either half are terminal and discarded, exactly
+/// as the axum path always did.
+pub(crate) async fn run_session<S, E>(
+    mut socket: S,
+    state: Arc<HostState>,
+    _transport: SessionTransport,
+) where
+    S: futures_util::Stream<Item = Result<Message, E>>
+        + futures_util::Sink<Message>
+        + Unpin
+        + Send
+        + 'static,
+{
     let Some(Ok(Message::Text(first))) = socket.next().await else {
         return;
     };
@@ -4415,12 +4448,15 @@ fn api_error(status: StatusCode, code: &'static str) -> (StatusCode, Json<Value>
     (status, Json(json!({ "error": { "code": code } })))
 }
 
-async fn send_error(
-    socket: &mut WebSocket,
+async fn send_error<S>(
+    socket: &mut S,
     request_id: Option<&str>,
     code: &'static str,
     message: &str,
-) -> Result<(), axum::Error> {
+) -> Result<(), S::Error>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
     socket
         .send(Message::Text(
             structured_error(request_id, code, message)
@@ -8872,5 +8908,243 @@ mod tests {
         let _ = socket.close(None).await;
         host.stop();
         let _ = fs::remove_dir_all(temp);
+    }
+
+    /// Adapter-contract tests (relay plan T3): `run_session` must accept any
+    /// `Stream + Sink` socket, not just the axum upgrade — this is the seam a
+    /// relay data socket plugs into after E2EE termination (spec §2.2).
+    mod adapter_contract {
+        use super::super::{run_session, HostServer, SessionTransport};
+        use crate::host_router::PROTOCOL_VERSION;
+        use crate::metadata_store::MetadataStore;
+        use crate::native_pi_manager::NativePiManager;
+        use crate::remote_auth::RemoteAuth;
+        use axum::extract::ws::Message;
+        use serde_json::{json, Value};
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        /// Sink failure marker; the pipeline discards socket errors, so it
+        /// never carries information.
+        struct ContractError;
+
+        /// In-memory session double: scripted inbound frames flow from
+        /// `in_tx`, outbound frames are observable on `out_rx`, and
+        /// `fail_sends` kills the sink half on demand.
+        struct ContractSocket {
+            inbound: tokio::sync::mpsc::UnboundedReceiver<Message>,
+            outbound: tokio::sync::mpsc::UnboundedSender<Message>,
+            fail_sends: bool,
+        }
+
+        impl futures_util::Stream for ContractSocket {
+            type Item = Result<Message, ContractError>;
+
+            fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                self.get_mut()
+                    .inbound
+                    .poll_recv(cx)
+                    .map(|frame| frame.map(Ok))
+            }
+        }
+
+        impl futures_util::Sink<Message> for ContractSocket {
+            type Error = ContractError;
+
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+                if self.fail_sends {
+                    return Err(ContractError);
+                }
+                self.outbound.send(item).map_err(|_| ContractError)
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        /// Bare host with one registered desktop owner, no socket connected:
+        /// `run_session` is driven directly through the contract double.
+        async fn contract_host(label: &str) -> (HostServer, String, std::path::PathBuf) {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let temp = std::env::temp_dir().join(format!("picot-host-contract-{label}-{nonce}"));
+            let workspace = temp.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let public = temp.join("public");
+            std::fs::create_dir_all(&public).unwrap();
+            std::fs::write(public.join("index.html"), "Picot").unwrap();
+            let metadata = Arc::new(Mutex::new(
+                MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+            ));
+            let workspace_id = metadata
+                .lock()
+                .unwrap()
+                .add_workspace(&workspace)
+                .unwrap()
+                .0
+                .workspace_id;
+            let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+            let registry = Arc::new(crate::window_owner::WindowOwnerRegistry::default());
+            let host = HostServer::start_with_session_root(
+                public,
+                NativePiManager::new(4),
+                auth,
+                metadata,
+                Some(temp.join("sessions")),
+            )
+            .await
+            .expect("host server starts");
+            let (_owner, capability) = registry
+                .create_owner_with_workspace(
+                    format!("{label}-window"),
+                    workspace,
+                    0,
+                    host.origin().into(),
+                    Some(workspace_id),
+                    crate::window_owner::TemporaryKind::DefaultStartup,
+                )
+                .unwrap();
+            host.set_owner_registry(registry);
+            host.runtime_started().expect("generation advances");
+            (host, capability, temp)
+        }
+
+        fn hello_frame(client_id: &str, capability: &str) -> Message {
+            Message::Text(
+                json!({
+                    "type": "hello",
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "clientType": "desktop",
+                    "clientId": client_id,
+                    "desktopCapability": capability,
+                })
+                .to_string()
+                .into(),
+            )
+        }
+
+        #[tokio::test]
+        async fn run_session_round_trips_hello_and_a_request_over_a_non_axum_socket() {
+            let (host, capability, temp) = contract_host("round-trip").await;
+            let state = host.state.clone();
+            let client_id = "adapter-contract-client".to_string();
+            let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            let socket = ContractSocket {
+                inbound: in_rx,
+                outbound: out_tx,
+                fail_sends: false,
+            };
+            let session = tokio::spawn(run_session(
+                socket,
+                Arc::clone(&state),
+                SessionTransport::Loopback,
+            ));
+
+            in_tx.send(hello_frame(&client_id, &capability)).unwrap();
+            let ack: Value =
+                serde_json::from_str(out_rx.recv().await.unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(ack["type"], "hello_ack", "handshake ack: {ack}");
+
+            // One business frame through the same entry: routed, dispatched on
+            // a spawned task, answered over the outbound writer.
+            in_tx
+                .send(Message::Text(
+                    json!({
+                        "type": "data_request",
+                        "requestId": "adapter-1",
+                        "operation": "definitely_not_an_operation",
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            let response: Value =
+                serde_json::from_str(out_rx.recv().await.unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(
+                response["requestId"], "adapter-1",
+                "correlated reply: {response}"
+            );
+            assert_eq!(
+                response["type"], "error",
+                "unknown op answers with an error frame"
+            );
+
+            // Peer gone (recv -> None): the session task exits and unregisters
+            // the declared id — the loopback registration key stays as-is.
+            drop(in_tx);
+            tokio::time::timeout(Duration::from_secs(5), session)
+                .await
+                .expect("recv-None ends the session")
+                .unwrap();
+            assert!(
+                state
+                    .router
+                    .lock()
+                    .unwrap()
+                    .client_context(&client_id)
+                    .is_none(),
+                "disconnect unregisters the loopback client"
+            );
+            host.stop();
+            std::fs::remove_dir_all(temp).unwrap();
+        }
+
+        #[tokio::test]
+        async fn run_session_exits_promptly_when_the_socket_send_half_is_dead() {
+            let (host, capability, temp) = contract_host("dead-sink").await;
+            let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+            let socket = ContractSocket {
+                inbound: in_rx,
+                outbound: out_tx,
+                fail_sends: true,
+            };
+            let session = tokio::spawn(run_session(
+                socket,
+                host.state.clone(),
+                SessionTransport::Loopback,
+            ));
+
+            in_tx
+                .send(hello_frame("adapter-dead-sink-client", &capability))
+                .unwrap();
+            // The sink refuses the hello_ack: the session returns instead of
+            // hanging on a dead socket. `in_tx` stays open, so the exit must
+            // come from the send failure alone, not from the stream ending.
+            tokio::time::timeout(Duration::from_secs(5), session)
+                .await
+                .expect("send-failure ends the session")
+                .unwrap();
+            assert!(
+                out_rx.try_recv().is_err(),
+                "a failed send must not deliver a frame"
+            );
+            drop(in_tx);
+            host.stop();
+            std::fs::remove_dir_all(temp).unwrap();
+        }
     }
 }
