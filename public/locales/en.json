@@ -809,6 +809,7 @@
           "connecting": "Connecting to relay"
         },
         "urlLabel": "Pairing link",
+        "expired": "This pairing link has expired. Generate a new code to pair.",
         "copy": "Copy link",
         "copied": "Copied",
         "regenerate": "New code",

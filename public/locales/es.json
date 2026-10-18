@@ -809,6 +809,7 @@
           "connecting": "Conectando al relay"
         },
         "urlLabel": "Enlace de emparejamiento",
+        "expired": "Este enlace de emparejamiento ha caducado. Genera un código nuevo.",
         "copy": "Copiar enlace",
         "copied": "Copiado",
         "regenerate": "Nuevo código",

@@ -809,6 +809,7 @@
           "connecting": "正在连接中继"
         },
         "urlLabel": "配对链接",
+        "expired": "配对链接已过期，请生成新的配对码。",
         "copy": "复制链接",
         "copied": "已复制",
         "regenerate": "重新生成",

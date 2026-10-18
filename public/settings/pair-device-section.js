@@ -73,6 +73,7 @@ export function setupPairDeviceSection({
   const stateEl = root.getElementById("pair-device-state");
   const qrCanvas = root.getElementById("pair-device-qr");
   const urlInput = root.getElementById("pair-device-url");
+  const expiredEl = root.getElementById("pair-device-expired");
   const copyBtn = root.getElementById("btn-pair-device-copy");
   const regenerateBtn = root.getElementById("btn-pair-device-regenerate");
   const disableBtn = root.getElementById("btn-pair-device-disable");
@@ -90,6 +91,7 @@ export function setupPairDeviceSection({
     !stateEl ||
     !qrCanvas ||
     !urlInput ||
+    !expiredEl ||
     !copyBtn ||
     !regenerateBtn ||
     !disableBtn
@@ -157,8 +159,20 @@ export function setupPairDeviceSection({
     }
   }
 
+  /**
+   * Spec §2.10: `expiresAt` is epoch seconds and `now == expiresAt` is still
+   * valid on the daemon side; the ms comparison only ever errs one second
+   * early, never shows a dead code as live.
+   */
+  function offerExpired() {
+    return (
+      offer !== null && typeof offer.expiresAt === "number" && Date.now() > offer.expiresAt * 1000
+    );
+  }
+
   function render() {
     const enabled = relayStatus?.enabled === true;
+    const expired = enabled && offerExpired();
     row.hidden = enabled;
     offerRow.hidden = !enabled;
     // The offer state replaces the consent wholesale, open or not.
@@ -166,8 +180,16 @@ export function setupPairDeviceSection({
     if (enabled) {
       stateEl.textContent = `${stateLabel(relayStatus?.state)} · ${relayStatus?.endpoint ?? "—"}`;
       urlInput.value = offer?.url ?? "";
-      void renderQr(offer?.url ?? null);
+      // An expired offer is a dead code (spec §2.10): hide the QR, keep the
+      // URL row with the expired marker — Regenerate is the way out.
+      expiredEl.hidden = !expired;
+      if (expired) {
+        qrCanvas.classList.add("hidden");
+      } else {
+        void renderQr(offer?.url ?? null);
+      }
     } else {
+      expiredEl.hidden = true;
       consentTitle.textContent = t("settings.daemon.pairDevice.enableTitle");
       consentText.textContent = t("settings.daemon.pairDevice.enableDescription", {
         endpoint: relayStatus?.endpoint ?? "—",

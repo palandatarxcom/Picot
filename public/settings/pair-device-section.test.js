@@ -117,6 +117,7 @@ function mountBlock() {
     state: document.getElementById("pair-device-state"),
     qr: document.getElementById("pair-device-qr"),
     url: document.getElementById("pair-device-url"),
+    expired: document.getElementById("pair-device-expired"),
     copyBtn: document.getElementById("btn-pair-device-copy"),
     regenerateBtn: document.getElementById("btn-pair-device-regenerate"),
     disableBtn: document.getElementById("btn-pair-device-disable"),
@@ -298,6 +299,48 @@ describe("relay on (offer state)", () => {
     expect(commands()).toEqual(["relay_status", "relay_offer", "relay_status", "relay_status"]);
   });
 
+  it("hides the dead QR and marks the offer expired once past expiresAt", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { page, qr, url, expired, toCanvas, regenerateBtn } = setup({
+      status: relayOn(),
+      offer: (mints) => ({
+        url: `https://picot.021521.xyz/#offer=t${mints}`,
+        // The first mint is already dead; Regenerate is the way out.
+        expiresAt: mints === 1 ? now - 60 : now + 300,
+      }),
+    });
+    await page.activate();
+    // Spec §2.10: an expired offer is never shown as usable — the QR (the
+    // scannable code) disappears and the URL row carries the expired marker.
+    expect(qr.classList.contains("hidden")).toBe(true);
+    expect(toCanvas).not.toHaveBeenCalled();
+    expect(expired.hidden).toBe(false);
+    expect(expired.textContent.trim()).toBe(COPY.expired);
+    expect(url.value).toBe("https://picot.021521.xyz/#offer=t1");
+
+    regenerateBtn.click();
+    await flush();
+    expect(url.value).toBe("https://picot.021521.xyz/#offer=t2");
+    expect(qr.classList.contains("hidden")).toBe(false);
+    expect(expired.hidden).toBe(true);
+  });
+
+  it("renders the QR normally while the offer is fresh", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { page, qr, expired, toCanvas } = setup({
+      status: relayOn(),
+      offer: () => ({ url: "https://picot.021521.xyz/#offer=fresh", expiresAt: now + 300 }),
+    });
+    await page.activate();
+    expect(expired.hidden).toBe(true);
+    expect(qr.classList.contains("hidden")).toBe(false);
+    expect(toCanvas).toHaveBeenCalledWith(
+      document.getElementById("pair-device-qr"),
+      "https://picot.021521.xyz/#offer=fresh",
+      { width: 200 },
+    );
+  });
+
   it("copies the link and shows the two-second confirmation", async () => {
     vi.useFakeTimers();
     const { page, copyBtn, writeText } = setup({ status: relayOn() });
@@ -477,6 +520,18 @@ async function renderEveryBranch() {
     await flush();
     await flush();
   }
+  // The expired-offer branch (spec §2.10): a dead code renders greyed.
+  mountBlock();
+  mountInvoke({
+    status: relayOn(),
+    offer: () => ({ url: "https://picot.021521.xyz/#offer=dead", expiresAt: 0 }),
+  });
+  mountShell();
+  {
+    const page = setupPairDeviceSection({ root: document });
+    await page.activate();
+    await flush();
+  }
   globalThis.PicotQr = {
     toCanvas: async () => {
       throw new Error("no renderer");
@@ -485,6 +540,7 @@ async function renderEveryBranch() {
   {
     mountBlock();
     mountInvoke({ status: relayOn() });
+    mountShell();
     const page = setupPairDeviceSection({ root: document });
     await page.activate();
     await flush();
