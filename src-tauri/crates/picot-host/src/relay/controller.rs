@@ -244,8 +244,10 @@ impl RelayController {
 
     /// The `relay.offer` op (spec §4.1 `relay_pairing_offer`): identity +
     /// endpoint + a freshly minted one-scan pairing token rendered as the
-    /// `#offer=` URL. Refuses while disabled — no implicit enable.
-    pub fn pairing_offer(&self) -> Result<PairingOffer, String> {
+    /// `#offer=` URL. The mint records `owner` — the binding exchange stamps
+    /// onto the device token (Gate B, spec §2.8). Refuses while disabled —
+    /// no implicit enable.
+    pub fn pairing_offer(&self, owner: &str) -> Result<PairingOffer, String> {
         if !self.enabled()? {
             return Err(
                 "relay is not enabled: enable relay before minting a pairing offer".to_string(),
@@ -267,7 +269,7 @@ impl RelayController {
             .remote_auth
             .lock()
             .map_err(|_| "remote auth lock poisoned".to_string())?
-            .mint_fresh_pairing_token(now);
+            .mint_fresh_pairing_token(now, Some(owner));
         build_pairing_offer(&identity, &endpoint, use_tls, &pairing)
     }
 

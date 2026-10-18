@@ -401,9 +401,9 @@ async fn relay_status_reaches(socket: &mut Client, want: &str, what: &str) -> Va
     }
 }
 
-/// One `relay.offer` round trip, asserted ok.
-async fn relay_offer(socket: &mut Client, id: &str) -> PairingOffer {
-    let response = request(socket, id, "relay.offer", json!({})).await;
+/// One `relay.offer` round trip minted for `owner`, asserted ok.
+async fn relay_offer(socket: &mut Client, id: &str, owner: &str) -> PairingOffer {
+    let response = request(socket, id, "relay.offer", json!({ "ownerId": owner })).await;
     assert_eq!(response["ok"], true, "{response}");
     let url = response["result"]["url"]
         .as_str()
@@ -411,6 +411,17 @@ async fn relay_offer(socket: &mut Client, id: &str) -> PairingOffer {
         .to_owned();
     let expires_at = response["result"]["expiresAt"].as_u64().expect("expiresAt");
     PairingOffer { url, expires_at }
+}
+
+/// Create one owner through the admin op and return its id — the identity a
+/// pairing offer stamps (spec §2.8 device principal).
+async fn create_owner(socket: &mut Client, label: &str) -> String {
+    let response = request(socket, "r-owner", "owner.create", owner_args(label)).await;
+    assert_eq!(response["ok"], true, "{response}");
+    response["result"]["owner"]
+        .as_str()
+        .expect("owner id")
+        .to_owned()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -482,13 +493,14 @@ async fn relay_disable_revokes_pending_tokens_but_keeps_paired_devices() {
     // A paired device token (the thing that must survive the flip) and a
     // pending pairing token (the thing that must not).
     let auth = fixture.state.relay.remote_auth_for_tests();
-    let pairing = auth.lock().unwrap().create_pairing(1_000);
+    let pairing = auth.lock().unwrap().create_pairing(1_000, None);
     let device_token = auth
         .lock()
         .unwrap()
         .exchange(&pairing.token, "relay-op-device", 1_001)
         .expect("seeded device token");
-    let pending = relay_offer(&mut socket, "r-offer-1").await;
+    let owner = create_owner(&mut socket, "relay-offer-owner").await;
+    let pending = relay_offer(&mut socket, "r-offer-1", &owner).await;
 
     let response = request(
         &mut socket,
@@ -521,7 +533,14 @@ async fn relay_disable_revokes_pending_tokens_but_keeps_paired_devices() {
 async fn relay_offer_is_refused_while_relay_is_disabled() {
     let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
     let (mut socket, _) = fixture.attach().await;
-    let response = request(&mut socket, "r1", "relay.offer", json!({})).await;
+    let owner = create_owner(&mut socket, "relay-off-owner").await;
+    let response = request(
+        &mut socket,
+        "r1",
+        "relay.offer",
+        json!({ "ownerId": owner }),
+    )
+    .await;
     assert_eq!(response["ok"], false, "{response}");
     assert!(
         response["error"].as_str().unwrap().contains("not enabled"),
@@ -540,12 +559,13 @@ async fn relay_pairing_offer_round_trips_and_supersedes_the_prior_token() {
     let (mut socket, _) = fixture.attach().await;
     enable_relay_against_mock(&fixture, &mut socket, &relay).await;
     let status = relay_status_reaches(&mut socket, "online", "online against the mock").await;
+    let owner = create_owner(&mut socket, "relay-pair-owner").await;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let first = relay_offer(&mut socket, "r-offer-1").await;
+    let first = relay_offer(&mut socket, "r-offer-1", &owner).await;
     assert!(
         first.url.starts_with("https://picot.021521.xyz/#offer="),
         "{}",
@@ -564,7 +584,7 @@ async fn relay_pairing_offer_round_trips_and_supersedes_the_prior_token() {
     assert_eq!(offer.pairing_token_expires_at, Some(first.expires_at));
 
     // The second mint kills the first token (spec §2.10 `superseded`).
-    let second = relay_offer(&mut socket, "r-offer-2").await;
+    let second = relay_offer(&mut socket, "r-offer-2", &owner).await;
     let second_token = parse_connection_offer(&second.url)
         .unwrap()
         .pairing_token
@@ -579,12 +599,64 @@ async fn relay_pairing_offer_round_trips_and_supersedes_the_prior_token() {
         Some(PairingError::InvalidOrUsed),
         "the first token dies the moment the second offer is minted"
     );
+    let device_token = auth
+        .lock()
+        .unwrap()
+        .exchange(&second_token, "sup", now)
+        .expect("the fresh token exchanges");
+    // The relay offer stamps the requesting owner (spec §2.8): the exchanged
+    // device token carries that owner as its principal binding.
+    assert_eq!(
+        auth.lock().unwrap().authenticate(&device_token).unwrap(),
+        Some(picot_host::remote_auth::DevicePrincipal {
+            device_id: "sup".into(),
+            owner_id: Some(owner),
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_offer_with_an_unknown_owner_is_refused_without_minting() {
+    let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+    let relay = MockRelay::start().await;
+    let (mut socket, _) = fixture.attach().await;
+    enable_relay_against_mock(&fixture, &mut socket, &relay).await;
+    let response = request(
+        &mut socket,
+        "r-ghost",
+        "relay.offer",
+        json!({ "ownerId": "no-such-owner" }),
+    )
+    .await;
+    assert_eq!(response["ok"], false, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown owner"),
+        "the refusal must name the unknown owner: {response}"
+    );
+    // Nothing was minted: a live seeded token must still exchange (a real
+    // mint would have superseded it, plan D12).
+    let auth = fixture.state.relay.remote_auth_for_tests();
+    let seeded = auth.lock().unwrap().create_pairing(1_000, None);
+    // A missing owner id is the same refusal, never an unbound mint.
+    let missing = request(&mut socket, "r-none", "relay.offer", json!({})).await;
+    assert_eq!(missing["ok"], false, "{missing}");
+    let refused = request(
+        &mut socket,
+        "r-ghost",
+        "relay.offer",
+        json!({ "ownerId": "no-such-owner" }),
+    )
+    .await;
+    assert_eq!(refused["ok"], false, "{refused}");
     assert!(
         auth.lock()
             .unwrap()
-            .exchange(&second_token, "sup", now)
+            .exchange(&seeded.token, "probe", 1_001)
             .is_ok(),
-        "the fresh token exchanges"
+        "a refused offer must not mint or supersede a live token"
     );
 }
 

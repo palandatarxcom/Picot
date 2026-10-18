@@ -20,8 +20,20 @@ pub struct HostClientContext {
     pub client_id: String,
     pub kind: ClientKind,
     pub owner_id: Option<OwnerId>,
+    /// Gate B device principal (spec §2.8): the owner binding a device-token
+    /// hello resolved to. Set only for Remote sessions whose pairing stamped
+    /// an owner; desktop/loopback and legacy remote contexts carry `None`.
+    pub device: Option<DevicePrincipal>,
     pub workspace_id: Option<String>,
     pub workspace_generation: Option<u64>,
+}
+
+/// The pairing-bound identity a remote session acts for (Gate B, spec §2.8):
+/// the paired device plus the desktop owner whose pairing minted its token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePrincipal {
+    pub device_id: String,
+    pub owner_id: String,
 }
 
 impl HostClientContext {
@@ -41,6 +53,7 @@ impl HostClientContext {
             client_id: client_id.into(),
             kind: ClientKind::Desktop,
             owner_id: Some(owner_id),
+            device: None,
             workspace_id,
             workspace_generation: generation,
         }
@@ -51,6 +64,7 @@ impl HostClientContext {
             client_id: client_id.into(),
             kind: ClientKind::Unpaired,
             owner_id: None,
+            device: None,
             workspace_id: None,
             workspace_generation: None,
         }
@@ -61,8 +75,57 @@ impl HostClientContext {
             client_id: client_id.into(),
             kind: ClientKind::Remote,
             owner_id: None,
+            device: None,
             workspace_id: None,
             workspace_generation: None,
+        }
+    }
+
+    /// A remote session whose device token carried the pairing owner stamp
+    /// (Gate B slice A modeling). Admission behavior is unchanged until the
+    /// matrix widens; the context just remembers whose device this is.
+    pub fn remote_device(client_id: impl Into<String>, device: DevicePrincipal) -> Self {
+        Self {
+            client_id: client_id.into(),
+            kind: ClientKind::Remote,
+            owner_id: None,
+            device: Some(device),
+            workspace_id: None,
+            workspace_generation: None,
+        }
+    }
+}
+
+/// The request faces the session pipeline admits against (Gate B, spec §2.8).
+/// Extracted verbatim from the inline checks (relay plan T9 slice A,
+/// zero behavior drift); slice B widens the remote device arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFace {
+    /// Router-level host_request class gate: Desktop kind only.
+    HostRequest,
+    /// Host control dispatch gate: Desktop kind + owner.
+    HostControl,
+    /// runtime_request / snapshot / capabilities (`authorize_target`).
+    RuntimeCommand,
+    /// runtime_subscribe admission.
+    RuntimeSubscribe,
+    /// data_request admission (op/workspace rules stay with the caller).
+    DataRequest,
+}
+
+/// Pure admission predicate: principal class × request face. The
+/// state-dependent facts (owner registered, runtime live, workspace
+/// generation match) are the caller's inputs, not this function's.
+pub fn admits(context: &HostClientContext, face: RequestFace) -> bool {
+    match face {
+        // Management plane is desktop-only (spec §2.8): a paired device
+        // never reaches host_request regardless of its owner binding.
+        RequestFace::HostRequest => context.kind == ClientKind::Desktop,
+        RequestFace::HostControl
+        | RequestFace::RuntimeCommand
+        | RequestFace::RuntimeSubscribe
+        | RequestFace::DataRequest => {
+            context.kind == ClientKind::Desktop && context.owner_id.is_some()
         }
     }
 }
@@ -369,6 +432,66 @@ fn validate_target(target: &Value) -> Result<(), RouterError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    #[test]
+    fn admission_matrix_locks_current_semantics() {
+        use crate::host_router::{
+            admits, ClientKind, DevicePrincipal, HostClientContext, RequestFace,
+        };
+        use crate::window_owner::OwnerWorkspaceSnapshot;
+
+        let faces = [
+            RequestFace::HostRequest,
+            RequestFace::HostControl,
+            RequestFace::RuntimeCommand,
+            RequestFace::RuntimeSubscribe,
+            RequestFace::DataRequest,
+        ];
+        let desktop = HostClientContext::desktop(
+            "d",
+            crate::window_owner::OwnerId::from_string("owner".into()),
+            OwnerWorkspaceSnapshot::NoWorkspace,
+        );
+        for face in faces {
+            assert!(admits(&desktop, face), "desktop owner admits {face:?}");
+        }
+        // A device principal exists (Gate B slice A modeling) but admits
+        // nothing yet: host_request stays forbidden_class and the data-plane
+        // faces widen only in slice B (spec §2.8).
+        let bound = HostClientContext::remote_device(
+            "r",
+            DevicePrincipal {
+                device_id: "phone".into(),
+                owner_id: "owner".into(),
+            },
+        );
+        for face in faces {
+            assert!(
+                !admits(&bound, face),
+                "remote device must not admit {face:?}"
+            );
+        }
+        // Legacy remote (device token without owner binding) and the public
+        // classes are refused everywhere, exactly as today.
+        for face in faces {
+            assert!(
+                !admits(&HostClientContext::remote("r"), face),
+                "remote {face:?}"
+            );
+            assert!(
+                !admits(&HostClientContext::public("p"), face),
+                "public {face:?}"
+            );
+        }
+        // The context constructor itself: a bound remote keeps ClientKind
+        // Remote — the principal never masquerades as a desktop owner
+        // (spec §2.8, no Desktop impersonation).
+        assert_eq!(bound.kind, ClientKind::Remote);
+        assert_eq!(bound.owner_id, None);
+    }
 }
 
 #[cfg(test)]

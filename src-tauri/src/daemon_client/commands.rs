@@ -205,12 +205,29 @@ pub async fn relay_set_enabled(
 
 /// Mint a fresh one-scan pairing offer (the QR/copy URL plus its expiry).
 /// Each mint supersedes the previous unconsumed token (plan D12), so this is
-/// a pass-through of exactly `{url, expiresAt}`.
+/// a pass-through of exactly `{url, expiresAt}`. The offer is minted for the
+/// calling window's owner (Gate B device-principal binding, spec §2.8).
 #[tauri::command]
 pub async fn relay_offer(window: tauri::WebviewWindow, app: AppHandle) -> Result<Value, String> {
     let link = caller_link(&app, &window)?;
-    let reply = link.client().request("relay.offer", json!({})).await;
+    let owner = caller_owner(&app, &window)?;
+    let reply = link
+        .client()
+        .request("relay.offer", json!({ "ownerId": owner }))
+        .await;
     relay_offer_payload(reply)
+}
+
+/// The validated caller's owner id: the ledger row `validate_caller` already
+/// bound against the daemon mirror (the identity the pairing offer stamps).
+fn caller_owner(app: &AppHandle, window: &tauri::WebviewWindow) -> Result<String, String> {
+    let ledger = app
+        .try_state::<WindowLedger>()
+        .ok_or_else(|| "Picot's window ledger is not available".to_string())?;
+    ledger
+        .row_for_label(window.label())
+        .map(|row| row.owner)
+        .ok_or_else(|| format!("window {} has no owner", window.label()))
 }
 
 /// Validate the caller against the two injected states and hand back the

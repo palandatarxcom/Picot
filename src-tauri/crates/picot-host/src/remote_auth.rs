@@ -17,6 +17,15 @@ pub struct Pairing {
     pub expires_at: u64,
 }
 
+/// The identity a device token resolves to (Gate B, spec §2.8): the paired
+/// device plus the owner whose pairing minted it. `owner_id` is `None` for
+/// rows written before the binding existed (legacy LAN pairings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePrincipal {
+    pub device_id: String,
+    pub owner_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingError {
     InvalidOrUsed,
@@ -26,7 +35,14 @@ pub enum PairingError {
 
 pub struct RemoteAuth {
     store: Arc<Mutex<MetadataStore>>,
-    pending: HashMap<Vec<u8>, u64>,
+    pending: HashMap<Vec<u8>, PendingPairing>,
+}
+
+/// One unconsumed pairing token: its expiry plus the minting owner the
+/// exchange will stamp onto the device token record (Gate B, spec §2.8).
+struct PendingPairing {
+    expires_at: u64,
+    owner: Option<String>,
 }
 
 impl RemoteAuth {
@@ -48,14 +64,20 @@ impl RemoteAuth {
         operation(&mut guard)
     }
 
-    pub fn create_pairing(&mut self, now: u64) -> Pairing {
+    pub fn create_pairing(&mut self, now: u64, owner: Option<&str>) -> Pairing {
         // Lazy cleanup shares the rejection boundary (`now > expires_at` is
         // dead): a token at now == expires_at is still redeemable (spec
         // 2026-10-17-relay-phase2 §2.10).
-        self.pending.retain(|_, expires_at| *expires_at >= now);
+        self.pending.retain(|_, pending| pending.expires_at >= now);
         let token = format!("picot_pair_{}", Uuid::new_v4().simple());
         let expires_at = now + PAIRING_LIFETIME_SECONDS;
-        self.pending.insert(hash(&token), expires_at);
+        self.pending.insert(
+            hash(&token),
+            PendingPairing {
+                expires_at,
+                owner: owner.map(str::to_owned),
+            },
+        );
         Pairing { token, expires_at }
     }
 
@@ -68,9 +90,9 @@ impl RemoteAuth {
     /// Mint a pairing token superseding any unconsumed one first, so at
     /// most one unconsumed token exists at any time (spec §2.6/§2.10; both
     /// mint points share this pending pool, spec §6).
-    pub fn mint_fresh_pairing_token(&mut self, now: u64) -> Pairing {
+    pub fn mint_fresh_pairing_token(&mut self, now: u64, owner: Option<&str>) -> Pairing {
         self.revoke_pending();
-        self.create_pairing(now)
+        self.create_pairing(now, owner)
     }
 
     pub fn exchange(
@@ -80,11 +102,11 @@ impl RemoteAuth {
         now: u64,
     ) -> Result<String, PairingError> {
         let token_hash = hash(pairing_token);
-        let expires_at = self
+        let pending = self
             .pending
             .remove(&token_hash)
             .ok_or(PairingError::InvalidOrUsed)?;
-        if now > expires_at {
+        if now > pending.expires_at {
             return Err(PairingError::Expired);
         }
         let device_token = format!(
@@ -95,16 +117,30 @@ impl RemoteAuth {
         self.store
             .lock()
             .map_err(|_| PairingError::Storage("Picot metadata lock poisoned".to_string()))?
-            .store_device_token(device_id, &device_token)
+            .store_device_token(device_id, &device_token, pending.owner.as_deref())
             .map_err(PairingError::Storage)?;
         Ok(device_token)
     }
 
     pub fn authorize(&self, device_token: &str) -> Result<bool, String> {
-        self.store
+        Ok(self.authenticate(device_token)?.is_some())
+    }
+
+    /// Resolve a device token to its principal (spec §2.8): `None` when the
+    /// token is unknown or revoked.
+    pub fn authenticate(&self, device_token: &str) -> Result<Option<DevicePrincipal>, String> {
+        let Some((device_id, owner_id)) = self
+            .store
             .lock()
             .map_err(|_| "Picot metadata lock poisoned".to_string())?
-            .verify_device_token(device_token)
+            .device_token_record(device_token)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(DevicePrincipal {
+            device_id,
+            owner_id,
+        }))
     }
 
     pub fn revoke(&mut self, device_id: &str) -> Result<(), String> {
@@ -157,7 +193,7 @@ mod tests {
         // Pairing-side write through RemoteAuth lands in the same database:
         // verify via a fresh handle onto the shared store's file path through
         // authorize (reads paired_devices) and registry row visibility.
-        let pairing = auth.create_pairing(1_000);
+        let pairing = auth.create_pairing(1_000, None);
         let device_token = auth.exchange(&pairing.token, "phone", 1_001).unwrap();
         assert!(auth.authorize(&device_token).unwrap());
 
@@ -178,9 +214,48 @@ mod tests {
     }
 
     #[test]
+    fn exchange_stamps_the_minting_owner_onto_the_device_record() {
+        let (mut auth, _store, temp) = shared_auth();
+        // Gate B (spec §2.8): the pending token carries the minting owner;
+        // exchange stamps it onto the device token record, so the device's
+        // principal needs no runtime guessing.
+        let pairing = auth.create_pairing(1_000, Some("owner-7"));
+        let device_token = auth.exchange(&pairing.token, "phone", 1_001).unwrap();
+        assert_eq!(
+            auth.authenticate(&device_token).unwrap(),
+            Some(super::DevicePrincipal {
+                device_id: "phone".into(),
+                owner_id: Some("owner-7".into()),
+            })
+        );
+        // A pending token minted without an owner (the legacy LAN shape)
+        // still exchanges; its record carries no binding.
+        let legacy = auth.create_pairing(2_000, None);
+        let legacy_token = auth.exchange(&legacy.token, "old-phone", 2_001).unwrap();
+        assert_eq!(
+            auth.authenticate(&legacy_token)
+                .unwrap()
+                .map(|principal| principal.owner_id),
+            Some(None)
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn authenticate_returns_none_for_unknown_or_revoked_tokens() {
+        let (mut auth, _store, temp) = shared_auth();
+        assert_eq!(auth.authenticate("picot_device_none").unwrap(), None);
+        let pairing = auth.create_pairing(1_000, Some("owner-7"));
+        let token = auth.exchange(&pairing.token, "phone", 1_001).unwrap();
+        auth.revoke("phone").unwrap();
+        assert_eq!(auth.authenticate(&token).unwrap(), None);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn exchanges_a_five_minute_single_use_pairing_token_for_a_device_token() {
         let (mut auth, _store, temp) = shared_auth();
-        let pairing = auth.create_pairing(1_000);
+        let pairing = auth.create_pairing(1_000, None);
         assert_eq!(pairing.expires_at, 1_300);
 
         let device_token = auth.exchange(&pairing.token, "phone", 1_001).unwrap();
@@ -199,8 +274,8 @@ mod tests {
     #[test]
     fn revoke_pending_supersedes_every_unconsumed_token() {
         let (mut auth, _store, temp) = shared_auth();
-        let first = auth.create_pairing(1_000);
-        let second = auth.create_pairing(1_100);
+        let first = auth.create_pairing(1_000, None);
+        let second = auth.create_pairing(1_100, None);
         auth.revoke_pending();
         assert_eq!(
             auth.exchange(&first.token, "phone", 1_200),
@@ -216,8 +291,8 @@ mod tests {
     #[test]
     fn mint_fresh_pairing_token_leaves_at_most_one_unconsumed_token() {
         let (mut auth, _store, temp) = shared_auth();
-        let stale = auth.mint_fresh_pairing_token(1_000);
-        let fresh = auth.mint_fresh_pairing_token(1_100);
+        let stale = auth.mint_fresh_pairing_token(1_000, None);
+        let fresh = auth.mint_fresh_pairing_token(1_100, None);
         assert_eq!(
             auth.exchange(&stale.token, "phone", 1_101),
             Err(PairingError::InvalidOrUsed)
@@ -229,12 +304,12 @@ mod tests {
     #[test]
     fn now_equal_to_expires_at_is_still_redeemable_for_cleanup_and_exchange() {
         let (mut auth, _store, temp) = shared_auth();
-        let pairing = auth.create_pairing(4_000);
+        let pairing = auth.create_pairing(4_000, None);
         assert_eq!(pairing.expires_at, 4_300);
         // The lazy cleanup inside create_pairing runs at now == expires_at
         // and must keep the token: cleanup and rejection share one boundary
         // (spec 2026-10-17-relay-phase2 §2.10, `now == expires_at` usable).
-        let _next = auth.create_pairing(4_300);
+        let _next = auth.create_pairing(4_300, None);
         assert!(auth.exchange(&pairing.token, "phone", 4_300).is_ok());
         fs::remove_dir_all(temp).unwrap();
     }
@@ -242,13 +317,13 @@ mod tests {
     #[test]
     fn rejects_expired_pairing_tokens_and_supports_device_revocation() {
         let (mut auth, _store, temp) = shared_auth();
-        let expired = auth.create_pairing(2_000);
+        let expired = auth.create_pairing(2_000, None);
         assert_eq!(
             auth.exchange(&expired.token, "phone", 2_301),
             Err(PairingError::Expired)
         );
 
-        let pairing = auth.create_pairing(3_000);
+        let pairing = auth.create_pairing(3_000, None);
         let token = auth.exchange(&pairing.token, "phone", 3_001).unwrap();
         auth.revoke("phone").unwrap();
         assert!(!auth.authorize(&token).unwrap());

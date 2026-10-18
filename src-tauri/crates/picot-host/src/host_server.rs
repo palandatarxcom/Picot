@@ -1660,13 +1660,14 @@ pub(crate) async fn run_session<S, E>(
             }
         }
     }
-    if hello.get("clientType").and_then(Value::as_str) == Some("remote") {
-        let authorized = hello
+    // Gate B (spec §2.8): a device-token hello resolves the pairing-bound
+    // principal — which device, and the owner whose pairing minted the token.
+    let device_principal = if hello.get("clientType").and_then(Value::as_str) == Some("remote") {
+        let principal = hello
             .get("deviceToken")
             .and_then(Value::as_str)
-            .and_then(|token| state.auth.lock().ok()?.authorize(token).ok())
-            .unwrap_or(false);
-        if !authorized {
+            .and_then(|token| state.auth.lock().ok()?.authenticate(token).ok().flatten());
+        if principal.is_none() {
             let _ = send_error(
                 &mut socket,
                 None,
@@ -1676,7 +1677,10 @@ pub(crate) async fn run_session<S, E>(
             .await;
             return;
         }
-    }
+        principal
+    } else {
+        None
+    };
     let context = match hello.get("clientType").and_then(Value::as_str) {
         Some("desktop") => {
             let capability = hello
@@ -1714,7 +1718,22 @@ pub(crate) async fn run_session<S, E>(
                 registry.owner_current_workspace(&owner),
             )
         }
-        Some("remote") => HostClientContext::remote(registration_key.clone()),
+        Some("remote") => {
+            // Only an owner-stamped pairing yields a device principal
+            // (legacy LAN rows authenticate but carry no binding).
+            let device = device_principal.and_then(|principal| {
+                principal
+                    .owner_id
+                    .map(|owner_id| crate::host_router::DevicePrincipal {
+                        device_id: principal.device_id,
+                        owner_id,
+                    })
+            });
+            match device {
+                Some(device) => HostClientContext::remote_device(registration_key.clone(), device),
+                None => HostClientContext::remote(registration_key.clone()),
+            }
+        }
         Some("browser") | Some("unpaired") => HostClientContext::public(registration_key.clone()),
         _ => {
             let _ = send_error(
@@ -2042,10 +2061,14 @@ pub(crate) async fn run_session<S, E>(
                                 // runtime's activity (sidebar green/blue dots across
                                 // workspaces); command admission stays authorize_target's
                                 // job in runtime_request dispatch.
-                                let desktop_owner = client_context.as_ref().is_some_and(|context| {
-                                    context.kind == crate::host_router::ClientKind::Desktop
-                                        && context.owner_id.is_some()
-                                });
+                                let desktop_owner = client_context.as_ref().is_some_and(
+                                    |context| {
+                                        crate::host_router::admits(
+                                            context,
+                                            crate::host_router::RequestFace::RuntimeSubscribe,
+                                        )
+                                    },
+                                );
                                 if let Some(target) = target.filter(|target| desktop_owner && runtime_target_is_live(&state, target)) {
                                 subscriptions.insert(target.clone());
                                 // Pending blocking dialogs replay only to the
@@ -2556,7 +2579,7 @@ fn authorize_target(
     let Some(owner) = context.owner_id.as_ref() else {
         return false;
     };
-    if context.kind != crate::host_router::ClientKind::Desktop {
+    if !crate::host_router::admits(context, crate::host_router::RequestFace::RuntimeCommand) {
         return false;
     }
     let Some(live) = state.runtimes.target_for_session_id(&target.session_id) else {
@@ -3055,8 +3078,7 @@ async fn dispatch(
             // unbound by design, so requiring a Registered snapshot here would
             // lock the whole control surface behind the very state landing
             // exists to move past.
-            if context.kind != crate::host_router::ClientKind::Desktop || context.owner_id.is_none()
-            {
+            if !crate::host_router::admits(context, crate::host_router::RequestFace::HostControl) {
                 return Err((
                     "stale_generation",
                     "Verified desktop workspace context is stale".into(),
@@ -3221,11 +3243,16 @@ async fn dispatch(
                 // loopback bind guarantees none can until the Phase 2 relay
                 // carries it (§4.4) — the token itself is minted by an
                 // authenticated desktop owner either way.
+                // Gate B (spec §2.8): the mint records the requesting owner;
+                // exchange stamps it onto the device token record.
                 let pairing = state
                     .auth
                     .lock()
                     .map_err(|_| ("auth_unavailable", "Remote auth unavailable".into()))?
-                    .mint_fresh_pairing_token(now_seconds());
+                    .mint_fresh_pairing_token(
+                        now_seconds(),
+                        context.owner_id.as_ref().map(|owner| owner.as_str()),
+                    );
                 return Ok(json!({
                     "type": "host_response",
                     "requestId": request_id,
@@ -3514,7 +3541,7 @@ async fn dispatch(
         } => {
             let operation = frame.get("operation").and_then(Value::as_str).unwrap_or("");
             let authorized = context.is_some_and(|ctx| {
-                if ctx.kind != crate::host_router::ClientKind::Desktop || ctx.owner_id.is_none() {
+                if !crate::host_router::admits(ctx, crate::host_router::RequestFace::DataRequest) {
                     return false;
                 }
                 // Sidebar registry rows and the cost dashboard are
@@ -8332,6 +8359,188 @@ mod tests {
         }
 
         let _ = socket.close(None).await;
+        host.stop();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn remote_hello_resolves_the_owner_stamped_device_principal() {
+        use tokio_tungstenite::tungstenite::Message;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-device-principal-{nonce}"));
+        let public = temp.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::write(public.join("index.html"), "Picot").unwrap();
+        let metadata = Arc::new(Mutex::new(
+            MetadataStore::open(&temp.join("picot.sqlite3")).unwrap(),
+        ));
+        let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+        let registry = Arc::new(crate::window_owner::WindowOwnerRegistry::default());
+        let host = HostServer::start(
+            public,
+            NativePiManager::new(8),
+            Arc::clone(&auth),
+            Arc::clone(&metadata),
+        )
+        .await
+        .unwrap();
+        let (owner, capability) = registry
+            .create_owner_with_workspace(
+                "principal-window".into(),
+                temp.clone(),
+                0,
+                host.origin().into(),
+                Some("principal-workspace".into()),
+                crate::window_owner::TemporaryKind::DefaultStartup,
+            )
+            .unwrap();
+        host.set_owner_registry(registry);
+        host.runtime_started().expect("generation advances");
+
+        // The desktop owner mints the pairing token (mobile_pairing_create):
+        // the mint records the minting owner (Gate B, spec §2.8).
+        let (mut socket, _) = tokio_tungstenite::connect_async(
+            host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
+        )
+        .await
+        .unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "hello", "protocolVersion": 2, "clientType": "desktop",
+                    "clientId": "desktop-principal", "desktopCapability": capability
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let ack: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(ack["type"], "hello_ack");
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "host_request", "requestId": "pair",
+                    "operation": "mobile_pairing_create", "args": {}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        let pairing_token = response["response"]["pairingToken"]
+            .as_str()
+            .expect("pairing token")
+            .to_owned();
+        let _ = socket.close(None).await;
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let exchange = client
+            .post(format!("{}/v2/auth/exchange", host.origin()))
+            .json(&json!({ "pairingToken": pairing_token, "deviceId": "phone-1" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exchange.status(), 200);
+        let device_token = exchange.json::<Value>().await.unwrap()["deviceToken"]
+            .as_str()
+            .expect("device token")
+            .to_owned();
+
+        // The remote hello authenticates with the device token and the
+        // session context resolves the device principal (device + the owner
+        // the pairing bound).
+        let (mut remote, _) = tokio_tungstenite::connect_async(
+            host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
+        )
+        .await
+        .unwrap();
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "hello", "protocolVersion": 2, "clientType": "remote",
+                    "clientId": "remote-principal", "deviceToken": device_token
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let remote_ack: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(remote_ack["type"], "hello_ack");
+        let context = host
+            .state
+            .router
+            .lock()
+            .unwrap()
+            .client_context("remote-principal")
+            .cloned()
+            .expect("remote session registered");
+        assert_eq!(context.kind, crate::host_router::ClientKind::Remote);
+        assert_eq!(
+            context.device,
+            Some(crate::host_router::DevicePrincipal {
+                device_id: "phone-1".into(),
+                owner_id: owner.as_str().to_owned(),
+            })
+        );
+        // The management plane stays desktop-only regardless of the binding
+        // (spec §2.8 matrix).
+        remote
+            .send(Message::Text(
+                json!({
+                    "type": "host_request", "requestId": "manage",
+                    "operation": "mobile_access_info", "args": {}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let refusal: Value =
+            serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(refusal["error"]["code"], "forbidden_class", "{refusal}");
+        let _ = remote.close(None).await;
+
+        // A legacy device token (minted without an owner binding)
+        // authenticates but carries no principal — the pre-Gate-B shape.
+        let legacy_pairing = auth.lock().unwrap().create_pairing(1, None);
+        let legacy_token = auth
+            .lock()
+            .unwrap()
+            .exchange(&legacy_pairing.token, "legacy-phone", 2)
+            .expect("legacy exchange");
+        let (mut legacy, _) = tokio_tungstenite::connect_async(
+            host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
+        )
+        .await
+        .unwrap();
+        legacy
+            .send(Message::Text(
+                json!({
+                    "type": "hello", "protocolVersion": 2, "clientType": "remote",
+                    "clientId": "remote-legacy", "deviceToken": legacy_token
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let legacy_ack: Value =
+            serde_json::from_str(legacy.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(legacy_ack["type"], "hello_ack");
+        let legacy_context = host
+            .state
+            .router
+            .lock()
+            .unwrap()
+            .client_context("remote-legacy")
+            .cloned()
+            .expect("legacy remote session registered");
+        assert_eq!(legacy_context.device, None);
+        let _ = legacy.close(None).await;
         host.stop();
         let _ = fs::remove_dir_all(temp);
     }

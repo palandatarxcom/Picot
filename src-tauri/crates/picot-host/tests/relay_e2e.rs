@@ -74,7 +74,7 @@ async fn e2e_setup(label: &str, e2ee_handshake_timeout: Duration) -> E2e {
     let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
     // Seed the device token straight through the existing exchange machinery
     // (plan T5 step 1a: "do NOT use the pairing path — that is T7").
-    let pairing = auth.lock().unwrap().create_pairing(1_000);
+    let pairing = auth.lock().unwrap().create_pairing(1_000, None);
     let device_token = auth
         .lock()
         .unwrap()

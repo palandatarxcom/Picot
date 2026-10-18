@@ -1198,9 +1198,16 @@ async fn run_op_inner(
         }
         "relay.offer" => {
             require_lease(inner, conn_id)?;
+            // The minting owner (Gate B, spec §2.8): the settings window the
+            // offer was requested from. An owner the daemon does not know is
+            // a refusal, never an unbound mint.
+            let owner = OwnerId::from_string(arg_str(&args, "ownerId")?);
+            if state.owner_registry.label_for_owner(&owner).is_none() {
+                return Err(format!("unknown owner {}", owner.as_str()));
+            }
             let offer = state
                 .relay
-                .pairing_offer()
+                .pairing_offer(owner.as_str())
                 .map_err(|error| format!("relay pairing offer failed: {error}"))?;
             Ok(json!({ "url": offer.url, "expiresAt": offer.expires_at }))
         }

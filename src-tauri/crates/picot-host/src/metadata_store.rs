@@ -227,6 +227,7 @@ impl MetadataStore {
         // exist at every accepted schema level.
         if current >= WRITTEN_SCHEMA_VERSION {
             self.ensure_workspace_session_bucket_column()?;
+            self.ensure_paired_devices_owner_column()?;
             self.ensure_reset_credit_operations_table()?;
             self.sweep_abandoned_reset_credits()?;
             self.drop_session_sidebar_visibility_table()?;
@@ -315,9 +316,37 @@ impl MetadataStore {
         // Public-owned additions apply to every accepted schema level, so a
         // freshly migrated database needs the same existence-based pass.
         self.ensure_workspace_session_bucket_column()?;
+        self.ensure_paired_devices_owner_column()?;
         self.ensure_reset_credit_operations_table()?;
         self.sweep_abandoned_reset_credits()?;
         self.drop_session_sidebar_visibility_table()
+    }
+
+    /// The Gate B owner binding on `paired_devices` (relay plan T9, spec
+    /// §2.8): existence-based and additive like the session_bucket column —
+    /// pre-Gate-B rows keep `owner_id NULL` and stay authenticatable.
+    fn ensure_paired_devices_owner_column(&self) -> Result<(), String> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(paired_devices)")
+            .map_err(|error| format!("Cannot inspect Picot paired_devices schema: {error}"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("Cannot inspect Picot paired_devices schema: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Cannot inspect Picot paired_devices schema: {error}"))?;
+        if columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("owner_id"))
+        {
+            return Ok(());
+        }
+        self.connection
+            .execute("ALTER TABLE paired_devices ADD COLUMN owner_id TEXT", [])
+            .map_err(|error| {
+                format!("Cannot extend Picot paired_devices schema (owner_id): {error}")
+            })?;
+        Ok(())
     }
 
     fn ensure_workspace_session_bucket_column(&self) -> Result<(), String> {
@@ -754,17 +783,23 @@ impl MetadataStore {
             .ok_or(WorkspaceLookupError::NotRegistered)
     }
 
-    pub fn store_device_token(&mut self, device_id: &str, token: &str) -> Result<(), String> {
+    pub fn store_device_token(
+        &mut self,
+        device_id: &str,
+        token: &str,
+        owner_id: Option<&str>,
+    ) -> Result<(), String> {
         let token_hash = token_hash(token);
         self.connection
             .execute(
-                "INSERT INTO paired_devices (device_id, token_hash, revoked_at)
-                 VALUES (?1, ?2, NULL)
+                "INSERT INTO paired_devices (device_id, token_hash, owner_id, revoked_at)
+                 VALUES (?1, ?2, ?3, NULL)
                  ON CONFLICT(device_id) DO UPDATE SET
                    token_hash = excluded.token_hash,
+                   owner_id = excluded.owner_id,
                    paired_at = unixepoch(),
                    revoked_at = NULL",
-                params![device_id, token_hash],
+                params![device_id, token_hash, owner_id],
             )
             .map_err(|error| format!("Cannot store paired device: {error}"))?;
         Ok(())
@@ -781,6 +816,28 @@ impl MetadataStore {
                 |row| row.get(0),
             )
             .map_err(|error| format!("Cannot verify paired device: {error}"))
+    }
+
+    /// The record a live device token resolves to: `(device_id, owner_id)`.
+    /// `owner_id` is `None` for rows written before the Gate B binding
+    /// existed (relay plan T9, spec §2.8).
+    pub fn device_token_record(
+        &self,
+        token: &str,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        let token_hash = token_hash(token);
+        self.connection
+            .query_row(
+                "SELECT device_id, owner_id FROM paired_devices
+                 WHERE token_hash = ?1 AND revoked_at IS NULL",
+                [token_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                error => Err(format!("Cannot read paired device: {error}")),
+            })
     }
 
     pub fn revoke_device(&mut self, device_id: &str) -> Result<(), String> {
@@ -1932,14 +1989,72 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), WRITTEN_SCHEMA_VERSION);
 
         store
-            .store_device_token("phone", "plain-device-token")
+            .store_device_token("phone", "plain-device-token", Some("owner-1"))
             .unwrap();
         assert!(store.verify_device_token("plain-device-token").unwrap());
         assert!(!store.verify_device_token("wrong-token").unwrap());
+        assert_eq!(
+            store.device_token_record("plain-device-token").unwrap(),
+            Some(("phone".to_string(), Some("owner-1".to_string())))
+        );
         let bytes = fs::read(&database).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("plain-device-token"));
         store.revoke_device("phone").unwrap();
         assert!(!store.verify_device_token("plain-device-token").unwrap());
+        assert_eq!(
+            store.device_token_record("plain-device-token").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pre_gate_b_paired_devices_table_gains_the_owner_column_additively() {
+        use rusqlite::Connection;
+        let temp = temp_dir();
+        let _guard = tempdir_guard::TempDirGuard(temp.clone());
+        let database = temp.join("picot.sqlite3");
+        // A pre-Gate-B database: the v3 paired_devices shape, no owner_id,
+        // with one already-paired legacy device row.
+        {
+            let legacy = Connection::open(&database).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE workspaces (
+                        workspace_id TEXT PRIMARY KEY,
+                        canonical_path TEXT NOT NULL UNIQUE,
+                        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                    );
+                    CREATE TABLE paired_devices (
+                        device_id TEXT PRIMARY KEY,
+                        token_hash BLOB NOT NULL UNIQUE,
+                        paired_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                        revoked_at INTEGER
+                    );
+                    PRAGMA user_version = 3;
+                    INSERT INTO paired_devices (device_id, token_hash)
+                        VALUES ('old-phone', X'00');",
+                )
+                .unwrap();
+        }
+        let mut store = MetadataStore::open(&database).unwrap();
+        // The legacy row survives with no owner binding (legacy LAN pairing);
+        // a fresh pairing records one (Gate B, spec §2.8).
+        store
+            .store_device_token("new-phone", "new-token", Some("owner-9"))
+            .unwrap();
+        assert_eq!(
+            store.device_token_record("new-token").unwrap(),
+            Some(("new-phone".to_string(), Some("owner-9".to_string())))
+        );
+        let legacy_row: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT owner_id FROM paired_devices WHERE device_id = 'old-phone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_row, None);
     }
 
     #[test]
