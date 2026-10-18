@@ -227,6 +227,37 @@ pub fn seal(shared: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     seal_with_nonce(shared, &nonce, plaintext)
 }
 
+impl DaemonIdentity {
+    /// Decode the persistent secret key for per-connection key agreement on
+    /// the transport side. Same validation as a loaded row; never logged.
+    pub(crate) fn secret_key_bytes(&self) -> Result<[u8; KEY_BYTES], String> {
+        decode_key(&self.secret_key_b64, "secretKeyB64")
+    }
+}
+
+/// Parse the client's `e2ee_hello` handshake frame (spec §2.4): `Some(key)`
+/// only for a well-formed hello — any other frame (malformed JSON, another
+/// type, missing key) is `None`, which the caller treats as a
+/// connection-closing violation (nothing but the handshake may precede
+/// `e2ee_ready`). The key's shape is validated by [`derive_shared_key`].
+pub(crate) fn parse_e2ee_hello(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("type").and_then(|value| value.as_str()) != Some("e2ee_hello") {
+        return None;
+    }
+    value
+        .get("key")
+        .and_then(|value| value.as_str())
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
+/// The daemon's plaintext `e2ee_ready` answer (spec §2.4): the only other
+/// cleartext frame ever sent on a data socket.
+pub(crate) fn e2ee_ready_frame() -> &'static str {
+    "{\"type\":\"e2ee_ready\"}"
+}
+
 /// Decrypt a [`seal`] bundle. Short/truncated input, tampering, and MAC
 /// failure all return `Err` (Paseo `decrypt` parity); callers treat any
 /// error as a connection-closing condition, never feeding plaintext to the

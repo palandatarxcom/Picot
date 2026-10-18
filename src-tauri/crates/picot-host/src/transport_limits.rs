@@ -28,14 +28,19 @@ pub const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 // violation that drops the control connection (reconnect per backoff).
 pub const RELAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
+// Concurrent E2EE handshakes per daemon (spec 2026-10-17-relay-phase2 §2.7):
+// a semaphore of this many permits bounds the asymmetric key agreements in
+// flight; queued connections wait inside the shared handshake timeout.
+pub const E2EE_HANDSHAKE_PERMITS: usize = 4;
+
 // Relay data frames are text frames carrying base64(nonce[24] ‖ ciphertext),
 // ciphertext = plaintext ‖ Poly1305 tag[16] (spec 2026-10-17-relay-phase2
 // §2.4). The plaintext cap is WS_PHYSICAL_FRAME_BYTES; base64 expands ×4/3
 // (one quad per 3-byte group, rounded up), so the wire-text cap is
-// 4·⌈(24 + WS_PHYSICAL_FRAME_BYTES + 16)/3⌉ = 22_369_676 bytes. A longer
-// frame can never decode to a legal plaintext → close that data connection
-// (spec §2.7; the slice-a raw-text check enforces the same bound the E2EE
-// channel will enforce pre-decrypt).
+// 4·⌈(24 + WS_PHYSICAL_FRAME_BYTES + 16)/3⌉ = 22_369_676 bytes. At the b64
+// quartet boundary a frame one plaintext byte over still fits the wire cap,
+// so the E2EE channel re-checks the decrypted length (spec §2.7 second
+// layer); anything longer can never decode to a legal plaintext.
 pub const RELAY_DATA_FRAME_TEXT_BYTES: usize = 4 * (WS_PHYSICAL_FRAME_BYTES + 24 + 16).div_ceil(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

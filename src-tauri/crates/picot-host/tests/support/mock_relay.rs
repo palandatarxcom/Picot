@@ -48,6 +48,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 const PIPE_CAPACITY: usize = 8;
 
 /// How a control socket stays quiet, per test.
+// Shared support module: each test target uses a subset of these knobs, so
+// per-target dead_code analysis cannot see the whole picture.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SilentMode {
     /// Upgrade but never send the initial `sync` — control-ready timeout path.
@@ -76,6 +79,7 @@ struct Inner {
     data_dials: Mutex<Vec<(String, String)>>,
 }
 
+#[allow(dead_code)] // shared support: per-target subset usage
 impl MockRelay {
     /// Bind an ephemeral loopback port and serve the mock relay.
     pub async fn start() -> MockRelay {
@@ -176,6 +180,7 @@ pub struct MockClientSocket {
     >,
 }
 
+#[allow(dead_code)] // shared support: per-target subset usage
 impl MockClientSocket {
     pub async fn send_text(&mut self, text: &str) {
         self.stream
@@ -203,6 +208,29 @@ impl MockClientSocket {
         })
         .await
         .expect("text frame within timeout")
+    }
+
+    /// Next text frame within `duration`, or `None` when the window elapses
+    /// (a late frame stays queued for the next read). Close/error still
+    /// panic — this is only for "nothing arrived yet" assertions.
+    pub async fn maybe_recv_text(&mut self, duration: Duration) -> Option<String> {
+        tokio::time::timeout(duration, async {
+            loop {
+                match self.stream.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        return text.to_string()
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                        panic!("socket closed before text frame")
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => panic!("socket error before text frame: {e}"),
+                    None => panic!("socket ended before text frame"),
+                }
+            }
+        })
+        .await
+        .ok()
     }
 
     /// Await the socket's end (Close frame, EOF, or error).

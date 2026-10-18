@@ -593,6 +593,14 @@ impl HostServer {
         &self.state.runtimes
     }
 
+    /// The relay session bridge (relay plan T5): decrypted relay data
+    /// channels attach here as `run_session` sessions under host-assigned
+    /// internal ids. `DaemonState` (plan T6) holds one instance for the
+    /// daemon's lifetime; integration tests build their own.
+    pub fn relay_session_sink(&self) -> Arc<RelaySessionBridge> {
+        Arc::new(RelaySessionBridge::new(Arc::clone(&self.state)))
+    }
+
     /// Install the terminal manager so the WebSocket loop can route
     /// `terminal_command` frames (PTY lifecycle, input, and checkpoints).
     pub fn set_terminal_manager(&self, manager: Arc<crate::terminal_manager::TerminalManager>) {
@@ -1537,11 +1545,11 @@ async fn websocket_upgrade(
 }
 
 /// Where a session socket came from (relay plan D2). The axum upgrade path is
-/// always [`SessionTransport::Loopback`]; the `Relay` arm is the seam task T5
-/// consumes to register relay sessions under a host-assigned internal id and
-/// admit `remote` hellos only — nothing reads it before that task lands.
+/// always [`SessionTransport::Loopback`]; the `Relay` arm carries the
+/// relay-assigned routing id (connectionId) of the data channel the session
+/// rides. Relay sessions admit `remote` hellos only and register under a
+/// host-assigned internal id (`relay:<uuid>`), never the declared clientId.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Relay arm + fields are consumed by relay task T5
 pub(crate) enum SessionTransport {
     Loopback,
     Relay {
@@ -1559,7 +1567,7 @@ pub(crate) enum SessionTransport {
 pub(crate) async fn run_session<S, E>(
     mut socket: S,
     state: Arc<HostState>,
-    _transport: SessionTransport,
+    transport: SessionTransport,
 ) where
     S: futures_util::Stream<Item = Result<Message, E>>
         + futures_util::Sink<Message>
@@ -1588,6 +1596,39 @@ pub(crate) async fn run_session<S, E>(
             )
             .await;
             return;
+        }
+    };
+    // Relay channels admit remote devices only (spec §2.2 / plan D2): the
+    // local owner path is loopback, so a desktop-typed hello over relay is
+    // forged regardless of capability fields; the public classes have no
+    // business on the relay either.
+    if matches!(transport, SessionTransport::Relay { .. })
+        && hello.get("clientType").and_then(Value::as_str) != Some("remote")
+    {
+        let _ = send_error(
+            &mut socket,
+            None,
+            "invalid_client_type",
+            "Relay sessions accept remote clients only",
+        )
+        .await;
+        return;
+    }
+    // Registration key (spec §2.2 / R5): loopback keeps the declared
+    // clientId; relay sessions register under a host-assigned internal id
+    // (`relay:<uuid>`), so a reconnect declaring the same name never
+    // clobbers the live registration and a stale disconnect cannot
+    // unregister its successor.
+    let registration_key = match &transport {
+        SessionTransport::Loopback => client_id.clone(),
+        SessionTransport::Relay {
+            routing_id,
+            declared_client_id,
+        } => {
+            log::debug!(
+                "relay session attached: routing_id={routing_id} declared_client_id={declared_client_id:?} hello_client_id={client_id}"
+            );
+            format!("relay:{}", uuid::Uuid::new_v4())
         }
     };
     if hello.get("clientType").and_then(Value::as_str) == Some("desktop") {
@@ -1668,13 +1709,13 @@ pub(crate) async fn run_session<S, E>(
                 return;
             };
             HostClientContext::desktop(
-                client_id.clone(),
+                registration_key.clone(),
                 owner.clone(),
                 registry.owner_current_workspace(&owner),
             )
         }
-        Some("remote") => HostClientContext::remote(client_id.clone()),
-        Some("browser") | Some("unpaired") => HostClientContext::public(client_id.clone()),
+        Some("remote") => HostClientContext::remote(registration_key.clone()),
+        Some("browser") | Some("unpaired") => HostClientContext::public(registration_key.clone()),
         _ => {
             let _ = send_error(
                 &mut socket,
@@ -1692,7 +1733,7 @@ pub(crate) async fn run_session<S, E>(
         .map_err(|_| "Host router unavailable".to_string())
         .and_then(|mut router| {
             router
-                .connect(&client_id, &hello, context)
+                .connect(&registration_key, &hello, context)
                 .map_err(|error| error.message)
         });
     if let Err(message) = handshake {
@@ -1718,7 +1759,7 @@ pub(crate) async fn run_session<S, E>(
         .router
         .lock()
         .ok()
-        .and_then(|router| router.client_context(&client_id).cloned());
+        .and_then(|router| router.client_context(&registration_key).cloned());
 
     // Greet desktop clients with the owner-scoped bootstrap frame (workspace
     // generation + live ephemeral instances) before the request loop starts.
@@ -1974,7 +2015,7 @@ pub(crate) async fn run_session<S, E>(
                     .map_err(|_| ("router_unavailable", "Host router unavailable".to_string()))
                     .and_then(|router| {
                         router
-                            .route(&client_id, &frame)
+                            .route(&registration_key, &frame)
                             .map_err(|error| (error.code, error.message))
                     });
                 let mut after_response = Vec::new();
@@ -2145,7 +2186,147 @@ pub(crate) async fn run_session<S, E>(
     drop(outgoing_tx);
     let _ = writer.await;
     if let Ok(mut router) = state.router.lock() {
-        router.disconnect(&client_id);
+        router.disconnect(&registration_key);
+    }
+}
+
+/// Sink-error marker for the relay session socket; the pipeline discards
+/// socket errors, so it carries no information (same shape as the
+/// adapter-contract test double).
+struct RelaySocketClosed;
+
+/// In-memory session socket bridging one relay data channel into
+/// [`run_session`] (spec §2.2 — the Paseo `attachSocket(transport:"relay")`
+/// counterpart): decrypted plaintext arrives on `inbound`, session frames
+/// leave on `outbound` for the encrypted-channel pump.
+struct RelaySessionSocket {
+    inbound: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    outbound: tokio::sync::mpsc::UnboundedSender<Message>,
+}
+
+impl futures_util::Stream for RelaySessionSocket {
+    type Item = Result<Message, RelaySocketClosed>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut()
+            .inbound
+            .poll_recv(cx)
+            .map(|frame| frame.map(Ok))
+    }
+}
+
+impl futures_util::Sink<Message> for RelaySessionSocket {
+    type Error = RelaySocketClosed;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        self.outbound.send(item).map_err(|_| RelaySocketClosed)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// One live relay-backed session: the inbound sender the transport's
+/// decrypted frames flow through. Dropping it ends the session stream.
+struct RelayBridgeSession {
+    inbound: tokio::sync::mpsc::UnboundedSender<Message>,
+}
+
+/// The concrete [`crate::relay::transport::RelaySessionSink`] (relay plan
+/// T5): every E2EE-ready relay data channel becomes one `run_session` task
+/// under `SessionTransport::Relay`, so relay sessions get the identical
+/// hello/auth/request pipeline as loopback sockets — remote-only admission
+/// and internal-id registration included.
+pub struct RelaySessionBridge {
+    state: Arc<HostState>,
+    sessions: std::sync::Mutex<HashMap<String, RelayBridgeSession>>,
+}
+
+impl RelaySessionBridge {
+    fn new(state: Arc<HostState>) -> Self {
+        Self {
+            state,
+            sessions: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::relay::transport::RelaySessionSink for RelaySessionBridge {
+    async fn on_connection_state(&self, _state: crate::relay::transport::ConnectionState) {
+        // Transport state feeds the T6 status op; the session bridge has no
+        // per-state behavior.
+    }
+
+    async fn open_session(
+        &self,
+        connection_id: String,
+        channel: crate::relay::transport::EncryptedChannelHandle,
+    ) {
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        // Outbound pump: session frames → sealed wire frames on the channel.
+        // When the session task exits the outbound stream ends and the pump
+        // closes the channel, tearing the data connection down with it.
+        tokio::spawn(async move {
+            while let Some(message) = outbound_rx.recv().await {
+                if let Message::Text(text) = message {
+                    if !channel.send(text.to_string()) {
+                        break;
+                    }
+                }
+            }
+            channel.close();
+        });
+        let socket = RelaySessionSocket {
+            inbound: inbound_rx,
+            outbound: outbound_tx,
+        };
+        let transport = SessionTransport::Relay {
+            routing_id: connection_id.clone(),
+            declared_client_id: None,
+        };
+        let state = Arc::clone(&self.state);
+        tokio::spawn(run_session(socket, state, transport));
+        self.sessions.lock().unwrap().insert(
+            connection_id,
+            RelayBridgeSession {
+                inbound: inbound_tx,
+            },
+        );
+    }
+
+    async fn data_frame(&self, connection_id: &str, payload: String) {
+        if let Some(session) = self.sessions.lock().unwrap().get(connection_id) {
+            let _ = session.inbound.send(Message::Text(payload.into()));
+        }
+    }
+
+    async fn close_session(&self, connection_id: &str) {
+        // Dropping the inbound sender ends the session stream; run_session
+        // unregisters its internal id on the way out.
+        self.sessions.lock().unwrap().remove(connection_id);
     }
 }
 

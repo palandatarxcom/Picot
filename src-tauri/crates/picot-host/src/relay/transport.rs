@@ -6,10 +6,13 @@
 //! `sync` (full connectionId list) on connect plus `connected`/`disconnected`
 //! deltas; the transport reconciles them against its live set and reports
 //! additions/removals to the [`ConnectionLifecycle`] driver, which dials one
-//! data socket per connectionId (`…&connectionId=<id>`, 15s open timeout) and
-//! hands the write path to the [`RelaySessionSink`] via [`RelayDataHandle`].
-//! Data sockets survive control reconnects; `sync` reconcile closes the ones
-//! the relay no longer lists.
+//! data socket per connectionId (`…&connectionId=<id>`, 15s open timeout),
+//! terminates its E2EE handshake (`e2ee_hello` → shared key → `e2ee_ready`,
+//! ≤4 concurrent, 10s budget), and hands the write path to the
+//! [`RelaySessionSink`] via [`EncryptedChannelHandle`] — every frame in both
+//! directions is base64 NaCl-box ciphertext from there on. Data sockets
+//! survive control reconnects; `sync` reconcile closes the ones the relay
+//! no longer lists.
 //!
 //! Parameters are Paseo's, copied verbatim (spec §2.5 / plan T4):
 //! reconnect backoff `min(30s, 1s × attempt)`, WS ping every 10s, 30s stale
@@ -27,7 +30,8 @@
 //! and reconnect, for a data socket eviction of that connection only. The
 //! same caps ride the WebSocket read config (max message and frame size) so
 //! oversized input dies at the protocol layer, with the explicit checks as
-//! the documented second layer.
+//! the documented second layer — including the post-decrypt plaintext cap,
+//! which the wire cap alone cannot express at the b64 quartet boundary.
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -35,21 +39,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::host_router::MAX_CLIENTS;
-use crate::relay::e2ee::DaemonIdentity;
+use crate::relay::e2ee::{self, DaemonIdentity};
 use crate::transport_limits::{
-    OUTBOUND_QUEUE_CAPACITY, RELAY_CONTROL_FRAME_BYTES, RELAY_DATA_FRAME_TEXT_BYTES,
+    E2EE_HANDSHAKE_PERMITS, OUTBOUND_QUEUE_CAPACITY, RELAY_CONTROL_FRAME_BYTES,
+    RELAY_DATA_FRAME_TEXT_BYTES, WS_PHYSICAL_FRAME_BYTES,
 };
 
 /// Reconnect backoff: `min(30s, 1s × attempt)` (relay-transport.ts:338).
@@ -65,7 +72,12 @@ pub const CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(8);
 /// WS handshake (dial → upgrade) deadline: 10s.
 pub const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-client data-socket open timeout: 15s (relay-transport.ts:361).
+/// Per-client data-socket open timeout: 15s (relay-transport.ts:361).
 pub const DATA_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+/// E2EE handshake budget per data socket, semaphore wait included
+/// (spec §2.5/§2.7): hello → shared key → ready inside this window or the
+/// connection closes.
+pub const E2EE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `min(cap, base × attempt)` — linear, per the copied parameter.
 pub fn control_backoff(attempt: u32, base: Duration, cap: Duration) -> Duration {
@@ -90,17 +102,18 @@ pub struct RelayConfig {
     pub server_id: String,
 }
 
-/// Write-path handle for one relay data connection, handed to the sink on
-/// `open_session`. This slice carries the bare socket queue; slice b (E2EE)
-/// swaps in an encrypted-channel handle at this same position.
+/// Write path for one relay data connection after its E2EE handshake,
+/// handed to the sink on `open_session`: plaintext in, base64 NaCl-box
+/// ciphertext out on the same bounded socket queue.
 #[derive(Clone)]
-pub struct RelayDataHandle {
+pub struct EncryptedChannelHandle {
     connection_id: String,
+    shared: Arc<[u8; 32]>,
     out: mpsc::Sender<Message>,
     close: watch::Sender<bool>,
 }
 
-impl RelayDataHandle {
+impl EncryptedChannelHandle {
     pub fn connection_id(&self) -> &str {
         &self.connection_id
     }
@@ -109,8 +122,9 @@ impl RelayDataHandle {
     /// (`OUTBOUND_QUEUE_CAPACITY`). `false`: the queue is full or the writer
     /// is gone — the connection is closing and the frame is dropped
     /// (spec §2.7: a full queue closes that data connection only).
-    pub fn send(&self, text: String) -> bool {
-        match self.out.try_send(Message::Text(text)) {
+    pub fn send(&self, plaintext: String) -> bool {
+        let wire = BASE64_STANDARD.encode(e2ee::seal(&self.shared, plaintext.as_bytes()));
+        match self.out.try_send(Message::Text(wire)) {
             Ok(()) => true,
             Err(_) => {
                 self.close();
@@ -130,10 +144,9 @@ impl RelayDataHandle {
 pub trait RelaySessionSink: Send + Sync {
     async fn on_connection_state(&self, state: ConnectionState);
     /// A relay connectionId is live and its data socket is open.
-    async fn open_session(&self, connection_id: String, socket: RelayDataHandle);
-    /// One inbound text frame off that connection's data socket. Raw text in
-    /// this slice; slice b delivers decrypted plaintext here (handshake
-    /// gating included).
+    async fn open_session(&self, connection_id: String, channel: EncryptedChannelHandle);
+    /// One decrypted plaintext frame off that connection's E2EE channel.
+    /// Handshake-gated: nothing arrives before `e2ee_ready`.
     async fn data_frame(&self, connection_id: &str, payload: String);
     /// The connection went away (`disconnected` delta, `sync` reconcile
     /// removal, socket death, or bounded-queue eviction). May fire more than
@@ -162,6 +175,7 @@ pub struct TransportTimings {
     pub ready_timeout: Duration,
     pub handshake_timeout: Duration,
     pub data_open_timeout: Duration,
+    pub e2ee_handshake_timeout: Duration,
 }
 
 impl Default for TransportTimings {
@@ -174,6 +188,7 @@ impl Default for TransportTimings {
             ready_timeout: CONTROL_READY_TIMEOUT,
             handshake_timeout: CONTROL_HANDSHAKE_TIMEOUT,
             data_open_timeout: DATA_OPEN_TIMEOUT,
+            e2ee_handshake_timeout: E2EE_HANDSHAKE_TIMEOUT,
         }
     }
 }
@@ -239,17 +254,15 @@ impl RelayTransport {
         sink: Arc<dyn RelaySessionSink>,
         seams: TransportSeams,
     ) -> RelayTransportHandle {
-        // The identity rides along for T5's E2EE handshake; the control socket
-        // itself only announces config.server_id.
-        let _ = &identity;
         let (shutdown, receiver) = watch::channel(false);
-        let task = tokio::spawn(run_control_loop(config, sink, seams, receiver));
+        let task = tokio::spawn(run_control_loop(config, identity, sink, seams, receiver));
         RelayTransportHandle { shutdown, task }
     }
 }
 
 async fn run_control_loop(
     config: RelayConfig,
+    identity: DaemonIdentity,
     sink: Arc<dyn RelaySessionSink>,
     seams: TransportSeams,
     mut shutdown: watch::Receiver<bool>,
@@ -261,8 +274,10 @@ async fn run_control_loop(
     let manager = DataSocketManager {
         config: config.clone(),
         seams: seams.clone(),
+        identity,
         sink: Arc::clone(&sink),
         registry: Arc::new(DataConnections::default()),
+        handshake_permits: Arc::new(Semaphore::new(E2EE_HANDSHAKE_PERMITS)),
         shutdown: shutdown.clone(),
     };
     let mut failed_attempts: u32 = 0;
@@ -578,8 +593,10 @@ impl DataConnections {
 struct DataSocketManager {
     config: RelayConfig,
     seams: TransportSeams,
+    identity: DaemonIdentity,
     sink: Arc<dyn RelaySessionSink>,
     registry: Arc<DataConnections>,
+    handshake_permits: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -594,8 +611,10 @@ impl ConnectionLifecycle for DataSocketManager {
         tokio::spawn(run_data_connection(DataConnection {
             config: self.config.clone(),
             seams: self.seams.clone(),
+            identity: self.identity.clone(),
             sink: Arc::clone(&self.sink),
             registry: Arc::clone(&self.registry),
+            handshake_permits: Arc::clone(&self.handshake_permits),
             connection_id,
             close: close_tx,
             shutdown: self.shutdown.clone(),
@@ -613,8 +632,10 @@ impl ConnectionLifecycle for DataSocketManager {
 struct DataConnection {
     config: RelayConfig,
     seams: TransportSeams,
+    identity: DaemonIdentity,
     sink: Arc<dyn RelaySessionSink>,
     registry: Arc<DataConnections>,
+    handshake_permits: Arc<Semaphore>,
     connection_id: String,
     close: watch::Sender<bool>,
     shutdown: watch::Receiver<bool>,
@@ -631,7 +652,7 @@ async fn run_data_connection(conn: DataConnection) {
         return;
     }
     let dial = dial_data(&conn.config, &conn.seams, &conn.connection_id);
-    let stream = tokio::select! {
+    let mut stream = tokio::select! {
         _ = shutdown.changed() => {
             conn.registry.remove_if_owner(&conn.connection_id, &conn.close);
             return;
@@ -657,11 +678,49 @@ async fn run_data_connection(conn: DataConnection) {
         return;
     }
 
+    // E2EE handshake gates the channel (spec §2.4/§2.5): no frame reaches
+    // the sink before e2ee_ready, any pre-ready frame closes the socket,
+    // and the whole exchange (semaphore wait included) fits the handshake
+    // budget. A failed or stalled handshake never opens a session, so its
+    // teardown stays silent (the relay's `disconnected` heals the state).
+    let secret = match conn.identity.secret_key_bytes() {
+        Ok(secret) => secret,
+        Err(_) => {
+            conn.registry
+                .remove_if_owner(&conn.connection_id, &conn.close);
+            return;
+        }
+    };
+    let handshake = e2ee_server_handshake(&mut stream, &secret, &conn.handshake_permits);
+    let shared_key = tokio::select! {
+        _ = shutdown.changed() => {
+            conn.registry.remove_if_owner(&conn.connection_id, &conn.close);
+            return;
+        }
+        _ = close_rx.changed() => {
+            conn.registry.remove_if_owner(&conn.connection_id, &conn.close);
+            return;
+        }
+        outcome = tokio::time::timeout(
+            conn.seams.timings.e2ee_handshake_timeout,
+            handshake,
+        ) => match outcome {
+            Ok(Some(shared_key)) => shared_key,
+            Ok(None) | Err(_) => {
+                conn.registry
+                    .remove_if_owner(&conn.connection_id, &conn.close);
+                return;
+            }
+        },
+    };
+
+    let shared_key = Arc::new(shared_key);
     let (socket_sink, socket_stream) = stream.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
     let writer = tokio::spawn(bounded_writer(socket_sink, out_rx));
-    let handle = RelayDataHandle {
+    let handle = EncryptedChannelHandle {
         connection_id: conn.connection_id.clone(),
+        shared: Arc::clone(&shared_key),
         out: out_tx,
         close: conn.close.clone(),
     };
@@ -680,14 +739,19 @@ async fn run_data_connection(conn: DataConnection) {
             }
             frame = inbound.next() => match frame {
                 Some(Ok(Message::Text(text))) => {
-                    // Spec §2.7: ciphertext text beyond the wire cap can
-                    // never decode to a legal plaintext — close the
-                    // connection (control and siblings stay).
+                    // Spec §2.7: ciphertext text beyond the wire cap, or
+                    // (post-decrypt) plaintext beyond the physical frame
+                    // cap — both close this connection only. Bad base64
+                    // and failed opens are the same class of violation.
                     if text.len() > RELAY_DATA_FRAME_TEXT_BYTES {
                         notify_close = true;
                         break;
                     }
-                    conn.sink.data_frame(&conn.connection_id, text).await;
+                    let Some(plaintext) = decrypt_frame(&shared_key, &text) else {
+                        notify_close = true;
+                        break;
+                    };
+                    conn.sink.data_frame(&conn.connection_id, plaintext).await;
                 }
                 // The data protocol is text-only; binary is a violation.
                 Some(Ok(Message::Binary(_))) => {
@@ -713,6 +777,52 @@ async fn run_data_connection(conn: DataConnection) {
     {
         conn.sink.close_session(&conn.connection_id).await;
     }
+}
+
+/// The daemon side of the E2EE handshake (spec §2.4/§2.5): wait for the
+/// client's `e2ee_hello`, derive the per-connection shared key, answer
+/// `e2ee_ready`. Runs under one of the ≤`E2EE_HANDSHAKE_PERMITS` permits;
+/// `None` is any connection-closing violation — a non-handshake frame before
+/// ready, malformed JSON, an unusable peer key, a dead socket.
+async fn e2ee_server_handshake(
+    stream: &mut ControlStream,
+    secret: &[u8; 32],
+    permits: &Arc<Semaphore>,
+) -> Option<[u8; 32]> {
+    // Held for the handshake only: a completed channel does not occupy a
+    // permit, so four slow handshakes queue a fifth instead of crowding out
+    // the CPU on key agreements.
+    let _permit = permits.acquire().await.ok()?;
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let key = e2ee::parse_e2ee_hello(&text)?;
+                let shared_key = e2ee::derive_shared_key(secret, &key).ok()?;
+                stream
+                    .send(Message::Text(e2ee::e2ee_ready_frame().to_string()))
+                    .await
+                    .ok()?;
+                return Some(shared_key);
+            }
+            // ping/pong is liveness, not content.
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            _ => return None,
+        }
+    }
+}
+
+/// Decode + open one inbound wire frame and re-check the decrypted length
+/// against the physical frame cap (spec §2.7 second layer: at the b64
+/// quartet boundary a plaintext one byte over still fits the wire cap).
+/// `None` is any of: bad base64, failed decryption, oversized or non-UTF-8
+/// plaintext — all connection-closing violations.
+fn decrypt_frame(shared: &[u8; 32], wire: &str) -> Option<String> {
+    let bundle = BASE64_STANDARD.decode(wire).ok()?;
+    let plaintext = e2ee::open(shared, &bundle).ok()?;
+    if plaintext.len() > WS_PHYSICAL_FRAME_BYTES {
+        return None;
+    }
+    String::from_utf8(plaintext).ok()
 }
 
 #[cfg(test)]
@@ -853,11 +963,12 @@ fn relay_urls_carry_the_v2_query_contract() {
 }
 
 #[tokio::test]
-async fn data_handle_send_signals_close_on_full_queue() {
+async fn encrypted_channel_send_signals_close_on_full_queue() {
     let (close_tx, close_rx) = watch::channel(false);
     let (out_tx, _out_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
-    let handle = RelayDataHandle {
+    let handle = EncryptedChannelHandle {
         connection_id: "c1".into(),
+        shared: Arc::new([7u8; 32]),
         out: out_tx,
         close: close_tx,
     };
