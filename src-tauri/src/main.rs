@@ -391,24 +391,94 @@ fn open_native_window(
     Ok(())
 }
 
-/// The cold-start window: host-origin `/`, owner `native-landing`. The label
-/// never changes (Tauri labels are immutable); the owner record carries the
-/// workspace state.
+/// A landing window: host-origin `/`. The label comes from the caller — the
+/// cold start and ⌘N both allocate through `next_landing_label`, so the first
+/// window stays `native-landing` and later ones get suffixed names. Tauri
+/// labels are immutable; the owner record carries the workspace state.
 fn open_native_landing_window(
     app: &AppHandle,
     host_origin: &str,
+    label: &str,
     mirror: Arc<NavigationMirror>,
     owner: window_owner::OwnerId,
     capability: &str,
 ) -> Result<(), String> {
     open_native_window(
         app,
-        "native-landing",
+        label,
         &format!("{host_origin}/"),
         mirror,
         owner,
         capability,
     )
+}
+
+/// ⌘N / File → New Window (multi-window §5): open one more landing window as
+/// a fresh client of the daemon. Purely Rust-side — no WebView is involved,
+/// so the shortcut needs no focused window and no owner binding.
+///
+/// Mint-first (T1 discipline): allocate the label, mint the owner over the
+/// admin channel, then open. The daemon's registry is the atomic conflict
+/// point (a label taken by a mint in flight rejects ours), so a collision
+/// retries the next suffix instead of pre-checking. An open failure revokes
+/// the just-minted owner; the label frees itself because no window exists.
+fn open_new_landing_window(app: &AppHandle) -> Result<(), String> {
+    let link = app
+        .try_state::<DaemonLink>()
+        .ok_or_else(|| "Picot's daemon link is not available".to_string())?;
+    let mirror = DaemonLink::mirror_for(app)
+        .ok_or_else(|| "Picot's navigation mirror is not available".to_string())?;
+    let host_origin = link.host_origin().to_string();
+    let home = canonical_home_dir()?;
+    let client = link.client();
+
+    // Start at the first slot no live window holds, then let the daemon's
+    // registry arbitrate: a slot held by a mint still in flight (another ⌘N
+    // racing us, window not yet built) rejects ours and the index advances —
+    // the §6.1 collision policy, retry the next suffix.
+    let mut index = next_landing_index(app);
+    let landing = loop {
+        match tauri::async_runtime::block_on(client.create_owner(
+            &landing_label_at(index),
+            Some(&home.to_string_lossy()),
+            0,
+            &host_origin,
+            None,
+        )) {
+            Ok(created) => break created,
+            Err(error) if error.contains("window label is already owned") => index += 1,
+            Err(error) => return Err(error),
+        }
+    };
+    let label = landing_label_at(index);
+
+    let owner = window_owner::OwnerId::from_string(landing.owner.clone());
+    if let Err(error) = open_native_landing_window(
+        app,
+        &host_origin,
+        &label,
+        mirror,
+        owner,
+        &landing.capability,
+    ) {
+        let failed_owner = landing.owner.clone();
+        if let Err(detach_error) = tauri::async_runtime::block_on(
+            client.request("owner.detach", serde_json::json!({ "owner": failed_owner })),
+        ) {
+            log::warn!(
+                "[picot] cannot revoke the owner of the failed landing window {label}: {detach_error}"
+            );
+        }
+        return Err(error);
+    }
+    if let Some(ledger) = app.try_state::<WindowLedger>() {
+        ledger.record(LedgerRow::landing(
+            &label,
+            &landing.owner,
+            &home.to_string_lossy(),
+        ));
+    }
+    Ok(())
 }
 
 fn open_native_workspace_window(
@@ -532,7 +602,7 @@ mod tests {
 
     use super::{
         clamp_window_geometry, close_request_needs_native_fallback, image_mime_from_path,
-        new_session_menu_enabled, resolve_static_dir, session_export_fetch_url,
+        new_session_menu_enabled, next_landing_label, resolve_static_dir, session_export_fetch_url,
         side_chat_startup_rpc_commands,
     };
     // The host-side helpers moved into `picot-host` with the dispatcher
@@ -1288,6 +1358,32 @@ mod tests {
     }
 
     #[test]
+    fn next_landing_label_keeps_the_first_window_suffixless() {
+        // The first landing window keeps the suffixless label: window-state
+        // geometry, ledger rows, and mirror rows all key on it, so existing
+        // single-window installations see no change (multi-window §6.1).
+        assert_eq!(next_landing_label(|_| false), "native-landing");
+    }
+
+    #[test]
+    fn next_landing_label_suffixes_from_two_and_takes_the_first_free_slot() {
+        assert_eq!(
+            next_landing_label(|label| label == "native-landing"),
+            "native-landing-2"
+        );
+        assert_eq!(
+            next_landing_label(|label| label == "native-landing" || label == "native-landing-2"),
+            "native-landing-3"
+        );
+        // A closed window frees its label: the first free slot is reused, the
+        // sequence does not ratchet monotonically upward.
+        assert_eq!(
+            next_landing_label(|label| label == "native-landing" || label == "native-landing-3"),
+            "native-landing-2"
+        );
+    }
+
+    #[test]
     fn landing_owner_rejects_workspace_snapshot_but_admits_quick_chat() {
         use picot_host::window_owner::{
             OwnerWorkspaceSnapshot, TemporaryKind, WindowOwnerRegistry,
@@ -1959,10 +2055,12 @@ fn setup_daemon_runtime(
     app.manage(browser_pane::BrowserPaneState(browser_panes));
     // The landing owner: no registered workspace, placeholder home cwd. Minted
     // over the admin channel, so the mirror learns its origin before the window
-    // can load it.
+    // can load it. The cold start always wins the suffixless label (no window
+    // exists yet), so existing single-window installations are unaffected.
     let home = canonical_home_dir().map_err(&fail)?;
+    let landing_label = next_free_landing_label(app.handle());
     let landing = tauri::async_runtime::block_on(client.create_owner(
-        "native-landing",
+        &landing_label,
         Some(&home.to_string_lossy()),
         0,
         &host_origin,
@@ -1972,6 +2070,7 @@ fn setup_daemon_runtime(
     open_native_landing_window(
         app.handle(),
         &host_origin,
+        &landing_label,
         Arc::clone(&mirror),
         window_owner::OwnerId::from_string(landing.owner.clone()),
         &landing.capability,
@@ -1979,7 +2078,7 @@ fn setup_daemon_runtime(
     .map_err(&fail)?;
     if let Some(ledger) = app.try_state::<WindowLedger>() {
         ledger.record(LedgerRow::landing(
-            "native-landing",
+            &landing_label,
             &landing.owner,
             &home.to_string_lossy(),
         ));
@@ -2753,7 +2852,49 @@ pub async fn run_restart(app: &AppHandle) -> Result<RestartReport, String> {
 // Windows/Linux draw in-window menus instead, so the builder stays menu-less
 // there exactly as upstream does.
 const MENU_NEW_SESSION_ID: &str = "picot-new-session";
+const MENU_NEW_WINDOW_ID: &str = "picot-new-window";
 const MENU_ADD_PROJECT_ID: &str = "picot-add-project";
+
+/// The landing window family's base label (multi-window §6.1): the app is the
+/// only creator of landing windows, so it is also the label allocator.
+const LANDING_WINDOW_LABEL: &str = "native-landing";
+
+/// The `index`-th label of the `native-landing` family: 1 is the suffixless
+/// cold-start name, 2 and up carry the `-2`/`-3`… suffix. Numeric, so retry
+/// arithmetic advances even while lexicographic order would not
+/// (`-10` sorts before `-2`).
+fn landing_label_at(index: u32) -> String {
+    if index == 1 {
+        LANDING_WINDOW_LABEL.to_string()
+    } else {
+        format!("{LANDING_WINDOW_LABEL}-{index}")
+    }
+}
+
+/// The next free label in the `native-landing` family: the first window keeps
+/// the suffixless name, later ones take the first free `-2`, `-3`, … suffix.
+/// Nothing is reserved — a closed window's label is immediately reusable, and
+/// existing single-window installations keep the suffixless name everywhere
+/// (window-state geometry files, ledger rows, and mirror rows all key on the
+/// label, so no migration is needed).
+fn next_landing_label(is_taken: impl Fn(&str) -> bool) -> String {
+    (1..)
+        .map(landing_label_at)
+        .find(|label| !is_taken(label))
+        .expect("the landing label suffix space is never exhausted")
+}
+
+/// `next_landing_label` over the app's live windows.
+fn next_free_landing_label(app: &AppHandle) -> String {
+    next_landing_label(|label| app.get_webview_window(label).is_some())
+}
+
+/// The first landing label index no live window holds (multi-window §6.1).
+fn next_landing_index(app: &AppHandle) -> u32 {
+    (1..)
+        .find(|index| app.get_webview_window(&landing_label_at(*index)).is_none())
+        .expect("the landing label suffix space is never exhausted")
+}
 
 /// File → New Session is enabled exactly when the focused window's owner is
 /// bound to a workspace, read from the owner registry — never from the label.
@@ -2823,13 +2964,22 @@ fn update_new_session_menu_state(app: &AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let new_window = MenuItem::with_id(
+        app,
+        MENU_NEW_WINDOW_ID,
+        "New Window",
+        // Always enabled: ⌘N is Rust-side (multi-window §5) and needs no
+        // focused owner-bound window.
+        true,
+        Some("CmdOrCtrl+N"),
+    )?;
     let new_session = MenuItem::with_id(
         app,
         MENU_NEW_SESSION_ID,
         "New Session",
         // Startup default: disabled — the first window is the landing.
         new_session_menu_enabled(None),
-        Some("CmdOrCtrl+N"),
+        Some("CmdOrCtrl+T"),
     )?;
     let add_project = MenuItem::with_id(
         app,
@@ -2844,6 +2994,7 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         "File",
         true,
         &[
+            &new_window,
             &new_session,
             &add_project,
             &PredefinedMenuItem::separator(app)?,
@@ -2975,8 +3126,15 @@ fn main() {
     #[cfg(target_os = "macos")]
     let builder = builder.menu(build_app_menu).on_menu_event(|app, event| {
         match event.id().as_ref() {
+            MENU_NEW_WINDOW_ID => {
+                // ⌘N opens another landing window Rust-side (multi-window
+                // §5): no WebView synthesis, no focused-window requirement.
+                if let Err(error) = open_new_landing_window(app) {
+                    log::warn!("[picot] cannot open a new window: {error}");
+                }
+            }
             MENU_NEW_SESSION_ID => {
-                // Re-keyed on the owner record: the menu dispatches Cmd+N only
+                // Re-keyed on the owner record: the menu dispatches Cmd+T only
                 // when the focused window's owner is bound to a workspace, so
                 // a transitioned landing window qualifies despite its label.
                 let Some(window) = app
@@ -2995,7 +3153,7 @@ fn main() {
                     .unwrap_or(false);
                 if bound {
                     let _ = window.eval(
-                        "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'n', metaKey: true, bubbles: true, cancelable: true}))",
+                        "document.dispatchEvent(new KeyboardEvent('keydown', {key: 't', metaKey: true, bubbles: true, cancelable: true}))",
                     );
                 }
             }
@@ -3539,6 +3697,98 @@ mod migration_window_state_tests {
         assert!(
             save < destroy,
             "the save must run while the window is still alive:\n{body}"
+        );
+    }
+}
+
+/// Source-inspection tests for the ⌘N/⌘T migration (multi-window §5/D6): the
+/// menu is native muda state that cannot be built without a running Tauri app,
+/// so the accelerator wiring and the handler arms are pinned against the
+/// source, the same form `migration_window_state_tests` uses.
+#[cfg(test)]
+mod multi_window_menu_tests {
+    fn section_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_at = source
+            .find(start)
+            .unwrap_or_else(|| panic!("marker {start:?} not found in the source"));
+        let rest = &source[start_at..];
+        let end_at = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("marker {end:?} not found after {start:?}"));
+        &rest[..end_at]
+    }
+
+    #[test]
+    fn file_menu_binds_new_window_to_cmd_n_and_new_session_to_cmd_t_in_that_order() {
+        let body = section_between(
+            include_str!("main.rs"),
+            "fn build_app_menu",
+            "fn disable_press_and_hold_accents",
+        );
+        let new_window = body.find("MENU_NEW_WINDOW_ID").expect("New Window item");
+        let cmd_n = body.find("CmdOrCtrl+N").expect("New Window accelerator");
+        let new_session = body.find("MENU_NEW_SESSION_ID").expect("New Session item");
+        let cmd_t = body.find("CmdOrCtrl+T").expect("New Session accelerator");
+        assert!(
+            new_window < cmd_n && cmd_n < new_session && new_session < cmd_t,
+            "New Window (⌘N) must precede New Session (⌘T), Safari/Finder order:\n{body}"
+        );
+    }
+
+    #[test]
+    fn cmd_n_menu_event_opens_a_landing_window_without_evaling_any_webview() {
+        let arm = section_between(
+            include_str!("main.rs"),
+            "MENU_NEW_WINDOW_ID =>",
+            "MENU_NEW_SESSION_ID =>",
+        );
+        assert!(
+            arm.contains("open_new_landing_window"),
+            "⌘N is Rust-side (spec §5): {arm}"
+        );
+        assert!(
+            !arm.contains(".eval("),
+            "the New Window arm must not synthesize a WebView keydown: {arm}"
+        );
+    }
+
+    #[test]
+    fn cmd_t_menu_event_synthesizes_the_rebound_key() {
+        let arm = section_between(
+            include_str!("main.rs"),
+            "MENU_NEW_SESSION_ID =>",
+            "MENU_ADD_PROJECT_ID =>",
+        );
+        assert!(
+            arm.contains("key: 't'"),
+            "New Session synthesizes ⌘T into the focused webview: {arm}"
+        );
+        assert!(
+            !arm.contains("key: 'n'"),
+            "the old ⌘N synthesis must be gone: {arm}"
+        );
+    }
+
+    #[test]
+    fn new_landing_window_mints_before_opening_and_rolls_back_on_open_failure() {
+        let body = section_between(
+            include_str!("main.rs"),
+            "fn open_new_landing_window",
+            "fn open_native_workspace_window",
+        );
+        let label = body.find("next_landing_index").expect("label allocation");
+        let mint = body.find("create_owner").expect("owner mint");
+        let open = body
+            .find("open_native_landing_window")
+            .expect("window open");
+        let detach = body.find("owner.detach").expect("rollback detach");
+        assert!(
+            label < mint && mint < open,
+            "mint-first discipline (T1): allocate → mint → open:\n{body}"
+        );
+        assert!(
+            open < detach,
+            "an open failure must revoke the minted owner (the label frees itself with no window):\n{body}"
         );
     }
 }
