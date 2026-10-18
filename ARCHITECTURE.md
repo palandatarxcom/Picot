@@ -137,7 +137,71 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 
 删除前置条件不变：D10 Stage 2+ 遥测需显示这些条目在两个稳定 release 周期内零命中。
 
-**LAN 边界（Phase 1）**：`HostServer` 与 admin listener 一律只绑 `127.0.0.1`（loopback-only），**与任何持久化偏好无关**——旧的「设置 → Mobile Access」（`mobile.lanAccessEnabled`）已随 Phase 1 移除，残留偏好行被忽略、不生效。配对与 device token 机制（`RemoteAuth`、`/v2/auth/exchange`、`/pair.html`）保留在 host 侧，但在 loopback-only 下没有远程可达路径：它们是 Phase 2 relay 复用的既有资产（§4.4）。远程访问一律走 daemon **出站** relay + E2EE，daemon 永不监听 LAN 与公网。**落地细节（T6）**：设置页的 Mobile Access 卡片与 `public/settings/mobile-access.js` 一并删除；`mobile_access_info` 恒返回 `enabled:false` + 空 `lanUrls`（`enabled` 是事实陈述而非开关），因此工具栏「Open on Mobile」QR 入口（`public/lan-qr.js`）恒隐；`mobile_pairing_create` 不再有 LAN 偏好门禁（它由 desktop owner 授权，token 在 relay 到来前无可达路径）。回归测试：`src-tauri/crates/picot-host/tests/daemon_boot.rs` 以旧偏好 `mobile.lanAccessEnabled=true` 启动，断言 host 与 admin **双** listener 的绑定地址均为 loopback 且非 loopback 地址不可达。
+**LAN 边界（Phase 1）**：`HostServer` 与 admin listener 一律只绑 `127.0.0.1`（loopback-only），**与任何持久化偏好无关**——旧的「设置 → Mobile Access」（`mobile.lanAccessEnabled`）已随 Phase 1 移除，残留偏好行被忽略、不生效。配对与 device token 机制（`RemoteAuth`、`/v2/auth/exchange`、`/pair.html`）保留在 host 侧，但在 loopback-only 下没有远程可达路径：它们是 Phase 2 relay 复用的既有资产（§4.4）。远程访问一律走 daemon **出站** relay + E2EE（见「远程访问」章节），daemon 永不监听 LAN 与公网。**落地细节（T6）**：设置页的 Mobile Access 卡片与 `public/settings/mobile-access.js` 一并删除；`mobile_access_info` 恒返回 `enabled:false` + 空 `lanUrls`（`enabled` 是事实陈述而非开关），因此工具栏「Open on Mobile」QR 入口（`public/lan-qr.js`）恒隐；`mobile_pairing_create` 不再有 LAN 偏好门禁（它由 desktop owner 授权，token 在 relay 到来前无可达路径）。回归测试：`src-tauri/crates/picot-host/tests/daemon_boot.rs` 以旧偏好 `mobile.lanAccessEnabled=true` 启动，断言 host 与 admin **双** listener 的绑定地址均为 loopback 且非 loopback 地址不可达。
+
+## 远程访问（relay 出站 + E2EE + 配对）
+
+> Phase 2 已落地（spec `docs/superpowers/specs/not-started/2026-10-17-relay-phase2-pair-device-design.md`，母 spec `implemented/2026-09-20-persistent-daemon-relay-design.md` §2/§4）：daemon **出站**连公司 relay，配对设备经 E2EE 数据面以 owner 同权操作数据面；管理面与 admin 通道永不经 relay 开放。本章是现行实现契约。
+
+### 模块归属
+
+relay 全部代码在共享库 `picot-host` 的 `src/relay/`，由 `DaemonState` 持有（`RelayController`）并按持久化偏好拉起。归属理由：E2EE 解密后的帧必须喂进 `host_server` 的会话管线，同进程注入零跨进程协议；零 Tauri 守卫（`scripts/check-daemon-no-tauri.js`）自动覆盖新模块。会话管线入口已泛型化（`run_session`，axum upgrade 路径与 relay 适配器共用同一管线），模块划分照母 spec §4.1：
+
+| 模块 | 职责 |
+| --- | --- |
+| `relay/e2ee.rs` | daemon identity（Curve25519 keypair + serverId；load-or-create 在 store 互斥锁内完成、并发首建唯一；损坏行拒绝启动、绝不静默重键）、NaCl box（RustCrypto `crypto_box`，与 Paseo tweetnacl wire 兼容：密文文本帧 = `base64(nonce[24] ‖ ciphertext)`）、握手帧与拒收面（全零共享密钥、低阶/全零公钥、错误长度、非规范 base64、截断、篡改——一律断连，不进会话管线） |
+| `relay/pairing.rs` | offer 编解码（Paseo v2 schema + `pairingToken` 加法扩展，一扫码完成信任锚+认证）、`#offer=` fragment URL、endpoint 常量与 env 覆盖 |
+| `relay/transport.rs` | control/data socket 与生命周期：重连退避 `min(30s, 1s×尝试次数)`、ping 10s / 30s stale 强断、8s control ready 超时、10s 握手超时、`sync` 对账（relay 推全量 connectionIds，daemon 补开缺失 data socket、关多余）、容量边界 |
+| `relay/controller.rs` | 生命周期门面：`relay.enabled` 持久化（先铸 identity 再落 flag）、transport 启停、状态视图、offer 铸造 |
+| `relay/smoke_client.rs` + `examples/relay-smoke-client.rs` | 一次性 CLI 冒烟客户端（offer→E2EE→配对→数据面探针），不进产品路径 |
+
+### 出站方向（唯一新增网络面）
+
+daemon→relay 出站：一条 control socket（`wss://<endpoint>/ws?serverId=…&role=server&v=2`）+ 每 client 一条独立 data socket。relay 只是密文转发器，**不受信**；daemon 不新增任何入站监听——host 与 admin 双 listener 仍硬锁 `127.0.0.1`，LAN/公网监听永不出现。TLS 用 native-tls（复用 reqwest 既有栈，无第二套 TLS 实现）：标准服务器证书链 + 主机名（SNI）校验，信任锚 = 系统信任库，不自定义根、传输层不做 TOFU；`PICOT_RELAY_TLS=0` 是连本地 mock relay 的 dev 覆盖。传输层 TLS 只挡被动嗅探与错误连接，应用层信任锚是配对 offer 里的 daemon 公钥。endpoint 默认常量 `paseo.021521.xyz:443`，`PICOT_RELAY_ENDPOINT` 覆盖（dev/自建），UI 只做开关与 Pair Device、不做 endpoint 编辑。
+
+### E2EE 边界
+
+- **握手前零处理**：data socket 在 `e2ee_hello`（客户端临时公钥）→ `e2ee_ready` 完成前，任何帧不进会话管线（丢弃并断开）。
+- **每连接独立共享密钥**：X25519 ECDH（daemon 私钥 × 该客户端连接的临时公钥），连接间互不复用。
+- **私钥隔离**：identity 与 `relay.enabled` 存 SQLite `relay.*` **保留命名空间**——公共 `pref_get/pref_set/pref_delete/pref_list` 对 `relay.` 前缀一律拒绝、list 结果过滤（与 `runtime.*` 同款守卫）；专用内部接口仅供 host 内部调用，不经任何 RPC 暴露。私钥不进日志（redacted Debug）与任何返回面。
+- **relay 可重放/乱序/丢弃密文帧**：NaCl box 无序号，v1 不做反重放窗口（与 Paseo 同级，已接受风险）：重放 pairing hello 无效（token 一次性）、重放 runtime_request 重复执行一次命令、重放事件帧是冗余渲染。E2EE 保证机密性与完整性，不保证新鲜度。
+
+### 连接身份与准入矩阵（Gate B）
+
+三 ID 不混用：hello 的 `clientId` 是声明 ID（客户端自报，只作展示/日志）；relay 分配的 `connectionId` 是路由 ID（transport 层「connectionId ↔ 会话任务」映射）；host 分配的内部连接 ID（`relay:<uuid>`）是 `HostRouter` 注册键——重连即新 ID，同名声明不覆盖、旧连接清理不误删新连接。relay 会话只接受 `clientType:"remote"` 的 hello：relay 通道上的 desktop hello 一律拒绝（本地 owner 通道只可能是 loopback，带本地 capability 也算伪造）。
+
+**device principal**：pairingToken 铸造时记录铸 token 的 desktop owner，exchange 消费时把 owner 写进 device token 记录——一枚 deviceToken 天然归属一个 owner，不需要运行时猜。准入与 desktop 落同一份纯判定（`host_router::admits`，principal class × request face），不打旁路补丁：
+
+| 面 | desktop owner | remote device principal |
+| --- | --- | --- |
+| runtime_subscribe / runtime_request / snapshot / capabilities | 现状 | 放行：owner 绑定 + 该 owner 现注册（**registry 逐帧复读**：owner 注销/代数切换即失效）+ live runtime 归属匹配 |
+| data_request（owner 全局面 + workspace 绑定面） | 现状 | 同 desktop 规则；workspace 绑定面按 owner 当前注册工作区比对 frame 的 `workspaceId`（同一复读） |
+| host_request / host_control（管理面） | 现状 | **永拒 `forbidden_class`**——通道级隔离，与 owner 绑定无关，对 Remote class 是永久拒绝 |
+| admin RPC 与 Pair Device ops | 仅 app 进程（loopback admin channel） | 永不可达：admin listener 只绑 `127.0.0.1`，relay ops 经 Tauri command + 窗口账本校验转发，不经数据面 |
+
+资源回收：remote 会话是订阅者/请求方，不拥有 runtime 进程；断开走既有 disconnect 清理（订阅、写任务、pending 帧）。**不冒充 Desktop**：不借 desktop hello 类型、不造 capability 绕过。
+
+### 生命周期与撤销
+
+- `relay.enabled` 持久（保留命名空间），默认 false、显式启用；daemon 启动序按 flag 自动拉起 transport（同一 identity 跨重启不变，keypair 不轮换——轮换语义 = 全部设备重新配对）。enable 先铸 identity 再落 flag：损坏的 identity 行让 enable 失败、存量状态不动，修复路径 = 手动删键。disable 只做本地 close（不等网络）并**清空全部未兑换 pairing token，已配对 device token 不撤**。
+- 配对凭据六状态：**minted**（新铸 5 分钟一次性 pairingToken 嵌 offer，先作废上一枚未兑换）/ **used**（exchange 成功即一次性移除）/ **expired**（`now > expires_at` 拒绝，与清理同界）/ **superseded**（再次生成 offer 即作废旧 token）/ **relay 关闭**（清未兑换、不撤已配对）/ **离开页面**（停轮询，token 按 TTL 自然过期）。offer URL 前缀 `https://picot.021521.xyz/#offer=<base64url>`（占位域名，格式与未来客户端兼容，已过期凭据不复活）。
+- **撤销即踢**：`relay.revoke_device {deviceId}` admin op = 关闭该 device 全部现存 remote 连接（device→活跃会话注册；relay 与 loopback remote 一致处理）+ 删 DB token；后续 hello 因 DB 校验自然拒绝，不做轮询复核。
+- 配置面四 ops：`relay.status` / `relay.set_enabled` / `relay.offer` / `relay.revoke_device`，全部走 admin 通道（Tauri command 转发，调用窗口须在 app 窗口账本内；offer 铸给该窗口的 owner）。pairingToken 与既有 LAN 配对（`RemoteAuth`、`POST /v2/auth/exchange`）共享同一池与同一授权面——relay 侧是 hello 内嵌 exchange（`hello_ack` 附铸出的 deviceToken 回传），HTTP 端点原样服务 loopback。
+
+### 容量边界（公网不可信入口，契约在 `transport_limits.rs`）
+
+relay 数据面绕开 axum 入口的物理帧上限，各上限统一进契约；溢出语义统一：**任何上限触发只关当事连接，本地会话与 control 连接不受影响**：
+
+| 维度 | 上限 | 溢出行为 |
+| --- | --- | --- |
+| control 帧尺寸 | `RELAY_CONTROL_FRAME_BYTES` 64 KiB | 断 control 连接，按退避重连 |
+| data 帧密文文本 | `RELAY_DATA_FRAME_TEXT_BYTES`（明文 ≤ `WS_PHYSICAL_FRAME_BYTES`，base64 ×4/3 膨胀计入） | 关该 data 连接 |
+| data 连接总数 | 计入 `MAX_CLIENTS`（256） | 既有 `client_limit` 拒绝新连接 |
+| 并发 E2EE 握手 | `E2EE_HANDSHAKE_PERMITS` 4（信号量）+ 10s 握手超时 | 超限/超时关该连接 |
+| 每连接出站队列 | `OUTBOUND_QUEUE_CAPACITY` 64（**有界队列取代无界 writer**，慢消费者不拖垮 daemon 内存） | 满即关该连接，丢弃未发帧 |
+| sync 列表长度 | connectionIds ≤ `MAX_CLIENTS` | 超限断 control（协议异常） |
+
+备份/恢复语义：metadata DB 备份会把 identity 私钥与 device tokens 一并带走——恢复到新机器 = **信任锚迁移**（旧配对关系保留），不是静默生成新 key；旧机器若仍以同一 serverId 连 relay，两台 daemon 竞争（行为依 relay 服务端语义），用户自行保证旧机停用；备份文件按敏感凭据对待。
 
 ## 授权模型
 
@@ -332,6 +396,8 @@ pi runtime 的存活不依赖 Picot 的 teardown：`pi` 在 stdin EOF 时退出�
 | `metadata_store.rs` | SQLite 工作区注册 + preferences；每个注册项持久化单个 Pi `session_bucket`；正式 spawn（`workspace_target_prepare`、`workspace_open`、`restart_runtime`）后由 host 主动 `get_state` 写回，`runtime_snapshot_request` 作为兜底；写入内容仅为 Pi `get_state.data.sessionFile` 的父目录，sidebar 只读该 bucket，不扫描全局 Pi sessions。schema 兼容契约：接受 user_version ≤ 6（Corp v4–v6 表归 Corp 构建，public 只读不建），public 迁移只完成 v1–v3 并只盖 v3 戳；public-owned `session_bucket` 列按存在性增量补齐，绝不改 Corp 版本戳 |
 | `window_owner.rs` | 窗口 owner 注册与 capability |
 | `remote_auth.rs` | 远程设备配对与 device token |
+| `remote_auth.rs` | 远程设备配对与 device token（pairingToken/deviceToken 池、pending 作废、device principal owner 绑定） |
+| `relay/` | Phase 2 远程访问（e2ee/pairing/transport/controller/smoke_client，见「远程访问」章节）——daemon 唯一出站网络面 |
 | `ephemeral_registry.rs` | Side/Quick chat 生命周期 |
 | `git_service.rs` | owner-scoped Git status, diff, history, commit, and push operations；push 与写操作共享 per-root 写槽，认证严格非交互（GIT_TERMINAL_PROMPT=0 + askpass 抑制 + SSH BatchMode），超时 120s 后按进程组终止 |
 
