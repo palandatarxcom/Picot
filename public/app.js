@@ -7355,7 +7355,7 @@ function selectSettingsTab(tabKey = "general") {
   // The daemon section polls only while it is the visible page (T10): the
   // status can change under us (a crash, a restart from another window), so the
   // row refreshes on open and every 5s afterwards, and stops on leave.
-  if (targetTabKey === "general") void daemonSection.activate();
+  if (targetTabKey === "daemon") void daemonSection.activate();
   else daemonSection.leave();
   // The MCP nav item stays hidden until the pi-mcp-adapter package is
   // detected; refreshAvailability caches after the first check.
@@ -8124,12 +8124,14 @@ const piPathToggle = setupPiPathToggle({
   note: document.getElementById("pi-path-note"),
 });
 
-// Settings → General → Daemon (plan T10). Its three commands go over Tauri IPC
+// Settings → Daemon. Its management commands go over Tauri IPC
 // (`window.__TAURI__.core.invoke`), not the host WebSocket: they are app-level
 // facts (the daemon's status, the app-private quit policy, the restart
 // transaction). Polling starts when the General panel opens and stops when it
 // closes — see the selectSettingsTab/closeSettings hooks.
-const daemonSection = setupDaemonSection();
+const daemonSection = setupDaemonSection({
+  loadWorkspaceSessions: (workspaceId) => transport.workspaceSessions(workspaceId),
+});
 
 ({ loadInlineConfigEditor, loadAgentsMdEditor, loadAppendSystemMdEditor } = setupSettingsConfig({
   configGateway,

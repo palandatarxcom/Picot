@@ -1,9 +1,10 @@
-// ABOUTME: Settings → General → Daemon section: the daemon's status row, the app-private
+// ABOUTME: Settings → Daemon section: the daemon's status row, the app-private
 // ABOUTME: keepRunningAfterQuit toggle, the restart transaction's confirm flow, and the
 // ABOUTME: permanent running-agents list with its per-runtime stop.
 
 import { t as i18n, onLocaleChange } from "../i18n.js";
 import { bindDialogEscape } from "../ui/dialog-escape.js";
+import { runtimeKey, setupDaemonRuntimes } from "./daemon-runtimes.js";
 import { setupPairDeviceSection } from "./pair-device-section.js";
 
 /**
@@ -82,12 +83,14 @@ const AGENT_STATES = [
  * @param {{
  *   root?: Document,
  *   transport?: ReturnType<typeof tauriDaemonTransport>,
+ *   loadWorkspaceSessions?: (workspaceId: string) => Promise<{sessions: object[]}>,
  *   t?: (key: string, params?: Record<string, string|number>) => string,
  * }} [options]
  */
 export function setupDaemonSection({
   root = document,
   transport = tauriDaemonTransport(),
+  loadWorkspaceSessions,
   t = i18n,
 } = {}) {
   const section = root.getElementById("setting-daemon-section");
@@ -153,6 +156,16 @@ export function setupDaemonSection({
   /** The instance id of the agent whose stop is in flight, if any. */
   let stoppingId = null;
   let pollTimer = null;
+  let refreshRound = 0;
+  let activation = 0;
+  const runtimes = setupDaemonRuntimes({
+    root,
+    t,
+    stateLabel: agentStateLabel,
+    onStop: requestStop,
+    onSelect: closeStopConfirm,
+    loadWorkspaceSessions,
+  });
 
   // The Pair Device block lives in this same section (relay Phase 2, spec
   // §3.2): its lifecycle and poll are this section's, so its reads ride
@@ -214,11 +227,14 @@ export function setupDaemonSection({
    */
   async function refresh() {
     if (busy) return status;
+    const round = ++refreshRound;
     try {
       const fresh = await transport.status();
+      if (!active || round !== refreshRound) return null;
       status = fresh && typeof fresh === "object" ? fresh : null;
       readError = null;
     } catch (error) {
+      if (!active || round !== refreshRound) return null;
       status = null;
       // A shell without the app-level IPC (a plain browser tab) has no daemon
       // to read: it stays “unavailable” and silent rather than telling the
@@ -228,6 +244,7 @@ export function setupDaemonSection({
         : null;
     }
     render();
+    runtimes.refreshNames();
     return status;
   }
 
@@ -236,7 +253,9 @@ export function setupDaemonSection({
    * status document (its consent warning reads keepRunningAfterQuit from it).
    */
   async function refreshAll() {
+    const visit = activation;
     const fresh = await refresh();
+    if (!active || visit !== activation) return;
     await pairDevice.refresh(fresh);
   }
 
@@ -263,35 +282,8 @@ export function setupDaemonSection({
     return session ? `${workspace} · ${session}` : String(workspace);
   }
 
-  /** The row's stop key: the instance id, which is what the daemon carries. */
+  /** The instance id used to display the in-flight stop. */
   const agentKey = (agent) => (agent?.instanceId == null ? null : String(agent.instanceId));
-
-  /**
-   * One list row per live runtime: workspace root, session id, coordinator
-   * state, and — in the permanent list — that runtime's own Stop button.
-   */
-  function agentRow(agent, onStop) {
-    const li = root.createElement("li");
-    li.textContent = `${agentLabel(agent)} · `;
-    const state = root.createElement("span");
-    state.className = "daemon-agent-state";
-    state.textContent = agentStateLabel(agent?.state);
-    li.append(state);
-    if (onStop) {
-      const stop = root.createElement("button");
-      stop.className = "settings-value-btn daemon-agent-stop";
-      const stopping = stoppingId !== null && agentKey(agent) === stoppingId;
-      stop.textContent = t(
-        stopping ? "settings.daemon.stoppingAgent" : "settings.daemon.stopAgent",
-      );
-      // A restart transaction is draining every runtime: racing it with a
-      // per-runtime stop is what the disabled button prevents.
-      stop.disabled = busy || stopping;
-      stop.addEventListener("click", () => onStop(agent));
-      li.append(stop);
-    }
-    return li;
-  }
 
   /**
    * The permanent list. Rebuilt from the last status document, so a poll (5s)
@@ -300,12 +292,10 @@ export function setupDaemonSection({
    */
   function renderAgents() {
     const agents = status && Array.isArray(status.agents) ? status.agents : [];
-    agentsEmpty.textContent = t("settings.daemon.agentsEmpty");
-    agentsEmpty.hidden = agents.length > 0;
-    agentsBlock.replaceChildren(
-      ...agents.map((agent) => agentRow(agent, requestStop)),
-      agentsEmpty,
-    );
+    if (stopTarget && !agents.some((agent) => runtimeKey(agent) === runtimeKey(stopTarget)))
+      closeStopConfirm();
+    runtimes.render(agents, { busy, stoppingId });
+    renderStopConfirm();
   }
 
   /** A row's Stop click: a working agent asks first, anything else stops now. */
@@ -322,8 +312,8 @@ export function setupDaemonSection({
   function renderStopConfirm() {
     stopConfirmRow.hidden = stopTarget === null;
     stopConfirmTarget.textContent = stopTarget ? agentLabel(stopTarget) : "";
-    stopConfirmBtn.disabled = false;
-    stopCancelBtn.disabled = false;
+    stopConfirmBtn.disabled = busy || stoppingId !== null;
+    stopCancelBtn.disabled = busy || stoppingId !== null;
   }
 
   function closeStopConfirm() {
@@ -367,9 +357,11 @@ export function setupDaemonSection({
   }
 
   async function openConfirm() {
+    const visit = activation;
     restartBtn.disabled = true;
     const fresh = await refresh();
     restartBtn.disabled = false;
+    if (!active || visit !== activation) return;
     if (!fresh) {
       // The count is what the user is approving; without it the confirm would
       // be a blind "stop everything". The notice already says why.
@@ -487,7 +479,7 @@ export function setupDaemonSection({
 
   // Every dynamic string is rebuilt on a locale change; the status values
   // themselves are locale-free, so nothing is re-fetched.
-  const unsubscribe = onLocaleChange(() => {
+  onLocaleChange(() => {
     if (!active) return;
     confirmRowText();
     render();
@@ -503,6 +495,7 @@ export function setupDaemonSection({
   return {
     /** Open the section: fetch once, then poll while it stays open. */
     async activate() {
+      const visit = ++activation;
       active = true;
       actionError = null;
       readError = null;
@@ -511,6 +504,7 @@ export function setupDaemonSection({
       closeStopConfirm();
       confirmRowText();
       await refreshAll();
+      if (!active || visit !== activation) return;
       stopPolling();
       pollTimer = setInterval(() => {
         void refreshAll();
@@ -519,11 +513,14 @@ export function setupDaemonSection({
     /** Close the section: stop polling and drop the pending confirm. */
     leave() {
       active = false;
+      activation++;
+      refreshRound++;
+      runtimes.invalidate();
       pairDevice.leave();
       stopPolling();
       closeConfirm();
       closeStopConfirm();
-      unsubscribe();
+      // The section is reused on re-entry; keep its one locale subscription.
     },
     refresh,
   };

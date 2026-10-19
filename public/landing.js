@@ -362,6 +362,7 @@ wsClient.addEventListener("registryChanged", () => {
 // advisor/models machinery over an ephemeral sessionless Pi.
 const LANDING_FUNCTIONAL_SETTINGS_TABS = new Set([
   "general",
+  "daemon",
   "appearance",
   "environment",
   "usage",
@@ -461,12 +462,14 @@ const piPathToggle = setupPiPathToggle({
   note: document.getElementById("pi-path-note"),
 });
 
-// Settings → General → Daemon (plan T10): the cold start renders this same
+// Settings → Daemon: the cold start renders this same
 // Settings panel (index.html is shared by both shells), so the landing window
 // wires the section too — the daemon commands validate the calling window's
 // label against the app's window ledger, which records the landing window just
 // like a workspace one.
-const daemonSection = setupDaemonSection();
+const daemonSection = setupDaemonSection({
+  loadWorkspaceSessions: (workspaceId) => transport.workspaceSessions(workspaceId),
+});
 
 const landingSubagents = setupSubagentsTab({
   container: document.getElementById("settings-subagents"),
@@ -486,8 +489,8 @@ const environmentPage = setupEnvironmentPage({
 function selectLandingSettingsTab(tabKey) {
   const target = LANDING_FUNCTIONAL_SETTINGS_TABS.has(tabKey) ? tabKey : "general";
   // Same lifecycle as the workspace shell: the daemon section polls while the
-  // General page is open and stops when it is left (T10).
-  if (target === "general") void daemonSection.activate();
+  // Daemon page is open and stops when it is left.
+  if (target === "daemon") void daemonSection.activate();
   else daemonSection.leave();
   document.querySelectorAll(".settings-nav-item[data-settings-tab]").forEach((item) => {
     const tab = item.dataset.settingsTab;

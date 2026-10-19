@@ -22,6 +22,16 @@ const harness = vi.hoisted(() => ({
   transport: null,
   sidebarInstance: null,
   wsClient: null,
+  daemon: null,
+  daemonOptions: null,
+}));
+
+vi.mock("./settings/daemon-section.js", () => ({
+  setupDaemonSection: (options) => {
+    harness.daemonOptions = options;
+    harness.daemon = { activate: vi.fn(), leave: vi.fn() };
+    return harness.daemon;
+  },
 }));
 
 vi.mock("./app/websocket-client.js", () => ({
@@ -358,6 +368,7 @@ test("landing settings: all tabs functional; MCP reveal follows installed packag
 <div class="settings-nav">
 <button class="settings-nav-back" id="settings-close" type="button"><span class="settings-nav-back-icon" aria-hidden="true"></span></button>
 <div class="settings-nav-item active" data-settings-tab="general">General</div>
+<div class="settings-nav-item" data-settings-tab="daemon">Daemon</div>
 <div class="settings-nav-item" data-settings-tab="appearance">Appearance</div>
 <div class="settings-nav-item" data-settings-tab="usage">Usage</div>
 <div class="settings-nav-item" data-settings-tab="models">Models</div>
@@ -379,6 +390,7 @@ test("landing settings: all tabs functional; MCP reveal follows installed packag
 <cost-dashboard id="settings-cost-dashboard" defer-load></cost-dashboard>
 </div>
 <div class="settings-tab" data-settings-panel="models"></div>
+<div class="settings-tab" data-settings-panel="daemon"></div>
 </div>`,
   );
   harness.transport = makeTransportStub();
@@ -410,6 +422,22 @@ test("landing settings: all tabs functional; MCP reveal follows installed packag
   // run on the lazily spawned config runtime. MCP is statically visible:
   // native MCP ships with every Pi 0.99+ runtime, no adapter gate.
   expect(hidden("general")).toBe(false);
+  expect(hidden("daemon")).toBe(false);
+  const load = vi.fn(async () => ({ sessions: [{ id: "s1", name: "JSONL name" }] }));
+  harness.transport.workspaceSessions = load;
+  await expect(harness.daemonOptions.loadWorkspaceSessions("other-workspace")).resolves.toEqual({
+    sessions: [{ id: "s1", name: "JSONL name" }],
+  });
+  expect(load).toHaveBeenCalledWith("other-workspace");
+  harness.daemon.activate.mockClear();
+  navItems.find((item) => item.dataset.settingsTab === "daemon").click();
+  expect(harness.daemon.activate).toHaveBeenCalledTimes(1);
+  expect(panel.querySelector('[data-settings-panel="daemon"]').classList.contains("active")).toBe(
+    true,
+  );
+  harness.daemon.leave.mockClear();
+  navItems.find((item) => item.dataset.settingsTab === "general").click();
+  expect(harness.daemon.leave).toHaveBeenCalledTimes(1);
   expect(hidden("appearance")).toBe(false);
   expect(hidden("usage")).toBe(false);
   expect(hidden("skills")).toBe(false);

@@ -1,6 +1,5 @@
-// ABOUTME: Settings → General → Daemon → Pair Device (relay Phase 2, spec §3.2): the
-// ABOUTME: Paseo-style two-state surface — consent while relay is off, QR + link +
-// warning while it is on — wired by daemon-section onto its shared poll.
+// ABOUTME: Settings → Daemon → Pair Device: consent while relay is off, link and warning while on.
+// ABOUTME: Shares daemon-section's visible-tab poll without rendering a pairing QR.
 
 import { t as i18n, onLocaleChange } from "../i18n.js";
 import { createIcon } from "../icons.js";
@@ -71,7 +70,6 @@ export function setupPairDeviceSection({
   const enableBtn = root.getElementById("btn-pair-device-enable");
   const offerRow = root.getElementById("pair-device-offer");
   const stateEl = root.getElementById("pair-device-state");
-  const qrCanvas = root.getElementById("pair-device-qr");
   const urlInput = root.getElementById("pair-device-url");
   const expiredEl = root.getElementById("pair-device-expired");
   const copyBtn = root.getElementById("btn-pair-device-copy");
@@ -89,7 +87,6 @@ export function setupPairDeviceSection({
     !enableBtn ||
     !offerRow ||
     !stateEl ||
-    !qrCanvas ||
     !urlInput ||
     !expiredEl ||
     !copyBtn ||
@@ -139,27 +136,6 @@ export function setupPairDeviceSection({
   }
 
   /**
-   * Render the QR from the offer URL (the same vendor call the LAN QR uses).
-   * A missing or failing renderer hides the canvas — the read-only link next
-   * to it stays the honest fallback — and says so once in the notice.
-   */
-  async function renderQr(url) {
-    if (!url) {
-      qrCanvas.classList.add("hidden");
-      return;
-    }
-    try {
-      const qr = globalThis.PicotQr;
-      if (!qr?.toCanvas) throw new Error("QR renderer unavailable");
-      await qr.toCanvas(qrCanvas, url, { width: 200 });
-      qrCanvas.classList.remove("hidden");
-    } catch {
-      qrCanvas.classList.add("hidden");
-      setNotice(t("misc.qrUnavailable"), "action");
-    }
-  }
-
-  /**
    * Spec §2.10: `expiresAt` is epoch seconds and `now == expiresAt` is still
    * valid on the daemon side; the ms comparison only ever errs one second
    * early, never shows a dead code as live.
@@ -180,14 +156,8 @@ export function setupPairDeviceSection({
     if (enabled) {
       stateEl.textContent = `${stateLabel(relayStatus?.state)} · ${relayStatus?.endpoint ?? "—"}`;
       urlInput.value = offer?.url ?? "";
-      // An expired offer is a dead code (spec §2.10): hide the QR, keep the
-      // URL row with the expired marker — Regenerate is the way out.
+      // Keep the expired URL selectable; Regenerate is the way out.
       expiredEl.hidden = !expired;
-      if (expired) {
-        qrCanvas.classList.add("hidden");
-      } else {
-        void renderQr(offer?.url ?? null);
-      }
     } else {
       expiredEl.hidden = true;
       consentTitle.textContent = t("settings.daemon.pairDevice.enableTitle");
@@ -347,7 +317,7 @@ export function setupPairDeviceSection({
 
   // Every dynamic string is rebuilt on a locale change; the relay facts and
   // the offer URL are locale-free, so nothing is re-fetched.
-  const unsubscribe = onLocaleChange(() => {
+  onLocaleChange(() => {
     if (!active) return;
     render();
   });
@@ -365,7 +335,6 @@ export function setupPairDeviceSection({
       consentOpen = false;
       clearTimeout(copyTimer);
       copyBtn.textContent = t("settings.daemon.pairDevice.copy");
-      unsubscribe();
     },
     refresh,
   };

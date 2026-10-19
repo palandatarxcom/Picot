@@ -1062,6 +1062,14 @@
         </button>
         <button
           class="settings-nav-item"
+          data-settings-tab="daemon"
+          data-i18n="settings.daemon.title"
+          type="button"
+        >
+          Daemon
+        </button>
+        <button
+          class="settings-nav-item"
           data-settings-tab="appearance"
           data-i18n="settings.appearance"
         >
@@ -1243,11 +1251,13 @@
                 <button class="settings-toggle" id="toggle-pi-path"></button>
               </div>
             </div>
-            <!-- Settings → General → Daemon (plan Task 10). The last section of
-                 this panel: the daemon's status, the app-private quit policy and
-                 the restart transaction's confirm. Shared by both shells
-                 (app.js renders the workspace window, landing.js the cold start),
-                 so both wire setupDaemonSection. -->
+          </div>
+        </div>
+        <div class="settings-tab" data-settings-panel="daemon">
+          <div class="settings-header">
+            <h3 data-i18n="settings.daemon.title">Daemon</h3>
+          </div>
+          <div class="settings-body">
             <div class="settings-section" id="setting-daemon-section">
               <div class="settings-section-title" data-i18n="settings.daemon.title">
                 Daemon
@@ -1284,30 +1294,28 @@
                   data-i18n-aria-label="settings.daemon.keepRunning"
                 ></button>
               </div>
-              <!-- The permanent runtime management surface (B2): every live
-                   agent with its coordinator state and its own Stop button.
-                   Unlike the restart confirm below, this block is always on
-                   screen — it is the entry point a single-window Picot
-                   otherwise has no way to reach. -->
-              <div class="settings-row" id="setting-daemon-agents">
-                <div class="daemon-agents">
-                  <span
-                    class="settings-label-main"
-                    data-i18n="settings.daemon.agentsTitle"
-                    >Running agents</span
-                  >
-                  <ul class="daemon-agent-list" id="daemon-agents">
-                    <li
-                      id="daemon-agents-empty"
-                      data-i18n="settings.daemon.agentsEmpty"
-                    >
-                      No agents are running.
-                    </li>
-                  </ul>
+              <div class="settings-section-title" data-i18n="settings.daemon.agentsTitle">Running agents</div>
+              <div class="pkg-manager-layout" id="daemon-runtime-layout">
+                <div class="pkg-manager-groups" id="daemon-agents" data-i18n-aria-label="settings.daemon.agentsTitle">
+                  <div class="pkg-manager-empty" id="daemon-agents-empty" data-i18n="settings.daemon.agentsEmpty">No agents are running.</div>
                 </div>
-              </div>
-              <div class="settings-row" id="daemon-stop-confirm" hidden>
-                <div class="daemon-confirm">
+                <section class="pkg-manager-detail" id="daemon-runtime-detail" data-i18n-aria-label="settings.daemon.runtimeDetails">
+                  <div id="daemon-runtime-content" hidden>
+                    <div class="pkg-manager-detail-header">
+                      <span class="settings-label-main" data-i18n="settings.daemon.runtimeDetails">Runtime details</span>
+                    </div>
+                    <div class="pkg-manager-status-grid">
+                      <div class="pkg-manager-status-row"><span data-i18n="settings.daemon.runtimeId">Runtime ID</span><span class="is-wrap" id="daemon-detail-runtime-id"></span></div>
+                      <div class="pkg-manager-status-row"><span data-i18n="settings.daemon.sessionName">Session name</span><span class="is-wrap" id="daemon-detail-session-name"></span></div>
+                      <div class="pkg-manager-status-row"><span data-i18n="settings.daemon.sessionId">Session ID</span><span class="is-wrap" id="daemon-detail-session-id"></span></div>
+                      <div class="pkg-manager-status-row"><span data-i18n="settings.daemon.workspace">Workspace</span><span class="is-wrap" id="daemon-detail-workspace"></span></div>
+                      <div class="pkg-manager-status-row"><span data-i18n="settings.daemon.state">State</span><span class="is-wrap" id="daemon-detail-state"></span></div>
+                      <div class="pkg-manager-status-row"><span data-i18n="settings.daemon.cwd">CWD</span><span class="is-wrap" id="daemon-detail-cwd"></span></div>
+                    </div>
+                    <div class="pkg-manager-footer">
+                      <button class="settings-value-btn is-danger daemon-agent-stop" id="btn-daemon-agent-stop" type="button" data-i18n="settings.daemon.stopAgent">Stop</button>
+                    </div>
+                <div class="daemon-confirm" id="daemon-stop-confirm" hidden style="margin-top: var(--space-3); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-glass);">
                   <p
                     class="settings-help"
                     id="daemon-stop-confirm-text"
@@ -1344,6 +1352,9 @@
                     </button>
                   </div>
                 </div>
+                  </div>
+                  <div class="pkg-manager-empty" id="daemon-runtime-empty" data-i18n="settings.daemon.selectRuntime">Select a runtime to view its details.</div>
+                </section>
               </div>
               <div class="settings-row" id="setting-daemon-restart">
                 <span class="settings-label settings-label-stack">
@@ -1365,15 +1376,9 @@
                 </button>
               </div>
             </div>
-            <!-- Settings → General → Remote access (relay Phase 2, spec
-                 §3.2): Paseo's two states — a collapsed row while relay is
-                 off (opens the consent copy), the offer state (state line +
-                 QR + read-only link + warning) while it is on. Wired by
-                 daemon-section alongside its own lifecycle. -->
+            <!-- Remote pairing shares the Daemon tab's lifecycle. -->
             <div class="settings-section" id="setting-remote-section">
-              <div class="settings-section-title" data-i18n="settings.remote.title">
-              </div>
-                Remote access
+              <div class="settings-section-title" data-i18n="settings.remote.title">Remote access</div>
               <div class="settings-row" id="setting-pair-device">
                 <span class="settings-label settings-label-stack">
                   <span
@@ -1449,16 +1454,9 @@
                     class="settings-help"
                     data-i18n="settings.daemon.pairDevice.requiresClient"
                   >
-                    Scanning needs a Picot client app, which is not available
-                    yet.
+                    You need the Picot client app to open this link.
                   </p>
-                  <div class="pair-device-offer-body">
-                    <canvas
-                      id="pair-device-qr"
-                      class="hidden"
-                      width="200"
-                      height="200"
-                    ></canvas>
+                  <div>
                     <div class="pair-device-link">
                       <input
                         class="pair-device-url"

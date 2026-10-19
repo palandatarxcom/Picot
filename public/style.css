@@ -3265,7 +3265,7 @@ body.landing-mode #landing {
   background: var(--bg-glass);
 }
 
-/* Settings → General → Daemon: the restart confirm block and its agent list. */
+/* Settings → Daemon: confirmation blocks and runtime master-detail. */
 .daemon-confirm {
   display: flex;
   flex-direction: column;
@@ -3273,11 +3273,8 @@ body.landing-mode #landing {
   width: 100%;
 }
 
-.daemon-agent-list {
-  margin: 0;
-  padding-inline-start: var(--space-4);
-  font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+.daemon-confirm[hidden] {
+  display: none;
 }
 
 /* The permanent running-agents block: title over its list, one column. */
@@ -3288,12 +3285,7 @@ body.landing-mode #landing {
   width: 100%;
 }
 
-.daemon-agent-stop {
-  margin-inline-start: var(--space-2);
-}
-
-/* Settings → General → Daemon → Pair Device: the consent's shield badge and
-   the offer body (QR beside the read-only link and its action row). */
+/* Settings → Daemon → Pair Device consent and read-only link. */
 .pair-device-consent-copy {
   display: flex;
   align-items: flex-start;
@@ -3304,13 +3296,6 @@ body.landing-mode #landing {
   display: inline-flex;
   color: var(--accent);
   flex-shrink: 0;
-}
-
-.pair-device-offer-body {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-3);
-  flex-wrap: wrap;
 }
 
 .pair-device-link {
@@ -10880,6 +10865,31 @@ body.file-preview-resizing {
   font-size: var(--font-size-xs);
 }
 
+.daemon-runtime-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.daemon-runtime-row .pkg-manager-sidebar-name {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.daemon-runtime-row .pkg-manager-sidebar-meta {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
+/* Short IDs must not inherit pkg-manager-source's flex: 1 (zero width on narrow rows). */
+.daemon-runtime-session-id {
+  color: var(--text-dim);
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
 .pkg-manager-status-dot {
   width: 0.45rem;
   height: 0.45rem;
@@ -11088,6 +11098,15 @@ body.file-preview-resizing {
   .pkg-manager-detail {
     min-height: 24rem;
     height: auto;
+  }
+
+  .daemon-runtime-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .daemon-runtime-row .pkg-manager-sidebar-meta {
+    margin-top: 0.2rem;
   }
 }
 

@@ -4,6 +4,15 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
+const daemonHarness = vi.hoisted(() => ({ options: null, page: null }));
+vi.mock("./settings/daemon-section.js", () => ({
+  setupDaemonSection: (options) => {
+    daemonHarness.options = options;
+    daemonHarness.page = { activate: vi.fn(), leave: vi.fn() };
+    return daemonHarness.page;
+  },
+}));
+
 const enMessages = JSON.parse(readFileSync(join(process.cwd(), "public/locales/en.json"), "utf8"));
 
 class FakeWebSocket extends EventTarget {
@@ -31,6 +40,9 @@ class FakeWebSocket extends EventTarget {
             !String(frame.workspaceId || "").includes("non-git") &&
             !String(frame.workspaceId || "").includes("nongit"),
         };
+      }
+      if (frame.operation === "workspace_sessions") {
+        response = { sessions: [{ id: "s1", name: "JSONL name" }] };
       }
       if (response) {
         queueMicrotask(() =>
@@ -117,6 +129,33 @@ afterEach(() => {
   delete globalThis.fetch;
   delete globalThis.requestAnimationFrame;
   delete globalThis.ResizeObserver;
+});
+
+test("workspace shell routes the Daemon lifecycle and injects the data-plane query", async () => {
+  await import("./app.js?daemon-tab-routing");
+  const socket = FakeWebSocket.instances.at(-1);
+  socket.readyState = FakeWebSocket.OPEN;
+  socket.onmessage({ data: JSON.stringify({ type: "hello_ack", protocolVersion: 2 }) });
+  document.getElementById("settings-btn").click();
+  expect(daemonHarness.page.activate).not.toHaveBeenCalled();
+  document.querySelector('[data-settings-tab="daemon"]').click();
+  expect(daemonHarness.page.activate).toHaveBeenCalledTimes(1);
+  expect(
+    document.querySelector('[data-settings-panel="daemon"]').classList.contains("active"),
+  ).toBe(true);
+  const result = await daemonHarness.options.loadWorkspaceSessions("other-workspace");
+  expect(result.sessions).toEqual([{ id: "s1", name: "JSONL name" }]);
+  expect(
+    socket.sent.some(
+      (frame) =>
+        frame.type === "data_request" &&
+        frame.operation === "workspace_sessions" &&
+        frame.workspaceId === "other-workspace",
+    ),
+  ).toBe(true);
+  daemonHarness.page.leave.mockClear();
+  document.querySelector('[data-settings-tab="general"]').click();
+  expect(daemonHarness.page.leave).toHaveBeenCalledTimes(1);
 });
 
 test("places the preview workspace below the shared header", () => {

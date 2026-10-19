@@ -113,7 +113,7 @@ describe("settings page split", () => {
     expect(appJs).not.toContain('rpcCommand({ type: "get_auth" })');
   });
 
-  test("keeps the daemon and remote sections at the end of General", () => {
+  test("moves daemon and remote into the second tab and wires both shells", () => {
     const dom = new JSDOM(html, { url: "http://localhost" });
     const { document } = dom.window;
 
@@ -121,15 +121,22 @@ describe("settings page split", () => {
     const section = document.querySelector("#setting-daemon-section");
     expect(panel).not.toBeNull();
     expect(section).not.toBeNull();
-    // The daemon section lives in General (not a page of its own) and the
-    // remote-access block follows it last: a section above would push the
-    // daemon's status out of the first screen for no reason, and the panel's
-    // order is the shipping order (Task 10).
-    expect(panel.contains(section)).toBe(true);
+    expect(panel.contains(section)).toBe(false);
     const sections = [...panel.querySelectorAll(".settings-section")];
-    expect(sections.at(-2)).toBe(section);
-    expect(sections.at(-1)?.id).toBe("setting-remote-section");
-    expect(sections.map((node) => node.id)).toContain("setting-pi-path-section");
+    expect(sections.map((node) => node.id)).toEqual([
+      "",
+      "setting-updater-section",
+      "setting-pi-path-section",
+    ]);
+    const daemonPanel = document.querySelector('[data-settings-panel="daemon"]');
+    expect(daemonPanel?.contains(section)).toBe(true);
+    expect([...daemonPanel.querySelectorAll(".settings-section")].map((node) => node.id)).toEqual([
+      "setting-daemon-section",
+      "setting-remote-section",
+    ]);
+    expect(document.querySelector('[data-settings-tab="daemon"]').dataset.i18n).toBe(
+      "settings.daemon.title",
+    );
 
     // Both shells render this one Settings panel (the workspace window and the
     // cold-start landing window), so both must wire the section's lifecycle:
@@ -141,6 +148,13 @@ describe("settings page split", () => {
     expect(landingJs).toContain("daemonSection.activate()");
     expect(appJs).toContain("daemonSection.leave()");
     expect(landingJs).toContain("daemonSection.leave()");
+    expect(appJs).toContain('if (targetTabKey === "daemon") void daemonSection.activate()');
+    expect(landingJs).toContain('if (target === "daemon") void daemonSection.activate()');
+    for (const shell of [appJs, landingJs]) {
+      expect(shell).toMatch(
+        /setupDaemonSection\(\{\s*loadWorkspaceSessions: \(workspaceId\) => transport.workspaceSessions\(workspaceId\),?\s*\}\)/,
+      );
+    }
   });
 
   test("orders navigation without the retired Agent Inbox entry", () => {
@@ -152,6 +166,7 @@ describe("settings page split", () => {
     );
     expect(tabs).toEqual([
       "general",
+      "daemon",
       "appearance",
       "models",
       "extensions",

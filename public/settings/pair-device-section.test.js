@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
-// ABOUTME: Verifies the Settings → General → Daemon → Pair Device block (relay
+// ABOUTME: Verifies the Settings → Daemon → Pair Device block (relay
 // ABOUTME: Phase 2, spec §3.2): the two Paseo-style states, the consent→enable
-// ABOUTME: call shape, the offer render (QR input is the offer URL), copy
+// ABOUTME: call shape, the link-only offer render, copy
 // ABOUTME: feedback, regenerate, disable, the keepRunning hint condition and
 // ABOUTME: locale coverage.
 
@@ -247,12 +247,9 @@ describe("enabling", () => {
     expect(offer.hidden).toBe(false);
     expect(state.textContent).toBe(`${COPY.state.online} · paseo.021521.xyz:443`);
     expect(url.value).toBe("https://picot.021521.xyz/#offer=t1");
-    // The QR input is the offer URL itself, with the lan-qr renderer call.
-    expect(toCanvas).toHaveBeenCalledWith(
-      document.getElementById("pair-device-qr"),
-      "https://picot.021521.xyz/#offer=t1",
-      { width: 200 },
-    );
+    expect(document.getElementById("pair-device-qr")).toBeNull();
+    expect(toCanvas).not.toHaveBeenCalled();
+    expect(url.readOnly).toBe(true);
   });
 
   it("keeps the consent open and names the failure when enabling fails", async () => {
@@ -299,7 +296,7 @@ describe("relay on (offer state)", () => {
     expect(commands()).toEqual(["relay_status", "relay_offer", "relay_status", "relay_status"]);
   });
 
-  it("hides the dead QR and marks the offer expired once past expiresAt", async () => {
+  it("marks the link expired once past expiresAt and regenerates without QR", async () => {
     const now = Math.floor(Date.now() / 1000);
     const { page, qr, url, expired, toCanvas, regenerateBtn } = setup({
       status: relayOn(),
@@ -310,9 +307,8 @@ describe("relay on (offer state)", () => {
       }),
     });
     await page.activate();
-    // Spec §2.10: an expired offer is never shown as usable — the QR (the
-    // scannable code) disappears and the URL row carries the expired marker.
-    expect(qr.classList.contains("hidden")).toBe(true);
+    // The selectable URL retains its expired marker until regenerated.
+    expect(qr).toBeNull();
     expect(toCanvas).not.toHaveBeenCalled();
     expect(expired.hidden).toBe(false);
     expect(expired.textContent.trim()).toBe(COPY.expired);
@@ -321,11 +317,11 @@ describe("relay on (offer state)", () => {
     regenerateBtn.click();
     await flush();
     expect(url.value).toBe("https://picot.021521.xyz/#offer=t2");
-    expect(qr.classList.contains("hidden")).toBe(false);
+    expect(toCanvas).not.toHaveBeenCalled();
     expect(expired.hidden).toBe(true);
   });
 
-  it("renders the QR normally while the offer is fresh", async () => {
+  it("renders only the read-only link while the offer is fresh", async () => {
     const now = Math.floor(Date.now() / 1000);
     const { page, qr, expired, toCanvas } = setup({
       status: relayOn(),
@@ -333,12 +329,8 @@ describe("relay on (offer state)", () => {
     });
     await page.activate();
     expect(expired.hidden).toBe(true);
-    expect(qr.classList.contains("hidden")).toBe(false);
-    expect(toCanvas).toHaveBeenCalledWith(
-      document.getElementById("pair-device-qr"),
-      "https://picot.021521.xyz/#offer=fresh",
-      { width: 200 },
-    );
+    expect(qr).toBeNull();
+    expect(toCanvas).not.toHaveBeenCalled();
   });
 
   it("copies the link and shows the two-second confirmation", async () => {
@@ -362,16 +354,12 @@ describe("relay on (offer state)", () => {
     await flush();
     expect(commands().at(-1)).toBe("relay_offer");
     expect(url.value).toBe("https://picot.021521.xyz/#offer=t2");
-    expect(toCanvas).toHaveBeenLastCalledWith(
-      expect.anything(),
-      "https://picot.021521.xyz/#offer=t2",
-      { width: 200 },
-    );
+    expect(toCanvas).not.toHaveBeenCalled();
     expect(notice.classList.contains("hidden")).toBe(false);
     expect(notice.textContent).toBe(COPY.regenerateNotice);
   });
 
-  it("shows the QR-unavailable copy when the renderer fails", async () => {
+  it("does not need a QR renderer and keeps LAN QR assets", async () => {
     const { page, qr, notice } = setup({ status: relayOn() });
     globalThis.PicotQr = {
       toCanvas: async () => {
@@ -379,8 +367,9 @@ describe("relay on (offer state)", () => {
       },
     };
     await page.activate();
-    expect(qr.classList.contains("hidden")).toBe(true);
-    expect(notice.textContent).toContain(EN.misc.qrUnavailable);
+    expect(qr).toBeNull();
+    expect(notice.textContent).toBe("");
+    expect(INDEX.getElementById("lan-qr-canvas")).not.toBeNull();
   });
 
   it("disables relay and returns to the collapsed row", async () => {
@@ -440,13 +429,22 @@ describe("transport", () => {
 // ── Locale coverage (mirrors the daemon-section suite) ───────────────────────
 
 describe("locale coverage", () => {
+  it("requires a client app to open the link in every locale, without scan instructions", () => {
+    const expected = {
+      en: "You need the Picot client app to open this link.",
+      zh: "需要客户端 app 才能打开此链接。",
+      ja: "このリンクを開くには Picot クライアントアプリが必要です。",
+      es: "Necesitas la app cliente de Picot para abrir este enlace.",
+    };
+    for (const locale of LOCALES) {
+      expect(messagesFor(locale).settings.daemon.pairDevice.requiresClient).toBe(expected[locale]);
+    }
+  });
+
   it("resolves every requested key in every locale, with no orphaned copy", async () => {
     await renderEveryBranch();
 
-    // `misc.qrUnavailable` is the one shared platform key this block renders.
-    expect([...new Set(requested)].filter((key) => !key.startsWith(GROUP_KEYS))).toEqual([
-      "misc.qrUnavailable",
-    ]);
+    expect([...new Set(requested)].filter((key) => !key.startsWith(GROUP_KEYS))).toEqual([]);
     const keys = new Set([
       ...[...requested].filter((key) => key.startsWith(GROUP_KEYS)),
       ...MARKUP_KEYS,
@@ -508,7 +506,7 @@ async function renderEveryBranch() {
     await flush();
     await flush();
   }
-  // The enable path (its own consent→offer transition) and the QR failure.
+  // The enable path (its own consent→offer transition).
   mountBlock();
   mountInvoke({ status: () => relayOff() });
   mountShell();
@@ -520,7 +518,7 @@ async function renderEveryBranch() {
     await flush();
     await flush();
   }
-  // The expired-offer branch (spec §2.10): a dead code renders greyed.
+  // The expired-offer branch retains the URL and marks it expired.
   mountBlock();
   mountInvoke({
     status: relayOn(),
@@ -528,19 +526,6 @@ async function renderEveryBranch() {
   });
   mountShell();
   {
-    const page = setupPairDeviceSection({ root: document });
-    await page.activate();
-    await flush();
-  }
-  globalThis.PicotQr = {
-    toCanvas: async () => {
-      throw new Error("no renderer");
-    },
-  };
-  {
-    mountBlock();
-    mountInvoke({ status: relayOn() });
-    mountShell();
     const page = setupPairDeviceSection({ root: document });
     await page.activate();
     await flush();

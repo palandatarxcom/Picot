@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-// ABOUTME: Verifies the Settings → General → Daemon section: status/toggle rendering,
+// ABOUTME: Verifies the Settings → Daemon section: status/toggle rendering,
 // ABOUTME: the policy-only quit toggle, the restart confirm flow, the permanent
 // ABOUTME: running-agents list and its stop flow, polling, and locale coverage.
 
@@ -128,12 +128,12 @@ function mountSection() {
 }
 
 /** The rows of the permanent list, without its empty-state node. */
-const agentRows = () => [
-  ...document.querySelectorAll("#daemon-agents li:not(#daemon-agents-empty)"),
-];
+const agentRows = () => [...document.querySelectorAll("#daemon-agents .daemon-runtime-row")];
 
 /** The permanent list's Stop buttons, in row order. */
-const stopButtons = () => [...document.querySelectorAll("#daemon-agents .daemon-agent-stop")];
+const stopButtons = () => [
+  ...document.querySelectorAll("#daemon-runtime-content:not([hidden]) .daemon-agent-stop"),
+];
 
 /** Mock the WebView's `__TAURI__.core.invoke` and record every call. */
 function mountInvoke({
@@ -174,10 +174,10 @@ function mountInvoke({
   return { invoke, calls, commands: () => calls.map((call) => call.command) };
 }
 
-function setup(overrides = {}) {
+function setup(overrides = {}, loadWorkspaceSessions) {
   const dom = mountSection();
   const harness = mountInvoke(overrides);
-  const page = setupDaemonSection({ root: document });
+  const page = setupDaemonSection({ root: document, loadWorkspaceSessions });
   return { ...dom, ...harness, page };
 }
 
@@ -444,14 +444,16 @@ describe("running agents list", () => {
     await page.activate();
     const rows = agentRows();
     expect(rows).toHaveLength(3);
-    expect(rows[0].textContent).toContain("/Users/x/proj");
+    expect(document.querySelector(".pkg-manager-group-header").textContent).toBe("/Users/x/proj");
     expect(rows[0].textContent).toContain("s1");
     expect(rows[0].querySelector(".daemon-agent-state").textContent).toBe(
       EN.settings.daemon.agentState.working,
     );
     // A runtime with no cwd falls back to its workspace id, like the restart
     // confirm's rows.
-    expect(rows[1].textContent).toContain("w2");
+    expect(
+      [...document.querySelectorAll(".pkg-manager-group-header")].map((el) => el.textContent),
+    ).toContain("w2");
     expect(rows[1].querySelector(".daemon-agent-state").textContent).toBe(
       EN.settings.daemon.agentState.idle,
     );
@@ -555,6 +557,30 @@ describe("running agents list", () => {
     expect(agentRows()).toHaveLength(1);
   });
 
+  it("disables pending working-stop confirmation controls during restart", async () => {
+    let release;
+    const { page, restartBtn, confirmBtn, stopConfirmBtn, stopCancelBtn } = setup({
+      status: status({ agents: [agent({ state: "working" })] }),
+      restart: () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    });
+    await page.activate();
+    stopButtons()[0].click();
+    restartBtn.click();
+    await flush();
+    confirmBtn.click();
+    await flush();
+    expect(stopConfirmBtn.disabled).toBe(true);
+    expect(stopCancelBtn.disabled).toBe(true);
+    release({ pid: 4243 });
+    await flush();
+    await flush();
+    expect(stopConfirmBtn.disabled).toBe(false);
+    page.leave();
+  });
+
   it("disables every Stop while a restart transaction is draining runtimes", async () => {
     let release;
     const { page, stopConfirm } = setup({
@@ -582,6 +608,388 @@ describe("running agents list", () => {
   });
 });
 
+describe("runtime master-detail and JSONL names", () => {
+  const detail = (key) => document.getElementById(`daemon-detail-${key}`)?.textContent;
+  const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    return { promise, resolve, reject };
+  };
+
+  it("groups by workspace identity, selects by triple, and shows all six full values", async () => {
+    const agents = [
+      agent({ sessionId: "session-123456789", state: "working" }),
+      agent({ sessionId: "session-abcdefgh", instanceId: "i2", state: "idle" }),
+      agent({ workspaceId: "w2", sessionId: "other", instanceId: "i3", state: "crashed" }),
+    ];
+    const load = vi.fn(async () => ({ sessions: [] }));
+    const { page, stopConfirm } = setup({ status: status({ agents }) }, load);
+    await page.activate();
+    await flush();
+    expect(load.mock.calls).toEqual([["w1"], ["w2"]]);
+    expect(document.querySelectorAll(".pkg-manager-group-header")).toHaveLength(2);
+    expect(agentRows()[0].getAttribute("aria-pressed")).toBe("true");
+    stopButtons()[0].click();
+    expect(stopConfirm.hidden).toBe(false);
+    agentRows()[1].click();
+    expect(stopConfirm.hidden).toBe(true);
+    expect(agentRows()[1].classList.contains("is-selected")).toBe(true);
+    expect(agentRows()[0].getAttribute("aria-pressed")).toBe("false");
+    expect(
+      ["runtime-id", "session-name", "session-id", "workspace", "state", "cwd"].map(detail),
+    ).toEqual([
+      "i2",
+      "—",
+      "session-abcdefgh",
+      "w1",
+      EN.settings.daemon.agentState.idle,
+      "/Users/x/proj",
+    ]);
+    expect(agentRows()[1].textContent).toContain("session-");
+    await page.refresh();
+    expect(agentRows()[1].getAttribute("aria-pressed")).toBe("true");
+    page.leave();
+  });
+
+  it("preserves the focused triple across polling and reordering without changing selection", async () => {
+    vi.useFakeTimers();
+    const a = agent();
+    const b = agent({ workspaceId: "w2", instanceId: "i2" });
+    let agents = [a, b];
+    const { page } = setup({ status: () => status({ agents }) });
+    await page.activate();
+    agentRows()[1].focus();
+    agents = [b, a];
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(document.activeElement).toBe(agentRows()[0]);
+    expect(agentRows()[1].getAttribute("aria-pressed")).toBe("true");
+    page.leave();
+  });
+
+  it("falls back to the selected row when the focused triple disappears", async () => {
+    let agents = [agent(), agent({ instanceId: "i2" })];
+    const { page } = setup({ status: () => status({ agents }) });
+    await page.activate();
+    agentRows()[1].focus();
+    agents = [agent()];
+    await page.refresh();
+    expect(document.activeElement).toBe(agentRows()[0]);
+    page.leave();
+  });
+
+  it("does not steal detail or restart-modal focus during polling", async () => {
+    vi.useFakeTimers();
+    const { page, restartBtn, cancelBtn } = setup({
+      status: status({ agents: [agent()] }),
+    });
+    await page.activate();
+    const stop = stopButtons()[0];
+    stop.focus();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(document.activeElement).toBe(stop);
+    restartBtn.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).toBe(cancelBtn);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(document.activeElement).toBe(cancelBtn);
+    page.leave();
+  });
+
+  it("loads exact JSONL names without sidebar data, then applies rename and blank clearing", async () => {
+    const first = deferred();
+    const load = vi
+      .fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ sessions: [{ id: "s1", name: "Renamed" }] })
+      .mockResolvedValueOnce({ sessions: [{ id: "s1", name: "  " }] });
+    const { page } = setup({ status: status({ agents: [agent({ state: "idle" })] }) }, load);
+    await page.activate();
+    expect(detail("session-name")).toBe(EN.settings.daemon.sessionNameLoading);
+    expect(agentRows()[0].textContent).toContain("s1");
+    first.resolve({
+      sessions: [
+        { id: "s1", name: "<b>Real name</b>" },
+        { id: "s10", name: "Wrong" },
+      ],
+    });
+    await flush();
+    expect(detail("session-name")).toBe("<b>Real name</b>");
+    expect(agentRows()[0].querySelector(".pkg-manager-sidebar-name").textContent).toBe(
+      "<b>Real name</b>",
+    );
+    expect(agentRows()[0].querySelector("b")).toBeNull();
+    expect(agentRows()[0].textContent).toContain("s1");
+    await page.refresh();
+    await flush();
+    expect(detail("session-name")).toBe("Renamed");
+    await page.refresh();
+    await flush();
+    expect(detail("session-name")).toBe("—");
+    expect(agentRows()[0].textContent).not.toContain("Renamed");
+    page.leave();
+  });
+
+  it("distinguishes failure from no match and never substitutes firstMessage", async () => {
+    const load = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("unregistered workspace"))
+      .mockResolvedValueOnce({
+        sessions: [{ id: "s10", name: "Wrong", firstMessage: "Not a name" }],
+      })
+      .mockResolvedValueOnce({ sessions: [{ id: "s1", firstMessage: "Not a name" }] });
+    const { page } = setup({ status: status({ agents: [agent()] }) }, load);
+    await page.activate();
+    await flush();
+    expect(detail("session-name")).toBe(EN.settings.daemon.sessionNameUnavailable);
+    expect(agentRows()[0].textContent).toContain("s1");
+    await page.refresh();
+    await flush();
+    expect(detail("session-name")).toBe("—");
+    await page.refresh();
+    await flush();
+    expect(detail("session-name")).toBe("—");
+    page.leave();
+  });
+
+  it("deduplicates pending workspace scans and accepts them across status refreshes", async () => {
+    const old = deferred();
+    const load = vi
+      .fn()
+      .mockReturnValueOnce(old.promise)
+      .mockResolvedValue({ sessions: [{ id: "s1", name: "Fresh" }] });
+    const { page } = setup(
+      { status: status({ agents: [agent(), agent({ instanceId: "i2" })] }) },
+      load,
+    );
+    await page.activate();
+    await page.refresh();
+    expect(load).toHaveBeenCalledTimes(1);
+    old.resolve({ sessions: [{ id: "s1", name: "Still current" }] });
+    await flush();
+    expect(detail("session-name")).toBe("Still current");
+    await page.refresh();
+    await flush();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(detail("session-name")).toBe("Fresh");
+    page.leave();
+  });
+
+  it("converges with six-second scans across five-second polls without overlap", async () => {
+    vi.useFakeTimers();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const load = vi.fn(() => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      const name = `Scan ${load.mock.calls.length}`;
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          inFlight--;
+          resolve({ sessions: [{ id: "s1", name }] });
+        }, 6000);
+      });
+    });
+    const { page } = setup(
+      { status: status({ agents: [agent(), agent({ instanceId: "i2" })] }) },
+      load,
+    );
+    await page.activate();
+    for (let scan = 1; scan <= 3; scan++) {
+      await vi.advanceTimersByTimeAsync(scan === 1 ? 5000 : 9000);
+      expect(load).toHaveBeenCalledTimes(scan);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(detail("session-name")).toBe(`Scan ${scan}`);
+    }
+    expect(maxInFlight).toBe(1);
+    page.leave();
+  });
+
+  it("rejects a removed workspace scan even if that workspace rejoins before completion", async () => {
+    const old = deferred();
+    const load = vi
+      .fn()
+      .mockReturnValueOnce(old.promise)
+      .mockResolvedValue({ sessions: [{ id: "s1", name: "Fresh" }] });
+    let agents = [agent()];
+    const { page } = setup({ status: () => status({ agents }) }, load);
+    await page.activate();
+    agents = [];
+    await page.refresh();
+    agents = [agent()];
+    await page.refresh();
+    expect(load).toHaveBeenCalledTimes(1);
+    old.resolve({ sessions: [{ id: "s1", name: "Removed" }] });
+    await flush();
+    expect(detail("session-name")).toBe(EN.settings.daemon.sessionNameLoading);
+    await page.refresh();
+    await flush();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(detail("session-name")).toBe("Fresh");
+    page.leave();
+  });
+
+  it("rejects a previous visit's pending scan on immediate re-entry without overlap", async () => {
+    const old = deferred();
+    const load = vi
+      .fn()
+      .mockReturnValueOnce(old.promise)
+      .mockResolvedValue({ sessions: [{ id: "s1", name: "New visit" }] });
+    const { page } = setup({ status: status({ agents: [agent()] }) }, load);
+    await page.activate();
+    page.leave();
+    await page.activate();
+    expect(load).toHaveBeenCalledTimes(1);
+    old.resolve({ sessions: [{ id: "s1", name: "Old visit" }] });
+    await flush();
+    expect(detail("session-name")).toBe(EN.settings.daemon.sessionNameLoading);
+    await page.refresh();
+    await flush();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(detail("session-name")).toBe("New visit");
+    page.leave();
+  });
+
+  it("matches late scan names against the current session after runtime replacement", async () => {
+    const old = deferred();
+    let agents = [agent({ sessionId: "temporary", state: "working" })];
+    const { page } = setup({ status: () => status({ agents }) }, () => old.promise);
+    await page.activate();
+    agents = [agent({ sessionId: "replacement", state: "idle" })];
+    await page.refresh();
+    old.resolve({ sessions: [{ id: "temporary", name: "Old session" }] });
+    await flush();
+    expect(detail("session-name")).toBe("—");
+    expect(detail("session-id")).toBe("replacement");
+    expect(detail("state")).toBe(EN.settings.daemon.agentState.idle);
+    expect(agentRows()[0].getAttribute("aria-pressed")).toBe("true");
+    page.leave();
+  });
+
+  it("late names change only text, never selection, state or a pending Stop target", async () => {
+    const names = deferred();
+    const a = agent({ sessionId: "same", state: "working" });
+    const b = agent({ workspaceId: "w2", sessionId: "same", instanceId: "i2", state: "working" });
+    const { page, calls, stopConfirm, stopConfirmBtn } = setup(
+      { status: status({ agents: [a, b] }) },
+      vi.fn((wid) =>
+        wid === "w1" ? Promise.resolve({ sessions: [{ id: "same", name: "A" }] }) : names.promise,
+      ),
+    );
+    await page.activate();
+    agentRows()[1].click();
+    stopButtons()[0].click();
+    names.resolve({ sessions: [{ id: "same", name: "B" }] });
+    await flush();
+    expect(detail("session-name")).toBe("B");
+    expect(detail("state")).toBe(EN.settings.daemon.agentState.working);
+    expect(agentRows()[1].getAttribute("aria-pressed")).toBe("true");
+    expect(stopConfirm.hidden).toBe(false);
+    stopConfirmBtn.click();
+    await flush();
+    expect(calls.find((call) => call.command === "daemon_agent_stop").args).toEqual({
+      workspaceId: "w2",
+      sessionId: "same",
+      instanceId: "i2",
+    });
+    page.leave();
+  });
+
+  it("drops late name responses after leave and resumes fresh on re-entry", async () => {
+    const late = deferred();
+    const load = vi
+      .fn()
+      .mockReturnValueOnce(late.promise)
+      .mockResolvedValue({ sessions: [{ id: "s1", name: "Current" }] });
+    const { page } = setup({ status: status({ agents: [agent()] }) }, load);
+    await page.activate();
+    page.leave();
+    const before = document.getElementById("daemon-runtime-detail").textContent;
+    late.resolve({ sessions: [{ id: "s1", name: "Late" }] });
+    await flush();
+    expect(document.getElementById("daemon-runtime-detail").textContent).toBe(before);
+    await page.activate();
+    await flush();
+    expect(detail("session-name")).toBe("Current");
+    page.leave();
+  });
+
+  it("keeps newer status and names when an older status arrives last", async () => {
+    const oldStatus = deferred();
+    const load = vi.fn(async (workspaceId) => ({ sessions: [{ id: "s1", name: workspaceId }] }));
+    const { page, statusValue } = setup({ status: status({ agents: [agent()] }) }, load);
+    await page.activate();
+    await flush();
+    const invoke = window.__TAURI__.core.invoke;
+    invoke.mockImplementationOnce(() => oldStatus.promise);
+    const oldRead = page.refresh();
+    invoke.mockImplementationOnce(async () =>
+      status({ version: "new", agents: [agent({ workspaceId: "new-w", instanceId: "new-i" })] }),
+    );
+    await page.refresh();
+    await flush();
+    expect(detail("runtime-id")).toBe("new-i");
+    expect(detail("session-name")).toBe("new-w");
+    oldStatus.resolve(status({ version: "old", agents: [agent()] }));
+    await oldRead;
+    expect(detail("runtime-id")).toBe("new-i");
+    expect(detail("session-name")).toBe("new-w");
+    expect(statusValue.textContent).toContain("vnew");
+    expect(load.mock.calls).toEqual([["w1"], ["new-w"]]);
+    page.leave();
+  });
+
+  it("drops a confirmation when the selected triple is replaced, even with a reused instance ID", async () => {
+    let agents = [agent({ state: "working" })];
+    const { page, stopConfirm, stopConfirmBtn, calls } = setup({
+      status: () => status({ agents }),
+    });
+    await page.activate();
+    stopButtons()[0].click();
+    expect(stopConfirm.hidden).toBe(false);
+    agents = [agent({ sessionId: "replacement", state: "idle" })];
+    await page.refresh();
+    expect(detail("session-id")).toBe("replacement");
+    expect(stopConfirm.hidden).toBe(true);
+    stopConfirmBtn.click();
+    expect(calls.some((call) => call.command === "daemon_agent_stop")).toBe(false);
+    page.leave();
+  });
+
+  it("does not scan the whole registry for an agent that has no workspace", async () => {
+    const load = vi.fn(async () => ({ sessions: [] }));
+    const { page } = setup({ status: status({ agents: [agent({ state: "idle" })] }) }, load);
+    await page.activate();
+    await flush();
+    expect(load.mock.calls).toEqual([["w1"]]);
+    window.__TAURI__.core.invoke.mockImplementationOnce(async () =>
+      status({ agents: [{ sessionId: "s1", instanceId: "i1", state: "idle" }] }),
+    );
+    await page.refresh();
+    await flush();
+    // A status frame with no workspaceId must not become workspaceSessions(null).
+    expect(load.mock.calls).toEqual([["w1"]]);
+    page.leave();
+  });
+
+  it("does not start polling or name scans if status resolves after leave", async () => {
+    vi.useFakeTimers();
+    const delayed = deferred();
+    const load = vi.fn(async () => ({ sessions: [] }));
+    const { page, commands } = setup({ status: () => delayed.promise }, load);
+    const opening = page.activate();
+    page.leave();
+    delayed.resolve(status({ agents: [agent()] }));
+    await opening;
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(commands()).toEqual(["daemon_status"]);
+    expect(load).not.toHaveBeenCalled();
+  });
+});
+
 // ── Restart confirm layout ───────────────────────────────────────────────────
 //
 // `.settings-row` sets `display: flex`, which beats the UA `[hidden]` rule: the
@@ -604,6 +1012,16 @@ describe("restart confirm layout", () => {
     expect(ruleBody(".daemon-restart-dialog-overlay[hidden]")).toContain("display: none");
   });
 
+  it("keeps short session IDs outside the flex-growing package source style", async () => {
+    const { page } = setup({ status: status({ agents: [agent({ sessionId: "abcdefgh-full" })] }) });
+    await page.activate();
+    const id = agentRows()[0].querySelector(".daemon-runtime-session-id");
+    expect(id?.textContent).toBe("abcdefgh");
+    expect(id?.classList.contains("pkg-manager-source")).toBe(false);
+    expect(ruleBody(".daemon-runtime-session-id")).toContain("white-space: nowrap");
+    page.leave();
+  });
+
   it("keeps the count line and the confirm actions in one revealed container", () => {
     const dom = mountSection();
     const actions = dom.confirm.querySelector(".daemon-confirm-actions");
@@ -617,11 +1035,10 @@ describe("restart confirm layout", () => {
 
   it("hides the stop confirm and the empty state without a display of their own", () => {
     const dom = mountSection();
-    // The stop confirm is a settings-row, so the rule above — not the UA
-    // default — is what keeps it hidden; the empty-state node is an `li` in
-    // the list, and nothing gives either container (or that li) a display
-    // declaration that would beat `[hidden]` (lesson from #1).
-    expect(dom.stopConfirm.classList.contains("settings-row")).toBe(true);
+    // The flex confirmation needs an explicit hidden rule, even inside detail.
+    expect(ruleBody(".daemon-confirm[hidden]")).toContain("display: none");
+    expect(dom.stopConfirm.classList.contains("daemon-confirm")).toBe(true);
+    expect(dom.stopConfirm.closest("#daemon-runtime-detail")).not.toBeNull();
     expect(dom.stopConfirm.hidden).toBe(true);
     expect(STYLE).not.toMatch(/#daemon-agents-empty\s*\{[^}]*display\s*:/);
     expect(STYLE).not.toMatch(/\.daemon-agent-list\s+li\s*\{[^}]*display\s*:/);
