@@ -121,6 +121,8 @@ landing 是纯入口（启动器）。新窗口打开即 landing 页；窗内点
 
 窗内 prepare 入口（`workspace_target_prepare`）已具备步骤 1–2，只受益于 §6.1 的 label 权威与 §6.3 的聚焦改造。同 workspace 二开（不同 session）在两入口下都是 `Spawn`：每个新窗 = 新 owner = 自己的 runtime，同 workspace 多 session 各自单活 runtime，互不干扰；restart 迁移本就按 label 逐窗（main.rs:2465/2517），无需改。
 
+P2 起本分支改写为 CoAttach（§13），聚焦语义仅保留于 §7 通知路由。
+
 ### 6.3 focus 失败只重核持有者，不回退开新窗（MW-2）
 
 `focus_window` 失败（label 解析不到、窗口已不存在）只允许重核持有者，**不允许回退 normal open path**——旧稿「focus 失败 ⇒ 正常开窗」废除，它会绕过活着的持有者直接破坏单可写绑定：

@@ -113,7 +113,7 @@ describe("settings page split", () => {
     expect(appJs).not.toContain('rpcCommand({ type: "get_auth" })');
   });
 
-  test("keeps the daemon section as the last section of General", () => {
+  test("keeps the daemon and remote sections at the end of General", () => {
     const dom = new JSDOM(html, { url: "http://localhost" });
     const { document } = dom.window;
 
@@ -121,12 +121,14 @@ describe("settings page split", () => {
     const section = document.querySelector("#setting-daemon-section");
     expect(panel).not.toBeNull();
     expect(section).not.toBeNull();
-    // It lives in General (not a page of its own) and closes the panel: a
-    // section below it would push the daemon's status out of the first screen
-    // for no reason, and the panel's order is the shipping order (Task 10).
+    // The daemon section lives in General (not a page of its own) and the
+    // remote-access block follows it last: a section above would push the
+    // daemon's status out of the first screen for no reason, and the panel's
+    // order is the shipping order (Task 10).
     expect(panel.contains(section)).toBe(true);
     const sections = [...panel.querySelectorAll(".settings-section")];
-    expect(sections.at(-1)).toBe(section);
+    expect(sections.at(-2)).toBe(section);
+    expect(sections.at(-1)?.id).toBe("setting-remote-section");
     expect(sections.map((node) => node.id)).toContain("setting-pi-path-section");
 
     // Both shells render this one Settings panel (the workspace window and the

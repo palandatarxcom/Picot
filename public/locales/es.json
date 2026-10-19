@@ -773,7 +773,7 @@
       "restartDescription": "Detiene el daemon en segundo plano e inicia uno nuevo.",
       "restartAction": "Reiniciar",
       "restartConfirm": "Reiniciar detiene todos los agentes en ejecución; se reanudan desde el estado guardado en disco.",
-      "restartAgentCount": "Agentes en ejecución ({count})",
+      "restartAgentCount": "Reiniciar detendrá {count} agente(s) en ejecución.",
       "restartNoAgents": "Ahora mismo no hay agentes en ejecución.",
       "restartCancel": "Cancelar",
       "restartConfirmAction": "Reiniciar ahora",
@@ -821,6 +821,9 @@
         "offerFailed": "No se pudo crear el código de emparejamiento: {reason}",
         "disableFailed": "No se pudo desactivar el emparejamiento remoto: {reason}"
       }
+    },
+    "remote": {
+      "title": "Acceso remoto"
     },
     "extensions": "Paquetes de extensión",
     "extensionAdvisor": {

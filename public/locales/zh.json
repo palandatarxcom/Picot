@@ -773,7 +773,7 @@
       "restartDescription": "停止当前后台守护进程并启动一个新的。",
       "restartAction": "重启",
       "restartConfirm": "重启会停止所有正在运行的代理，它们会从磁盘保存的状态恢复。",
-      "restartAgentCount": "正在运行的代理（{count}）",
+      "restartAgentCount": "重启将停止 {count} 个正在运行的代理。",
       "restartNoAgents": "当前没有正在运行的代理。",
       "restartCancel": "取消",
       "restartConfirmAction": "确认重启",
@@ -821,6 +821,9 @@
         "offerFailed": "无法生成配对码：{reason}",
         "disableFailed": "无法停用远程配对：{reason}"
       }
+    },
+    "remote": {
+      "title": "远程访问"
     },
     "extensions": "扩展包",
     "extensionAdvisor": {

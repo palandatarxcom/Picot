@@ -773,7 +773,7 @@
       "restartDescription": "Stops the background daemon and starts a fresh one.",
       "restartAction": "Restart",
       "restartConfirm": "Restarting stops every running agent. They resume from the state saved on disk.",
-      "restartAgentCount": "Running agents ({count})",
+      "restartAgentCount": "Restarting will stop {count} running agent(s).",
       "restartNoAgents": "No agents are running right now.",
       "restartCancel": "Cancel",
       "restartConfirmAction": "Restart now",
@@ -821,6 +821,9 @@
         "offerFailed": "Could not create a pairing code: {reason}",
         "disableFailed": "Could not turn off remote pairing: {reason}"
       }
+    },
+    "remote": {
+      "title": "Remote access"
     },
     "extensions": "Extension packages",
     "extensionAdvisor": {

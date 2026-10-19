@@ -97,7 +97,6 @@ export function setupDaemonSection({
   const restartBtn = root.getElementById("btn-daemon-restart");
   const confirmRow = root.getElementById("daemon-restart-confirm");
   const agentsLabel = root.getElementById("daemon-restart-agents-label");
-  const agentsList = root.getElementById("daemon-restart-agents");
   const confirmBtn = root.getElementById("btn-daemon-restart-confirm");
   const cancelBtn = root.getElementById("btn-daemon-restart-cancel");
   const agentsBlock = root.getElementById("daemon-agents");
@@ -144,6 +143,8 @@ export function setupDaemonSection({
   let busy = false;
   /** Whether the confirm block is awaiting the user's decision. */
   let confirmOpen = false;
+  /** The running-agent count the open confirm is speaking about. */
+  let confirmCount = 0;
   /** The working agent whose Stop is awaiting the user's decision, if any. */
   let stopTarget = null;
   /** The instance id of the agent whose stop is in flight, if any. */
@@ -246,7 +247,7 @@ export function setupDaemonSection({
   function closeConfirm() {
     confirmOpen = false;
     confirmRow.hidden = true;
-    agentsList.replaceChildren();
+    confirmCount = 0;
     agentsLabel.textContent = "";
   }
 
@@ -365,15 +366,15 @@ export function setupDaemonSection({
     const fresh = await refresh();
     restartBtn.disabled = false;
     if (!fresh) {
-      // The agent list is what the user is approving; without it the confirm
-      // would be a blind "stop everything". The notice already says why.
+      // The count is what the user is approving; without it the confirm would
+      // be a blind "stop everything". The notice already says why.
       return;
     }
     const agents = Array.isArray(fresh.agents) ? fresh.agents : [];
+    confirmCount = agents.length;
     agentsLabel.textContent = agents.length
       ? t("settings.daemon.restartAgentCount", { count: agents.length })
       : t("settings.daemon.restartNoAgents");
-    agentsList.replaceChildren(...agents.map(agentRow));
     confirmRowText();
     confirmOpen = true;
     confirmRow.hidden = false;
@@ -476,8 +477,8 @@ export function setupDaemonSection({
     confirmRowText();
     render();
     if (confirmOpen) {
-      agentsLabel.textContent = agentsList.children.length
-        ? t("settings.daemon.restartAgentCount", { count: agentsList.children.length })
+      agentsLabel.textContent = confirmCount
+        ? t("settings.daemon.restartAgentCount", { count: confirmCount })
         : t("settings.daemon.restartNoAgents");
       confirmBtn.textContent = t("settings.daemon.restartConfirmAction");
       cancelBtn.textContent = t("settings.daemon.restartCancel");

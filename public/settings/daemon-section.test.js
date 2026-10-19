@@ -111,7 +111,6 @@ function mountSection() {
     confirm: document.getElementById("daemon-restart-confirm"),
     confirmText: document.getElementById("daemon-restart-confirm-text"),
     agentsLabel: document.getElementById("daemon-restart-agents-label"),
-    agents: document.getElementById("daemon-restart-agents"),
     confirmBtn: document.getElementById("btn-daemon-restart-confirm"),
     cancelBtn: document.getElementById("btn-daemon-restart-cancel"),
     empty: document.getElementById("daemon-agents-empty"),
@@ -278,7 +277,7 @@ describe("quit-policy toggle", () => {
 describe("restart", () => {
   it("confirms with the fresh running-agent list before restarting", async () => {
     let version = "0.5.0";
-    const { page, commands, confirm, confirmText, agentsLabel, agents, restartBtn } = setup({
+    const { page, commands, confirm, confirmText, agentsLabel, restartBtn } = setup({
       status: () =>
         status({
           version,
@@ -298,7 +297,7 @@ describe("restart", () => {
 
     restartBtn.click();
     await flush();
-    // A *fresh* status produced the list the user approves, and nothing was
+    // A *fresh* status produced the count the user approves, and nothing was
     // restarted yet.
     expect(commands()).toEqual(["daemon_status", "daemon_status"]);
     expect(confirm.hidden).toBe(false);
@@ -306,29 +305,9 @@ describe("restart", () => {
     expect(agentsLabel.textContent).toBe(
       EN.settings.daemon.restartAgentCount.replace("{count}", "2"),
     );
-    const rows = [...agents.querySelectorAll("li")].map((row) => row.textContent);
-    expect(rows).toHaveLength(2);
-    expect(rows[0]).toContain("/Users/x/proj");
-    expect(rows[0]).toContain("s1");
-    expect(rows[1]).toContain("w2");
-  });
-
-  it("labels each agent row with its coordinator state, and a placeholder when it has none", async () => {
-    const { page, agents, restartBtn } = setup({
-      status: status({
-        agents: [
-          agent({ sessionId: "s1", state: "working" }),
-          agent({ sessionId: "s2", state: null }),
-        ],
-      }),
-    });
-    await page.activate();
-    restartBtn.click();
-    await flush();
-    const states = [...agents.querySelectorAll("li .daemon-agent-state")].map(
-      (node) => node.textContent,
-    );
-    expect(states).toEqual([EN.settings.daemon.agentState.working, "—"]);
+    // The per-agent rows are gone from the confirm: the permanent list above
+    // is the only per-agent surface.
+    expect(confirm.querySelector(".daemon-agent-list")).toBeNull();
   });
 
   it("runs the transaction and refreshes the status when confirmed", async () => {
@@ -370,12 +349,11 @@ describe("restart", () => {
   });
 
   it("says so when there is nothing running", async () => {
-    const { page, agentsLabel, agents, restartBtn } = setup({ status: status({ agents: [] }) });
+    const { page, agentsLabel, restartBtn } = setup({ status: status({ agents: [] }) });
     await page.activate();
     restartBtn.click();
     await flush();
     expect(agentsLabel.textContent).toBe(EN.settings.daemon.restartNoAgents);
-    expect(agents.querySelectorAll("li")).toHaveLength(0);
   });
 
   it("keeps the failure visible when the transaction aborts", async () => {
@@ -420,12 +398,13 @@ describe("running agents list", () => {
         agents: [
           agent({ sessionId: "s1", cwd: "/Users/x/proj", state: "working" }),
           agent({ workspaceId: "w2", sessionId: "s2", cwd: null, state: "idle" }),
+          agent({ workspaceId: "w3", sessionId: "s3", state: null }),
         ],
       }),
     });
     await page.activate();
     const rows = agentRows();
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(3);
     expect(rows[0].textContent).toContain("/Users/x/proj");
     expect(rows[0].textContent).toContain("s1");
     expect(rows[0].querySelector(".daemon-agent-state").textContent).toBe(
@@ -437,6 +416,7 @@ describe("running agents list", () => {
     expect(rows[1].querySelector(".daemon-agent-state").textContent).toBe(
       EN.settings.daemon.agentState.idle,
     );
+    expect(rows[2].querySelector(".daemon-agent-state").textContent).toBe("—");
     expect(empty.hidden).toBe(true);
   });
 
@@ -581,14 +561,14 @@ describe("restart confirm layout", () => {
     expect(ruleBody(".settings-row[hidden]")).toContain("display: none");
   });
 
-  it("keeps the agent list and the confirm actions in one revealed container", () => {
+  it("keeps the count line and the confirm actions in one revealed container", () => {
     const dom = mountSection();
     const actions = dom.confirm.querySelector(".daemon-confirm-actions");
     expect(actions).not.toBeNull();
-    expect(actions.parentElement).toBe(dom.agents.parentElement);
-    // Both live under the row openConfirm() reveals: the two buttons are only
-    // reachable together with the list they belong to.
-    expect(dom.confirm.contains(dom.agents)).toBe(true);
+    expect(dom.agentsLabel.parentElement).toBe(actions.parentElement);
+    // Both live under the row openConfirm() reveals: the count is only
+    // reachable together with the buttons it qualifies.
+    expect(dom.confirm.contains(dom.agentsLabel)).toBe(true);
     expect(dom.confirm.contains(actions)).toBe(true);
   });
 

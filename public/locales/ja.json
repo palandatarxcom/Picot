@@ -773,7 +773,7 @@
       "restartDescription": "バックグラウンドのデーモンを停止し、新しいデーモンを起動します。",
       "restartAction": "再起動",
       "restartConfirm": "再起動すると実行中のエージェントはすべて停止します。ディスクに保存された状態から再開します。",
-      "restartAgentCount": "実行中のエージェント（{count}）",
+      "restartAgentCount": "再起動すると実行中のエージェント {count} 個が停止します。",
       "restartNoAgents": "現在実行中のエージェントはありません。",
       "restartCancel": "キャンセル",
       "restartConfirmAction": "再起動する",
@@ -821,6 +821,9 @@
         "offerFailed": "ペアリングコードを作成できませんでした：{reason}",
         "disableFailed": "リモートペアリングをオフにできませんでした：{reason}"
       }
+    },
+    "remote": {
+      "title": "リモートアクセス"
     },
     "extensions": "拡張パッケージ",
     "extensionAdvisor": {
