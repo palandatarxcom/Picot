@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en" data-theme="night">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Picot Settings — Daemon (design preview)</title>
+    <link rel="stylesheet" href="../public/style-theme.css" />
+    <link rel="stylesheet" href="../public/style.css" />
+    <style>
+      .daemon-runtime-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-2);
+      }
+
+      .daemon-runtime-row .pkg-manager-sidebar-name {
+        min-width: 0;
+      }
+
+      .daemon-runtime-row .pkg-manager-sidebar-meta {
+        flex: 0 0 auto;
+        margin-top: 0;
+      }
+
+      dialog {
+        width: min(30rem, calc(100vw - 2rem));
+        margin: auto;
+        padding: var(--space-4);
+        color: var(--text-primary);
+        background: var(--bg-solid);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+      }
+
+      dialog::backdrop {
+        background: color-mix(in srgb, var(--bg-solid) 72%, transparent);
+      }
+
+      @media (max-width: 760px) {
+        .daemon-runtime-row {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .daemon-runtime-row .pkg-manager-sidebar-meta {
+          margin-top: 0.2rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app-layout">
+      <div class="settings-panel">
+        <div
+          class="settings-drag-region"
+          aria-hidden="true"
+          style="display: flex; align-items: center; justify-content: center; color: var(--text-dim); font-size: var(--font-size-xs);"
+        >
+          Static preview · UI actions do not connect to a daemon
+        </div>
+        <aside class="settings-nav" aria-label="Settings navigation">
+          <div class="settings-nav-title">Settings</div>
+          <button class="settings-nav-item" data-settings-tab="general" type="button" disabled>
+            General
+          </button>
+          <button class="settings-nav-item active" data-settings-tab="daemon" type="button" aria-current="page">
+            Daemon
+          </button>
+          <button class="settings-nav-item" type="button" disabled>Appearance</button>
+          <button class="settings-nav-item" type="button" disabled>Models</button>
+          <button class="settings-nav-item" type="button" disabled>Extension packages</button>
+          <button class="settings-nav-item" type="button" disabled>Skills</button>
+          <button class="settings-nav-item" type="button" disabled>MCP</button>
+          <button class="settings-nav-item" type="button" disabled>Subagents</button>
+          <button class="settings-nav-item" type="button" disabled>Environment</button>
+          <button class="settings-nav-item" type="button" disabled>Advanced Configuration</button>
+          <button class="settings-nav-item" type="button" disabled>Usage</button>
+          <button class="settings-nav-back" type="button" disabled>Back to chat</button>
+        </aside>
+
+        <section class="settings-content" aria-label="Daemon settings">
+          <div class="settings-tab active" data-settings-panel="daemon">
+            <div
+              class="settings-header"
+              style="display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);"
+            >
+              <h3>Daemon</h3>
+              <button class="settings-value-btn" id="preview-empty-toggle" type="button" aria-controls="daemon-runtime-layout" aria-pressed="false">
+                Show empty state
+              </button>
+            </div>
+            <div class="settings-body">
+              <section class="settings-section" aria-labelledby="daemon-section-title">
+                <div class="settings-section-title" id="daemon-section-title">Daemon</div>
+
+                <div class="settings-row">
+                  <span class="settings-label">Status</span>
+                  <span class="settings-static-value" data-tone="ok">Running · v0.5.0</span>
+                </div>
+
+                <div class="settings-row">
+                  <span class="settings-label settings-label-stack">
+                    <span class="settings-label-main">Keep agents running after quitting</span>
+                    <span class="settings-label-sub">Agents keep running when you close Picot.</span>
+                  </span>
+                  <button
+                    class="settings-toggle on"
+                    id="toggle-daemon-keep-running"
+                    type="button"
+                    aria-label="Keep agents running after quitting"
+                    aria-pressed="true"
+                  ></button>
+                </div>
+
+                <div class="settings-section-title">Running agents</div>
+                <div class="pkg-manager-layout" id="daemon-runtime-layout">
+                  <div class="pkg-manager-groups" id="daemon-runtime-groups" aria-label="Running agents by workspace">
+                    <div id="runtime-populated">
+                      <h4
+                        class="pkg-manager-group-header"
+                        style="white-space: normal; overflow-wrap: anywhere;"
+                      >
+                        /Users/dr-lin/Projects/picot-v3
+                      </h4>
+                      <button
+                        class="pkg-manager-sidebar-row daemon-runtime-row is-selected"
+                        type="button"
+                        data-runtime-id="rt-7f2c4a91-0d13"
+                        data-session-id="session-8bd12a60-1cc4"
+                        data-session-short="s-8bd12a"
+                        data-workspace="/Users/dr-lin/Projects/picot-v3"
+                        data-state="Working"
+                        data-tone="ok"
+                        data-cwd="/Users/dr-lin/Projects/picot-v3"
+                        aria-pressed="true"
+                      >
+                        <span class="pkg-manager-sidebar-name">session · s-8bd12a</span>
+                        <span class="pkg-manager-sidebar-meta"><span class="pill settings-static-value" data-tone="ok">Working</span></span>
+                      </button>
+                      <button
+                        class="pkg-manager-sidebar-row daemon-runtime-row"
+                        type="button"
+                        data-runtime-id="rt-a064de38-92b1"
+                        data-session-id="session-44c1f0d9-a7e5"
+                        data-session-short="s-44c1f0"
+                        data-workspace="/Users/dr-lin/Projects/picot-v3"
+                        data-state="Idle"
+                        data-tone=""
+                        data-cwd="/Users/dr-lin/Projects/picot-v3"
+                        aria-pressed="false"
+                      >
+                        <span class="pkg-manager-sidebar-name">session · s-44c1f0</span>
+                        <span class="pkg-manager-sidebar-meta"><span class="pill settings-static-value">Idle</span></span>
+                      </button>
+
+                      <h4
+                        class="pkg-manager-group-header"
+                        style="white-space: normal; overflow-wrap: anywhere;"
+                      >
+                        /Users/dr-lin/Projects/picot-v3/.worktrees/daemon-phase1
+                      </h4>
+                      <button
+                        class="pkg-manager-sidebar-row daemon-runtime-row"
+                        type="button"
+                        data-runtime-id="rt-93bc018e-5ef2"
+                        data-session-id="session-9e8a3c2b-620d"
+                        data-session-short="s-9e8a3c"
+                        data-workspace="/Users/dr-lin/Projects/picot-v3/.worktrees/daemon-phase1"
+                        data-state="Crashed"
+                        data-tone="error"
+                        data-cwd="/Users/dr-lin/Projects/picot-v3/.worktrees/daemon-phase1"
+                        aria-pressed="false"
+                      >
+                        <span class="pkg-manager-sidebar-name">session · s-9e8a3c</span>
+                        <span class="pkg-manager-sidebar-meta"><span class="pill settings-static-value" data-tone="error">Crashed</span></span>
+                      </button>
+                    </div>
+                    <div
+                      class="pkg-manager-empty"
+                      id="runtime-empty"
+                      role="status"
+                      hidden
+                      style="display: grid; min-height: 100%; place-items: center; text-align: center; color: var(--text-dim);"
+                    >
+                      No agents are running.
+                    </div>
+                  </div>
+
+                  <section class="pkg-manager-detail" aria-label="Selected runtime details">
+                    <div id="runtime-detail-content">
+                      <div class="pkg-manager-detail-header">
+                        <span class="settings-label-main">Runtime details</span>
+                        <span class="pkg-manager-source" id="detail-runtime-id">rt-7f2c4a91-0d13</span>
+                      </div>
+                      <div class="pkg-manager-status-grid">
+                        <div class="pkg-manager-status-row"><span>Runtime ID</span><span class="is-wrap" id="detail-runtime-id-row">rt-7f2c4a91-0d13</span></div>
+                        <div class="pkg-manager-status-row"><span>Session ID</span><span class="is-wrap" id="detail-session-id">session-8bd12a60-1cc4</span></div>
+                        <div class="pkg-manager-status-row"><span>Workspace</span><span class="is-wrap" id="detail-workspace">/Users/dr-lin/Projects/picot-v3</span></div>
+                        <div class="pkg-manager-status-row"><span>State</span><span id="detail-state" data-tone="ok">Working</span></div>
+                        <div class="pkg-manager-status-row"><span>CWD</span><span class="is-wrap" id="detail-cwd">/Users/dr-lin/Projects/picot-v3</span></div>
+                      </div>
+                      <div class="pkg-manager-footer">
+                        <button class="settings-value-btn is-danger" id="stop-runtime-button" type="button" data-preview-action="Stop">Stop</button>
+                      </div>
+                      <div
+                        class="daemon-confirm"
+                        id="working-stop-confirm"
+                        style="margin-top: var(--space-3); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-glass);"
+                      >
+                        <p class="settings-help" style="margin-bottom: 0; color: var(--error);">Stop this agent?</p>
+                        <span class="settings-label-sub">session-8bd12a60-1cc4 · Working</span>
+                        <p class="settings-help">
+                          It is working on a turn right now. Stopping it interrupts that turn, and its reply will not be delivered.
+                        </p>
+                        <div class="daemon-confirm-actions">
+                          <button class="settings-value-btn" type="button" data-preview-action="Cancel stop confirmation">Cancel</button>
+                          <button class="settings-value-btn is-primary" type="button" data-preview-action="Stop anyway">Stop anyway</button>
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      class="pkg-manager-empty"
+                      id="runtime-detail-empty"
+                      hidden
+                      style="display: grid; height: 100%; place-items: center; text-align: center; color: var(--text-dim);"
+                    >
+                      Select a runtime to view its details.
+                    </div>
+                  </section>
+                </div>
+                <p class="settings-help" id="preview-feedback" role="status" aria-live="polite">
+                  Preview data only · no daemon commands are sent.
+                </p>
+
+                <div class="settings-row">
+                  <span class="settings-label settings-label-stack">
+                    <span class="settings-label-main">Restart daemon</span>
+                    <span class="settings-label-sub">Stops the background daemon and starts a fresh one.</span>
+                  </span>
+                  <button class="settings-value-btn" id="restart-daemon-button" type="button">Restart</button>
+                </div>
+              </section>
+
+              <section class="settings-section" aria-labelledby="pair-section-title">
+                <div class="settings-section-title" id="pair-section-title">Remote access</div>
+                <div class="daemon-agents">
+                  <span class="settings-label-main">Pair a device</span>
+                  <div class="settings-row">
+                    <span class="settings-label">Status</span>
+                    <span class="settings-static-value" data-tone="ok">Enabled · link expired</span>
+                  </div>
+                  <div class="settings-label-stack" style="width: 100%;">
+                    <label class="settings-label" for="pair-device-url">Pairing URL</label>
+                    <input
+                      class="pair-device-url"
+                      id="pair-device-url"
+                      type="text"
+                      value="https://example.invalid/#offer=preview-only"
+                      readonly
+                      aria-label="Pairing URL"
+                      style="width: 100%;"
+                    />
+                    <p class="settings-help" id="pair-device-expired" style="margin: 0; color: var(--error);">
+                      This pairing link has expired. Generate a new code to pair.
+                    </p>
+                    <div class="daemon-confirm-actions">
+                      <button class="settings-value-btn" type="button" data-preview-action="Copy link">Copy link</button>
+                      <button class="settings-value-btn" type="button" data-preview-action="New code">New code</button>
+                      <button class="settings-value-btn" type="button" data-preview-action="Turn off">Turn off</button>
+                    </div>
+                  </div>
+                  <p class="settings-help pair-device-warning">
+                    Treat the pairing code like a password. Anyone with this URL may be able to pair a device.
+                  </p>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="restart-confirm-dialog" aria-labelledby="restart-dialog-title">
+      <div class="daemon-confirm">
+        <h3 id="restart-dialog-title">Restart daemon?</h3>
+        <p class="settings-help">This stops the current daemon and starts a fresh one. Running agents may be interrupted.</p>
+        <p class="settings-help">Static preview · no daemon command will be sent.</p>
+        <div class="daemon-confirm-actions">
+          <button class="settings-value-btn" id="cancel-restart" type="button">Cancel</button>
+          <button class="settings-value-btn is-primary" id="confirm-restart" type="button">Restart daemon</button>
+        </div>
+      </div>
+    </dialog>
+
+    <script>
+      const feedback = document.getElementById("preview-feedback");
+      const rows = [...document.querySelectorAll(".daemon-runtime-row")];
+      const detail = {
+        runtime: document.getElementById("detail-runtime-id"),
+        runtimeRow: document.getElementById("detail-runtime-id-row"),
+        session: document.getElementById("detail-session-id"),
+        workspace: document.getElementById("detail-workspace"),
+        state: document.getElementById("detail-state"),
+        cwd: document.getElementById("detail-cwd"),
+      };
+      const detailContent = document.getElementById("runtime-detail-content");
+      const detailEmpty = document.getElementById("runtime-detail-empty");
+      const stopConfirm = document.getElementById("working-stop-confirm");
+
+      rows.forEach((row) => {
+        row.addEventListener("click", () => {
+          rows.forEach((candidate) => {
+            const selected = candidate === row;
+            candidate.classList.toggle("is-selected", selected);
+            candidate.setAttribute("aria-pressed", String(selected));
+          });
+          detail.runtime.textContent = row.dataset.runtimeId;
+          detail.runtimeRow.textContent = row.dataset.runtimeId;
+          detail.session.textContent = row.dataset.sessionId;
+          detail.workspace.textContent = row.dataset.workspace;
+          detail.state.textContent = row.dataset.state;
+          detail.state.dataset.tone = row.dataset.tone;
+          detail.cwd.textContent = row.dataset.cwd;
+          stopConfirm.hidden = row.dataset.state !== "Working";
+          feedback.textContent = `Preview selection · ${row.dataset.sessionShort} · ${row.dataset.state}. No daemon command sent.`;
+        });
+      });
+
+      const keepRunning = document.getElementById("toggle-daemon-keep-running");
+      keepRunning.addEventListener("click", () => {
+        const enabled = keepRunning.getAttribute("aria-pressed") !== "true";
+        keepRunning.classList.toggle("on", enabled);
+        keepRunning.setAttribute("aria-pressed", String(enabled));
+        feedback.textContent = `Preview toggle · ${enabled ? "on" : "off"}. No setting was saved.`;
+      });
+
+      const emptyToggle = document.getElementById("preview-empty-toggle");
+      const populated = document.getElementById("runtime-populated");
+      const empty = document.getElementById("runtime-empty");
+      const layout = document.getElementById("daemon-runtime-layout");
+      emptyToggle.addEventListener("click", () => {
+        const showEmpty = emptyToggle.getAttribute("aria-pressed") !== "true";
+        emptyToggle.setAttribute("aria-pressed", String(showEmpty));
+        emptyToggle.textContent = showEmpty ? "Show populated data" : "Show empty state";
+        populated.hidden = showEmpty;
+        empty.hidden = !showEmpty;
+        detailContent.hidden = showEmpty;
+        detailEmpty.hidden = !showEmpty;
+        layout.setAttribute("aria-label", showEmpty ? "Empty running-agent list" : "Running agents by workspace");
+        feedback.textContent = showEmpty
+          ? "Preview empty state · no agents are running."
+          : "Preview populated state · sample runtimes restored.";
+      });
+
+      const restartDialog = document.getElementById("restart-confirm-dialog");
+      document.getElementById("restart-daemon-button").addEventListener("click", () => restartDialog.showModal());
+      document.getElementById("cancel-restart").addEventListener("click", () => restartDialog.close());
+      document.getElementById("confirm-restart").addEventListener("click", () => {
+        restartDialog.close();
+        feedback.textContent = "Preview only · daemon restart was not sent.";
+      });
+
+      document.querySelectorAll("[data-preview-action]").forEach((button) => {
+        button.addEventListener("click", () => {
+          feedback.textContent = `Preview only · “${button.dataset.previewAction}” was not sent.`;
+        });
+      });
+    </script>
+  </body>
+</html>
