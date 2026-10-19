@@ -3,7 +3,7 @@
 **状态：** Draft — 待 Dr. Lin 评审后实施
 **日期：** 2026-10-19
 **演化关系：** Phase 1（daemon-phase1 分支）把 daemon 状态行、keepRunning toggle、运行中代理列表、pair 区都塞进 Settings → General 面板末尾（`index.html:1251-1370` 的 `#setting-daemon-section` 与 `:1373` 的 `#setting-remote-section`）。本 spec 把这块内容独立成页签并重排信息结构；后端命令面（`daemon_status` / `daemon_set_keep_running` / `daemon_restart` / `daemon_agent_stop` 四个 IPC）零改动。重启确认 modal（commit 81fb79b）原样保留。
-**视觉真源：** `.design-preview/daemon-tab.html`（与本 spec 同一 commit 入库）。布局、类名、交互行为以预览为准；本文记录决策与迁移面，不重复视觉细节。
+**视觉真源：** `docs/superpowers/specs/prototypes/2026-10-19-daemon-tab-prototype.html`（与本 spec 同一 commit 入库）。布局、类名、交互行为以预览为准；本文记录决策与迁移面，不重复视觉细节。
 
 ## 1. 决策记录
 
@@ -54,7 +54,7 @@ General 面板现为 5 段（language `index.html:1140` / updater `:1162` / pi-p
 
 ## 4. 与预览的对照（预览为视觉真源）
 
-`.design-preview/daemon-tab.html` 是静态 HTML，直接引用生产样式表（`../public/style-theme.css` + `../public/style.css`），新增样式集中在文件头 `<style>` 块（`daemon-runtime-row` 布局 + dialog 外观），共 3 条规则：
+`docs/superpowers/specs/prototypes/2026-10-19-daemon-tab-prototype.html` 是静态 HTML，直接引用生产样式表（`../public/style-theme.css` + `../public/style.css`），新增样式集中在文件头 `<style>` 块（`daemon-runtime-row` 布局 + dialog 外观），共 3 条规则：
 
 | 预览区块 | 对应实施落点 | 说明 |
 | --- | --- | --- |
@@ -95,7 +95,7 @@ General 面板现为 5 段（language `index.html:1140` / updater `:1162` / pi-p
 4. 停止：非 working 直停；working 弹 detail 内嵌确认卡，Cancel/Stop anyway 语义与现版一致；busy/重启事务期间按钮禁用。
 5. pair 区：无 QR canvas；URL 只读框+过期标注+三按钮+警示行；requiresClient 四 locale 为新文案。
 6. 重启 modal：视觉与行为与 81fb79b 完全一致（Escape 取消、overlay 点击不关、焦点落 Cancel）。
-7. **预览一致性：实施版的可交互行为（选中切换、空态切换、确认卡展开、modal 开关、toggle）与 `.design-preview/daemon-tab.html` 一致**；视觉 token 全部来自既有 style.css 变量，预览 `<style>` 块仅 `daemon-runtime-row` 三条规则收编进生产样式。
+7. **预览一致性：实施版的可交互行为（选中切换、空态切换、确认卡展开、modal 开关、toggle）与 `docs/superpowers/specs/prototypes/2026-10-19-daemon-tab-prototype.html` 一致**；视觉 token 全部来自既有 style.css 变量，预览 `<style>` 块仅 `daemon-runtime-row` 三条规则收编进生产样式。
 8. 全量 `bun test`（或既有测试命令）绿。
 
 ## 8. 非目标
