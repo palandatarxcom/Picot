@@ -8060,6 +8060,39 @@ details.sg-section > summary {
   filter: brightness(1.1);
   background: var(--danger, #ef4444);
 }
+.git-confirm-discard:hover:not(:disabled) {
+  filter: brightness(1.1);
+  background: var(--danger, #ef4444);
+}
+/* The daemon restart confirm: same modal shape as the git confirm dialog
+   above, as a static body-level overlay hidden by attribute. */
+.daemon-restart-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+/* display: flex overrides the UA [hidden] rule; keep attribute hiding working. */
+.daemon-restart-dialog-overlay[hidden] {
+  display: none;
+}
+.daemon-restart-dialog {
+  background: var(--bg-frosted, #1e1e2e);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 1.5rem;
+  width: min(90vw, 420px);
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.daemon-restart-dialog h3 {
+  margin: 0;
+  font-size: 1rem;
+}
 .git-commit-dialog {
   background: var(--bg-frosted, #1e1e2e);
   border: 1px solid var(--border, #333);

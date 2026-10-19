@@ -773,6 +773,7 @@
       "restart": "Reiniciar el daemon",
       "restartDescription": "Detiene el daemon en segundo plano e inicia uno nuevo.",
       "restartAction": "Reiniciar",
+      "restartDialogTitle": "Reiniciar el daemon",
       "restartConfirm": "Reiniciar detiene todos los agentes en ejecución; se reanudan desde el estado guardado en disco.",
       "restartAgentCount": "Reiniciar detendrá {count} agente(s) en ejecución.",
       "restartNoAgents": "Ahora mismo no hay agentes en ejecución.",

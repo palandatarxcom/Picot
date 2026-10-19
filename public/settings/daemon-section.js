@@ -3,6 +3,7 @@
 // ABOUTME: permanent running-agents list with its per-runtime stop.
 
 import { t as i18n, onLocaleChange } from "../i18n.js";
+import { bindDialogEscape } from "../ui/dialog-escape.js";
 import { setupPairDeviceSection } from "./pair-device-section.js";
 
 /**
@@ -143,6 +144,8 @@ export function setupDaemonSection({
   let busy = false;
   /** Whether the confirm block is awaiting the user's decision. */
   let confirmOpen = false;
+  /** The Escape binding of the open confirm modal, if any. */
+  let unbindEscape = null;
   /** The running-agent count the open confirm is speaking about. */
   let confirmCount = 0;
   /** The working agent whose Stop is awaiting the user's decision, if any. */
@@ -249,6 +252,8 @@ export function setupDaemonSection({
     confirmRow.hidden = true;
     confirmCount = 0;
     agentsLabel.textContent = "";
+    unbindEscape?.();
+    unbindEscape = null;
   }
 
   /** A row's identity line: workspace root (or id) and session id. */
@@ -378,9 +383,19 @@ export function setupDaemonSection({
     confirmRowText();
     confirmOpen = true;
     confirmRow.hidden = false;
+    // Escape is the modal's keyboard cancel, with the same busy guard as the
+    // cancel button: the transaction in flight must not be dismissed.
+    unbindEscape = bindDialogEscape(
+      () => {
+        if (busy) return;
+        closeConfirm();
+      },
+      { isActive: () => confirmOpen },
+    );
     confirmBtn.disabled = false;
     cancelBtn.disabled = false;
     confirmBtn.textContent = t("settings.daemon.restartConfirmAction");
+    cancelBtn.focus();
   }
 
   /** The confirm's own sentence, normalized so markup whitespace never shows. */

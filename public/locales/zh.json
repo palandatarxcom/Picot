@@ -773,6 +773,7 @@
       "restart": "重启守护进程",
       "restartDescription": "停止当前后台守护进程并启动一个新的。",
       "restartAction": "重启",
+      "restartDialogTitle": "重启守护进程",
       "restartConfirm": "重启会停止所有正在运行的代理，它们会从磁盘保存的状态恢复。",
       "restartAgentCount": "重启将停止 {count} 个正在运行的代理。",
       "restartNoAgents": "当前没有正在运行的代理。",

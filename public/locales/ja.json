@@ -773,6 +773,7 @@
       "restart": "デーモンを再起動",
       "restartDescription": "バックグラウンドのデーモンを停止し、新しいデーモンを起動します。",
       "restartAction": "再起動",
+      "restartDialogTitle": "デーモンを再起動",
       "restartConfirm": "再起動すると実行中のエージェントはすべて停止します。ディスクに保存された状態から再開します。",
       "restartAgentCount": "再起動すると実行中のエージェント {count} 個が停止します。",
       "restartNoAgents": "現在実行中のエージェントはありません。",

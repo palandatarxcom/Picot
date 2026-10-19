@@ -66,11 +66,17 @@ const SECTION_KEYS = "settings.daemon.";
 const INDEX = new JSDOM(readFileSync("public/index.html", "utf8")).window.document;
 const SECTION = INDEX.getElementById("setting-daemon-section");
 const SECTION_HTML = SECTION.outerHTML;
+// The restart confirm is a body-level modal overlay (same shape as the git
+// confirm dialog), so it is extracted and mounted beside the section, not
+// inside it — exactly how the shipped page lays the two out.
+const CONFIRM_OVERLAY = INDEX.getElementById("daemon-restart-confirm");
+const CONFIRM_HTML = CONFIRM_OVERLAY.outerHTML;
 // Every key the *static* markup carries (labels the i18n DOM pass translates:
 // they never travel through t() and would otherwise look like orphaned copy).
-const MARKUP_KEYS = [...SECTION.querySelectorAll("[data-i18n], [data-i18n-aria-label]")].flatMap(
-  (node) => [node.dataset.i18n, node.dataset.i18nAriaLabel].filter(Boolean),
-);
+const MARKUP_KEYS = [
+  ...SECTION.querySelectorAll("[data-i18n], [data-i18n-aria-label]"),
+  ...CONFIRM_OVERLAY.querySelectorAll("[data-i18n], [data-i18n-aria-label]"),
+].flatMap((node) => [node.dataset.i18n, node.dataset.i18nAriaLabel].filter(Boolean));
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -100,7 +106,7 @@ function agent(overrides = {}) {
 }
 
 function mountSection() {
-  document.body.innerHTML = SECTION_HTML;
+  document.body.innerHTML = SECTION_HTML + CONFIRM_HTML;
   return {
     section: document.getElementById("setting-daemon-section"),
     statusValue: document.getElementById("setting-daemon-status-value"),
@@ -301,6 +307,9 @@ describe("restart", () => {
     // restarted yet.
     expect(commands()).toEqual(["daemon_status", "daemon_status"]);
     expect(confirm.hidden).toBe(false);
+    // The confirm is a body-level modal overlay, not an inline row.
+    expect(confirm.classList.contains("daemon-restart-dialog-overlay")).toBe(true);
+    expect(confirm.getAttribute("aria-modal")).toBe("true");
     expect(confirmText.textContent).toBe(EN.settings.daemon.restartConfirm);
     expect(agentsLabel.textContent).toBe(
       EN.settings.daemon.restartAgentCount.replace("{count}", "2"),
@@ -346,6 +355,36 @@ describe("restart", () => {
     await flush();
     expect(document.getElementById("daemon-restart-confirm").hidden).toBe(true);
     expect(commands()).toEqual(["daemon_status", "daemon_status"]);
+  });
+
+  it("closes the confirm on Escape without touching the daemon", async () => {
+    const { page, commands, restartBtn } = setup({ status: status({ agents: [agent()] }) });
+    await page.activate();
+    restartBtn.click();
+    await flush();
+    const overlay = document.getElementById("daemon-restart-confirm");
+    expect(overlay.hidden).toBe(false);
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(overlay.hidden).toBe(true);
+    expect(commands()).toEqual(["daemon_status", "daemon_status"]);
+  });
+
+  it("ignores Escape while the restart transaction is in flight", async () => {
+    const { page, restartBtn } = setup({
+      status: status({ agents: [agent()] }),
+      restart: () => new Promise(() => {}),
+    });
+    await page.activate();
+    restartBtn.click();
+    await flush();
+    document.getElementById("btn-daemon-restart-confirm").click();
+    await flush();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(document.getElementById("daemon-restart-confirm").hidden).toBe(false);
   });
 
   it("says so when there is nothing running", async () => {
@@ -559,6 +598,10 @@ describe("restart confirm layout", () => {
 
   it("hides a hidden settings row instead of letting display: flex win", () => {
     expect(ruleBody(".settings-row[hidden]")).toContain("display: none");
+  });
+
+  it("hides the flex overlay instead of letting display: flex win", () => {
+    expect(ruleBody(".daemon-restart-dialog-overlay[hidden]")).toContain("display: none");
   });
 
   it("keeps the count line and the confirm actions in one revealed container", () => {

@@ -1003,6 +1003,46 @@
 
     <div class="settings-overlay hidden" id="settings-overlay"></div>
 
+    <!-- Settings → General → Daemon: the restart confirm modal. Body-level
+         like the config editor overlay so it centers over the whole window;
+         wired by daemon-section.js (Escape cancels). -->
+    <div
+      class="daemon-restart-dialog-overlay"
+      id="daemon-restart-confirm"
+      role="alertdialog"
+      aria-modal="true"
+      hidden
+    >
+      <div class="daemon-restart-dialog">
+        <h3 data-i18n="settings.daemon.restartDialogTitle">Restart daemon</h3>
+        <p
+          class="settings-help"
+          id="daemon-restart-confirm-text"
+          data-i18n="settings.daemon.restartConfirm"
+        >
+          Restarting stops every running agent. They resume from the state
+          saved on disk.
+        </p>
+        <span class="settings-label-sub" id="daemon-restart-agents-label"></span>
+        <div class="daemon-confirm-actions">
+          <button
+            class="settings-value-btn"
+            id="btn-daemon-restart-cancel"
+            data-i18n="settings.daemon.restartCancel"
+          >
+            Cancel
+          </button>
+          <button
+            class="settings-value-btn is-primary"
+            id="btn-daemon-restart-confirm"
+            data-i18n="settings.daemon.restartConfirmAction"
+          >
+            Restart now
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div class="settings-panel hidden" id="settings-panel">
       <div
         id="settings-drag-region"
@@ -1323,38 +1363,6 @@
                 >
                   Restart
                 </button>
-              </div>
-              <div class="settings-row" id="daemon-restart-confirm" hidden>
-                <div class="daemon-confirm">
-                  <p
-                    class="settings-help"
-                    id="daemon-restart-confirm-text"
-                    data-i18n="settings.daemon.restartConfirm"
-                  >
-                    Restarting stops every running agent. They resume from the
-                    state saved on disk.
-                  </p>
-                  <span
-                    class="settings-label-sub"
-                    id="daemon-restart-agents-label"
-                  ></span>
-                  <div class="daemon-confirm-actions">
-                    <button
-                      class="settings-value-btn"
-                      id="btn-daemon-restart-cancel"
-                      data-i18n="settings.daemon.restartCancel"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      class="settings-value-btn is-primary"
-                      id="btn-daemon-restart-confirm"
-                      data-i18n="settings.daemon.restartConfirmAction"
-                    >
-                      Restart now
-                    </button>
-                  </div>
-                </div>
               </div>
             </div>
             <!-- Settings → General → Remote access (relay Phase 2, spec

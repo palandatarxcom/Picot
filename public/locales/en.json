@@ -773,6 +773,7 @@
       "restart": "Restart daemon",
       "restartDescription": "Stops the background daemon and starts a fresh one.",
       "restartAction": "Restart",
+      "restartDialogTitle": "Restart daemon",
       "restartConfirm": "Restarting stops every running agent. They resume from the state saved on disk.",
       "restartAgentCount": "Restarting will stop {count} running agent(s).",
       "restartNoAgents": "No agents are running right now.",
