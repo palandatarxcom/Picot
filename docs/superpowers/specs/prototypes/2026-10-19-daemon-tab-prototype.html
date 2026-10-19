@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Picot Settings — Daemon (design preview)</title>
-    <link rel="stylesheet" href="../public/style-theme.css" />
-    <link rel="stylesheet" href="../public/style.css" />
+    <link rel="stylesheet" href="../../../../public/style-theme.css" />
+    <link rel="stylesheet" href="../../../../public/style.css" />
     <style>
       .daemon-runtime-row {
         display: flex;
@@ -16,11 +16,32 @@
 
       .daemon-runtime-row .pkg-manager-sidebar-name {
         min-width: 0;
+        flex: 1 1 auto;
       }
 
       .daemon-runtime-row .pkg-manager-sidebar-meta {
         flex: 0 0 auto;
         margin-top: 0;
+      }
+
+      .daemon-runtime-session-id {
+        color: var(--text-dim);
+        font-family: ui-monospace, "SF Mono", Consolas, monospace;
+        font-size: var(--font-size-xs);
+        white-space: nowrap;
+      }
+
+      .daemon-runtime-preview-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--space-2);
+        margin: var(--space-2) 0;
+      }
+
+      .daemon-confirm[hidden],
+      .pkg-manager-empty[hidden] {
+        display: none !important;
       }
 
       dialog {
@@ -57,7 +78,7 @@
           aria-hidden="true"
           style="display: flex; align-items: center; justify-content: center; color: var(--text-dim); font-size: var(--font-size-xs);"
         >
-          Static preview · UI actions do not connect to a daemon
+          Static preview · sample data only · no daemon or data-plane requests
         </div>
         <aside class="settings-nav" aria-label="Settings navigation">
           <div class="settings-nav-title">Settings</div>
@@ -87,7 +108,7 @@
             >
               <h3>Daemon</h3>
               <button class="settings-value-btn" id="preview-empty-toggle" type="button" aria-controls="daemon-runtime-layout" aria-pressed="false">
-                Show empty state
+                Show empty state (demo)
               </button>
             </div>
             <div class="settings-body">
@@ -114,6 +135,12 @@
                 </div>
 
                 <div class="settings-section-title">Running agents</div>
+                <div class="daemon-runtime-preview-controls" role="group" aria-label="Demonstration controls for session-name lookup">
+                  <span class="settings-label-sub">Demo only · no session lookup is sent</span>
+                  <button class="settings-value-btn" type="button" data-name-state="success" aria-pressed="true">Show sample names</button>
+                  <button class="settings-value-btn" type="button" data-name-state="loading" aria-pressed="false">Show loading fallback</button>
+                  <button class="settings-value-btn" type="button" data-name-state="failure" aria-pressed="false">Show failed-lookup fallback</button>
+                </div>
                 <div class="pkg-manager-layout" id="daemon-runtime-layout">
                   <div class="pkg-manager-groups" id="daemon-runtime-groups" aria-label="Running agents by workspace">
                     <div id="runtime-populated">
@@ -129,14 +156,18 @@
                         data-runtime-id="rt-7f2c4a91-0d13"
                         data-session-id="session-8bd12a60-1cc4"
                         data-session-short="s-8bd12a"
+                        data-session-name="Review daemon status refresh"
                         data-workspace="/Users/dr-lin/Projects/picot-v3"
                         data-state="Working"
                         data-tone="ok"
                         data-cwd="/Users/dr-lin/Projects/picot-v3"
                         aria-pressed="true"
                       >
-                        <span class="pkg-manager-sidebar-name">session · s-8bd12a</span>
-                        <span class="pkg-manager-sidebar-meta"><span class="pill settings-static-value" data-tone="ok">Working</span></span>
+                        <span class="pkg-manager-sidebar-name" data-runtime-name>Review daemon status refresh</span>
+                        <span class="pkg-manager-sidebar-meta">
+                          <span class="daemon-runtime-session-id">s-8bd12a</span>
+                          <span class="pill settings-static-value" data-tone="ok">Working</span>
+                        </span>
                       </button>
                       <button
                         class="pkg-manager-sidebar-row daemon-runtime-row"
@@ -144,14 +175,18 @@
                         data-runtime-id="rt-a064de38-92b1"
                         data-session-id="session-44c1f0d9-a7e5"
                         data-session-short="s-44c1f0"
+                        data-session-name=""
                         data-workspace="/Users/dr-lin/Projects/picot-v3"
                         data-state="Idle"
                         data-tone=""
                         data-cwd="/Users/dr-lin/Projects/picot-v3"
                         aria-pressed="false"
                       >
-                        <span class="pkg-manager-sidebar-name">session · s-44c1f0</span>
-                        <span class="pkg-manager-sidebar-meta"><span class="pill settings-static-value">Idle</span></span>
+                        <span class="pkg-manager-sidebar-name" data-runtime-name>session · s-44c1f0</span>
+                        <span class="pkg-manager-sidebar-meta">
+                          <span class="daemon-runtime-session-id">s-44c1f0</span>
+                          <span class="pill settings-static-value">Idle</span>
+                        </span>
                       </button>
 
                       <h4
@@ -166,14 +201,18 @@
                         data-runtime-id="rt-93bc018e-5ef2"
                         data-session-id="session-9e8a3c2b-620d"
                         data-session-short="s-9e8a3c"
+                        data-session-name="Validate settings-tab layout"
                         data-workspace="/Users/dr-lin/Projects/picot-v3/.worktrees/daemon-phase1"
                         data-state="Crashed"
                         data-tone="error"
                         data-cwd="/Users/dr-lin/Projects/picot-v3/.worktrees/daemon-phase1"
                         aria-pressed="false"
                       >
-                        <span class="pkg-manager-sidebar-name">session · s-9e8a3c</span>
-                        <span class="pkg-manager-sidebar-meta"><span class="pill settings-static-value" data-tone="error">Crashed</span></span>
+                        <span class="pkg-manager-sidebar-name" data-runtime-name>Validate settings-tab layout</span>
+                        <span class="pkg-manager-sidebar-meta">
+                          <span class="daemon-runtime-session-id">s-9e8a3c</span>
+                          <span class="pill settings-static-value" data-tone="error">Crashed</span>
+                        </span>
                       </button>
                     </div>
                     <div
@@ -187,7 +226,7 @@
                     </div>
                   </div>
 
-                  <section class="pkg-manager-detail" aria-label="Selected runtime details">
+                  <section class="pkg-manager-detail" id="daemon-runtime-detail" aria-label="Selected runtime details">
                     <div id="runtime-detail-content">
                       <div class="pkg-manager-detail-header">
                         <span class="settings-label-main">Runtime details</span>
@@ -195,27 +234,29 @@
                       </div>
                       <div class="pkg-manager-status-grid">
                         <div class="pkg-manager-status-row"><span>Runtime ID</span><span class="is-wrap" id="detail-runtime-id-row">rt-7f2c4a91-0d13</span></div>
+                        <div class="pkg-manager-status-row"><span>Session name</span><span class="is-wrap" id="detail-session-name">Review daemon status refresh</span></div>
                         <div class="pkg-manager-status-row"><span>Session ID</span><span class="is-wrap" id="detail-session-id">session-8bd12a60-1cc4</span></div>
                         <div class="pkg-manager-status-row"><span>Workspace</span><span class="is-wrap" id="detail-workspace">/Users/dr-lin/Projects/picot-v3</span></div>
                         <div class="pkg-manager-status-row"><span>State</span><span id="detail-state" data-tone="ok">Working</span></div>
                         <div class="pkg-manager-status-row"><span>CWD</span><span class="is-wrap" id="detail-cwd">/Users/dr-lin/Projects/picot-v3</span></div>
                       </div>
                       <div class="pkg-manager-footer">
-                        <button class="settings-value-btn is-danger" id="stop-runtime-button" type="button" data-preview-action="Stop">Stop</button>
+                        <button class="settings-value-btn is-danger" id="stop-runtime-button" type="button">Stop</button>
                       </div>
                       <div
                         class="daemon-confirm"
                         id="working-stop-confirm"
+                        hidden
                         style="margin-top: var(--space-3); padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-glass);"
                       >
                         <p class="settings-help" style="margin-bottom: 0; color: var(--error);">Stop this agent?</p>
-                        <span class="settings-label-sub">session-8bd12a60-1cc4 · Working</span>
+                        <span class="settings-label-sub" id="stop-confirm-summary">session-8bd12a60-1cc4 · Working</span>
                         <p class="settings-help">
                           It is working on a turn right now. Stopping it interrupts that turn, and its reply will not be delivered.
                         </p>
                         <div class="daemon-confirm-actions">
-                          <button class="settings-value-btn" type="button" data-preview-action="Cancel stop confirmation">Cancel</button>
-                          <button class="settings-value-btn is-primary" type="button" data-preview-action="Stop anyway">Stop anyway</button>
+                          <button class="settings-value-btn" id="cancel-stop-confirm" type="button">Cancel</button>
+                          <button class="settings-value-btn is-primary" id="confirm-stop-preview" type="button">Stop anyway</button>
                         </div>
                       </div>
                     </div>
@@ -230,7 +271,7 @@
                   </section>
                 </div>
                 <p class="settings-help" id="preview-feedback" role="status" aria-live="polite">
-                  Preview data only · no daemon commands are sent.
+                  Preview data only · no daemon or data-plane requests are sent.
                 </p>
 
                 <div class="settings-row">
@@ -299,6 +340,7 @@
       const detail = {
         runtime: document.getElementById("detail-runtime-id"),
         runtimeRow: document.getElementById("detail-runtime-id-row"),
+        sessionName: document.getElementById("detail-session-name"),
         session: document.getElementById("detail-session-id"),
         workspace: document.getElementById("detail-workspace"),
         state: document.getElementById("detail-state"),
@@ -307,6 +349,47 @@
       const detailContent = document.getElementById("runtime-detail-content");
       const detailEmpty = document.getElementById("runtime-detail-empty");
       const stopConfirm = document.getElementById("working-stop-confirm");
+      const stopSummary = document.getElementById("stop-confirm-summary");
+      const nameStateButtons = [...document.querySelectorAll("[data-name-state]")];
+      let selectedRow = rows[0];
+      let nameState = "success";
+
+      function renderName(row) {
+        const name = row.dataset.sessionName.trim();
+        const master = row.querySelector("[data-runtime-name]");
+        master.textContent = nameState === "success" && name ? name : "session";
+        detail.sessionName.textContent =
+          nameState === "loading"
+            ? "Loading…"
+            : nameState === "failure"
+              ? "Name temporarily unavailable"
+              : name || "—";
+      }
+
+      function renderSelectedRuntime() {
+        detail.runtime.textContent = selectedRow.dataset.runtimeId;
+        detail.runtimeRow.textContent = selectedRow.dataset.runtimeId;
+        detail.session.textContent = selectedRow.dataset.sessionId;
+        detail.workspace.textContent = selectedRow.dataset.workspace;
+        detail.state.textContent = selectedRow.dataset.state;
+        detail.state.dataset.tone = selectedRow.dataset.tone;
+        detail.cwd.textContent = selectedRow.dataset.cwd;
+        stopSummary.textContent = `${selectedRow.dataset.sessionId} · ${selectedRow.dataset.state}`;
+        stopConfirm.hidden = true;
+        renderName(selectedRow);
+      }
+
+      function setNameState(state) {
+        nameState = state;
+        nameStateButtons.forEach((button) => {
+          button.setAttribute("aria-pressed", String(button.dataset.nameState === state));
+        });
+        renderName(selectedRow);
+        feedback.textContent =
+          state === "success"
+            ? "Preview sample state · session name is shown when present. No lookup request sent."
+            : `Preview ${state} fallback · short ID remains visible. No lookup request sent.`;
+      }
 
       rows.forEach((row) => {
         row.addEventListener("click", () => {
@@ -315,16 +398,35 @@
             candidate.classList.toggle("is-selected", selected);
             candidate.setAttribute("aria-pressed", String(selected));
           });
-          detail.runtime.textContent = row.dataset.runtimeId;
-          detail.runtimeRow.textContent = row.dataset.runtimeId;
-          detail.session.textContent = row.dataset.sessionId;
-          detail.workspace.textContent = row.dataset.workspace;
-          detail.state.textContent = row.dataset.state;
-          detail.state.dataset.tone = row.dataset.tone;
-          detail.cwd.textContent = row.dataset.cwd;
-          stopConfirm.hidden = row.dataset.state !== "Working";
+          selectedRow = row;
+          nameState = "success";
+          nameStateButtons.forEach((button) => {
+            button.setAttribute("aria-pressed", String(button.dataset.nameState === nameState));
+          });
+          renderSelectedRuntime();
           feedback.textContent = `Preview selection · ${row.dataset.sessionShort} · ${row.dataset.state}. No daemon command sent.`;
         });
+      });
+
+      nameStateButtons.forEach((button) => {
+        button.addEventListener("click", () => setNameState(button.dataset.nameState));
+      });
+
+      document.getElementById("stop-runtime-button").addEventListener("click", () => {
+        if (selectedRow.dataset.state === "Working") {
+          stopConfirm.hidden = false;
+          feedback.textContent = "Preview stop confirmation · no daemon command sent.";
+        } else {
+          feedback.textContent = "Preview only · Stop was not sent.";
+        }
+      });
+      document.getElementById("cancel-stop-confirm").addEventListener("click", () => {
+        stopConfirm.hidden = true;
+        feedback.textContent = "Preview only · stop cancelled; no daemon command sent.";
+      });
+      document.getElementById("confirm-stop-preview").addEventListener("click", () => {
+        stopConfirm.hidden = true;
+        feedback.textContent = "Preview only · stop was not sent.";
       });
 
       const keepRunning = document.getElementById("toggle-daemon-keep-running");
@@ -342,7 +444,7 @@
       emptyToggle.addEventListener("click", () => {
         const showEmpty = emptyToggle.getAttribute("aria-pressed") !== "true";
         emptyToggle.setAttribute("aria-pressed", String(showEmpty));
-        emptyToggle.textContent = showEmpty ? "Show populated data" : "Show empty state";
+        emptyToggle.textContent = showEmpty ? "Show populated data (demo)" : "Show empty state (demo)";
         populated.hidden = showEmpty;
         empty.hidden = !showEmpty;
         detailContent.hidden = showEmpty;
