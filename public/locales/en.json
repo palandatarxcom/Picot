@@ -152,6 +152,7 @@
     "abort": "Abort (Esc)",
     "messagePlaceholder": "Message...",
     "mirrorReadOnly": "Viewing historical session (read-only)",
+    "stoppedSession": "This session has been stopped. Reopen it to start a new agent.",
     "waitingForSession": "Waiting for current session to finish…",
     "compact": "Compact",
     "compactDesc": "Compact context to save tokens",
@@ -1751,7 +1752,9 @@
     "back": "Back",
     "newTask": "New Task",
     "showMore": "Show more",
-    "focusedExisting": "That session is already open in another window — focused it for you."
+    "focusedExisting": "That session is already open in another window — focused it for you.",
+    "sessionStopped": "This session has been stopped",
+    "sessionEnded": "This session has ended"
   },
   "migrated": {
     "native": {

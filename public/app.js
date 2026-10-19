@@ -9,6 +9,7 @@ import { createComposerDraftStore } from "./app/composer-draft-store.js";
 import { resolveComposerSessionIdentity } from "./app/composer-session-identity.js";
 import { installHostOriginFetch } from "./app/host-origin.js";
 import { createPromptDelivery } from "./app/prompt-delivery.js";
+import { createSessionStoppedBanner } from "./app/session-stopped-banner.js";
 import { StateManager } from "./app/state.js";
 import { initTransport } from "./app/transport.js";
 import { createAppUpdater } from "./app/updater.js";
@@ -997,7 +998,12 @@ wsClient.addEventListener("runtimeStarted", (event) => {
     // file the park is keyed by.
     const sessionFile = backgroundSessionFiles.resolve(event.detail);
     piQueuePark.forget(sessionFile);
-    if (sessionFile && sessionFile === activeUiSessionFile) renderPiQueue(null);
+    sessionStoppedBanner.clear(sessionFile);
+    if (sessionFile && sessionFile === activeUiSessionFile) {
+      renderPiQueue(null);
+      sessionStoppedBanner.sync(activeUiSessionFile);
+      updateUI();
+    }
   });
 });
 widgetMirrorRegistry.registerRenderer({
@@ -3059,6 +3065,27 @@ function handleRPCEvent(event) {
       // not outlive it: returning to that session spawns a fresh runtime.
       piQueuePark.forget(eventSessionFile);
       renderPiQueue(piQueuePark.get(activeUiSessionFile));
+      // B′ in-place stopped state: the runtime behind this view is gone, so
+      // no streaming UI may survive it and the composer is dead — the host
+      // rejects sends to a stopped runtime (unauthorized_target), so the
+      // composer must not offer a send that cannot succeed.
+      sessionStoppedBanner.mark(
+        eventSessionFile,
+        event.type === "runtime_crashed" ? "crashed" : "stopped",
+      );
+      if (eventSessionFile === activeUiSessionFile) {
+        if (state.isStreaming) {
+          state.setStreaming(false);
+          showTypingIndicator(false);
+          currentStreamingElement = null;
+          currentStreamingText = "";
+        }
+        taskAnalysis?.setStreaming(false);
+        // The open turn can never complete: fold it as aborted, not settled.
+        if (activeTurn) closeLiveTurn();
+        sessionStoppedBanner.sync(activeUiSessionFile);
+        updateUI();
+      }
       break;
     case "auto_retry_start":
       handleAutoRetryStart(event);
@@ -4244,6 +4271,8 @@ function subscribeToLiveRuntimeTargets() {
 function sendMessage() {
   if (mainPasteOffload.isBusy()) return;
   if (!currentOnboardingState().canQuery) return;
+  // The stopped session's runtime is gone and cannot be respawned by a send.
+  if (sessionStoppedBanner.isStopped(activeUiSessionFile)) return;
   // One correlated send at a time: the delivery record owns the input until
   // acceptance/rejection settles, so a second Enter cannot double-send.
   if (promptDelivery.hasAwaiting(composerIdentity())) return;
@@ -4472,6 +4501,11 @@ function maybeDrainFollowUpQueue() {
 // The park mirrors pi's live queue for a session whose runtime is backgrounded;
 // see ARCHITECTURE on runtimes surviving session switches.
 const piQueuePark = createPiQueuePark();
+
+// B′ in-place stopped state: sessions whose runtime died keep their view,
+// but the view must say so (banner) and the composer stays dead until a
+// fresh runtime spawns — sending cannot respawn (host rejects dead targets).
+const sessionStoppedBanner = createSessionStoppedBanner({ chatEl: messagesElement });
 
 // Follow-ups queue Picot-side (2026-09-26 spec): pi's queue protocol is
 // all-or-nothing, so per-item edit/delete needs a client-owned truth keyed by
@@ -6369,6 +6403,8 @@ function renderTranscriptEntries(entries, { leafId = null } = {}) {
   resetHeaderStatusBar();
   renderSessionHistory(entries, { searchQuery: sidebar.searchQuery, leafId });
   maybeOpenAdoptedLiveTurn();
+  // Navigating back into a stopped session must repaint its truth.
+  sessionStoppedBanner.sync(activeUiSessionFile);
 }
 
 /** Upstream switch hydration: read the session file in parallel with the
@@ -7190,6 +7226,9 @@ function updateConnectionStatus(status) {
 function updateUI() {
   const isStreaming = state.isStreaming;
   const onboarding = updateOnboardingUI();
+  // A stopped session's composer is dead: sending cannot respawn the runtime
+  // (the host rejects dead targets), so no send may even be offered.
+  const sessionStopped = sessionStoppedBanner.isStopped(activeUiSessionFile);
 
   composerCard.classList.toggle("streaming", isStreaming);
 
@@ -7203,8 +7242,10 @@ function updateUI() {
     statusText.textContent = t("status.connected");
   }
 
-  messageInput.disabled = !onboarding.canType;
-  sendBtn.disabled = !onboarding.canQuery || promptDelivery.hasAwaiting(composerIdentity());
+  messageInput.disabled = !onboarding.canType || sessionStopped;
+  sendBtn.disabled =
+    !onboarding.canQuery || sessionStopped || promptDelivery.hasAwaiting(composerIdentity());
+  inputAreaEl.classList.toggle("session-stopped", sessionStopped);
 
   if (isStreaming) {
     abortBtn.classList.remove("hidden");
@@ -7218,7 +7259,9 @@ function updateUI() {
     sendCaretBtn.classList.add("hidden");
   }
 
-  if (onboarding.canQuery) {
+  if (sessionStopped) {
+    messageInput.placeholder = t("input.stoppedSession");
+  } else if (onboarding.canQuery) {
     messageInput.placeholder = `${t("input.typeMessage")}${t("input.typeMessageFollowUpHint")}`;
   }
 }

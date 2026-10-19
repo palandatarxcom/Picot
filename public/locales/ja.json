@@ -152,6 +152,7 @@
     "abort": "中止 (Esc)",
     "messagePlaceholder": "メッセージ… / でコマンド、@ でファイルを入力",
     "mirrorReadOnly": "履歴セッションを表示中（読み取り専用）",
+    "stoppedSession": "このセッションは停止されました。開き直すと新しいエージェントが起動します。",
     "waitingForSession": "現在のセッションが終了するのを待っています…",
     "compact": "コンパクト",
     "compactDesc": "トークンを節約するためコンテキストをコンパクトにする",
@@ -1751,7 +1752,9 @@
     "back": "戻る",
     "newTask": "新しいタスク",
     "showMore": "もっと表示",
-    "focusedExisting": "このセッションは別のウィンドウで開いています。そのウィンドウにフォーカスしました"
+    "focusedExisting": "このセッションは別のウィンドウで開いています。そのウィンドウにフォーカスしました",
+    "sessionStopped": "このセッションは停止されました",
+    "sessionEnded": "このセッションは終了しました"
   },
   "migrated": {
     "index": {

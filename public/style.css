@@ -11939,3 +11939,26 @@ button.skills-group-status:disabled {
   color: var(--accent);
   font-weight: 500;
 }
+
+/* B′ in-place stopped session: banner at the top of the chat area, and a
+   composer that cannot offer a send the dead runtime would reject. */
+.session-stopped-banner {
+  width: fit-content;
+  margin: var(--space-2) auto var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-hover);
+  border-radius: var(--radius-sm);
+  background: var(--bg-glass);
+  color: var(--text-dim);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+.session-stopped-banner[data-kind="crashed"] {
+  border-color: var(--danger, #ff6b6b);
+}
+
+.input-area.session-stopped {
+  opacity: 0.7;
+  pointer-events: none;
+}

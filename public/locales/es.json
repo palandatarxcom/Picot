@@ -152,6 +152,7 @@
     "abort": "Cancelar (Esc)",
     "messagePlaceholder": "Mensaje… Escribe / para comandos, @ para archivos",
     "mirrorReadOnly": "Viendo sesión histórica (solo lectura)",
+    "stoppedSession": "Esta sesión se ha detenido. Vuelve a abrirla para iniciar un nuevo agente.",
     "waitingForSession": "Esperando que la sesión actual termine…",
     "compact": "Compactar",
     "compactDesc": "Compactar contexto para ahorrar tokens",
@@ -1751,7 +1752,9 @@
     "back": "Atrás",
     "newTask": "Nueva tarea",
     "showMore": "Mostrar más",
-    "focusedExisting": "Esa sesión ya está abierta en otra ventana; se ha enfocado esa ventana."
+    "focusedExisting": "Esa sesión ya está abierta en otra ventana; se ha enfocado esa ventana.",
+    "sessionStopped": "Esta sesión se ha detenido",
+    "sessionEnded": "Esta sesión ha finalizado"
   },
   "migrated": {
     "index": {

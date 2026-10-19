@@ -152,6 +152,7 @@
     "abort": "终止 (Esc)",
     "messagePlaceholder": "消息...",
     "mirrorReadOnly": "正在查看历史会话（只读）",
+    "stoppedSession": "会话已停止。重新打开会话可启动新的 Agent。",
     "waitingForSession": "等待当前会话结束…",
     "compact": "压缩",
     "compactDesc": "压缩上下文以节省令牌",
@@ -1751,7 +1752,9 @@
     "back": "返回",
     "newTask": "新任务",
     "showMore": "显示更多",
-    "focusedExisting": "该会话已在另一窗口打开，已为你聚焦该窗口"
+    "focusedExisting": "该会话已在另一窗口打开，已为你聚焦该窗口",
+    "sessionStopped": "会话已停止",
+    "sessionEnded": "会话已结束"
   },
   "migrated": {
     "native": {
