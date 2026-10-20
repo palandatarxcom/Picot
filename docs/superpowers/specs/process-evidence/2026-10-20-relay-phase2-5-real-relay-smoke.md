@@ -43,6 +43,7 @@
 6. **宿主 app 退出后远程仍可操作**（D1 的产品级实证）；
 7. 从设备管理 UI 撤销 → 客户端表现为 `credentialInvalid` 且停止自动重连；
 8. 断网降级 → 恢复重连的 UI 表现。
+9. **真 relay 空闲 >60s 不掉线**（架构狮 F-09）：client_role 的半开判定是「30s 内无任何入站帧即判死」，靠 10s 一次的 WS ping 换 pong 刷新。若真 relay 不回 client ping，健康的空闲会话会被本地每 30s 误判死并重拨。mock relay 覆盖了这条路径，真 relay 只在短会话上验过。观测方法：连上后保持空闲 90s，daemon 侧 `relay.status` 仍为 `online`，客户端日志无 `offline→connecting` 循环。
 
 **执行方式**（建议）：两台真机（桌面 = host，笔记本 = 客户端），或本机双隔离根 + 两个 Picot 实例。命令与前置条件见本文件 §1 与 plan T11 Step 1。
 

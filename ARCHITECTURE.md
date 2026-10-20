@@ -225,6 +225,8 @@ relay 数据面绕开 axum 入口的物理帧上限，各上限统一进契约�
 - **HTTP 面处置（契约 2）**：relay 通道只隧道 WS 会话帧，没有 HTTP 承接协议，本地加代理路由也不会让远端 handler 可达——因此**不做通用 HTTP 代理**，前端每个相对 HTTP 调用逐项三选一：映射到既有/新增受限 WS op、远程模式显式禁用、显式保持本机（静态资源）。清盘与逐项处置见 `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-http-inventory.md`，并有一条测试守住新增调用点必须入表。
 - **切换 = 页面级重载（契约 4）**：host 参数在**窗口 URL** 上，切换即导航 + 整页重载，模块闭包、投影、pending、在途请求随旧页面消亡；草稿与 keyed cache 按 host 命名空间存 localStorage 跨重载保留；切前 flush 复用既有 quit 前 flush 机制。桥**按 host 共享、按窗口引用计数**：同一 host 多窗口共享一个桥，桥上每条 proxy 连接 = 一条独立 relay 会话；最后一个窗口离开才停桥。同 host 双窗口共享同一个 device view。
 - **host_store 威胁边界**：`app_config_dir/picot-hosts.json`（0600，tmp+rename 原子替换，写失败保旧文件）存 HostProfile 与 deviceToken。服务端只存 token hash，这里存的是**明文 bearer token**——泄露后果**重于**服务端库，本机同用户任意进程可读；本期接受，macOS Keychain 留作后续加固。此文件同时是 TOFU 信任基线，**损坏不回退默认值**：保留原文件、阻塞覆盖性保存、UI 要求重新配对或手动恢复。本机删 host 只删本地 profile+token，远端设备记录仍在（撤销是远端 owner 的动作）。
+- **已知行为：设备 git 事件回放到 pairing owner 的窗口**（架构狮 F-08）。设备的 git 操作经 `send_owner_event(owner, …)` 推给配对时记录的 owner，因此本机同一 owner 的窗口会看到设备发起的 git 事件——同一个 principal，不构成越权，但会与本机 git 面板串扰。按 principal 定向属后续优化，本期记为已知行为；若将来出现第二个 device principal 共享 owner 的场景，须改为按连接定向。
+- **失败态语义**：`PairingFailed`（配对本身被拒，token 已消费）与 `CredentialInvalid`（已配对设备被撤销）是两个独立终态：前者停用该次 pairingToken、等新 offer 顶替；后者清本地 token、停桥、清 grant 绑定并落回 `offline`。桥在两层重连中都不重放应用层 hello。
 
 ## 授权模型
 
