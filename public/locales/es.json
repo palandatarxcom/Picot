@@ -601,6 +601,40 @@
       "action": "Abrir ajustes de modelo"
     }
   },
+  "hostPicker": {
+    "title": "Hosts",
+    "local": "Este Mac",
+    "remove": "Quitar",
+    "removeAction": "Quitar",
+    "removeConfirm": "¿Quitar {host} de este Mac? El host remoto aún confía en este dispositivo: su propietario debe revocarlo allí.",
+    "removed": "Se quitó {host}.",
+    "removeFailed": "No se pudo quitar el host: {reason}",
+    "add": "Añadir host",
+    "addPlaceholder": "Pega la oferta de conexión del host",
+    "addSubmit": "Añadir",
+    "added": "Conectado a {host}.",
+    "addFailed": "No se pudo añadir el host: {reason}",
+    "cancelled": "Cancelado.",
+    "saveFailed": "Emparejado, pero no se pudo guardar la credencial. Vuelve a emparejar tras cerrar Picot.",
+    "readFailed": "No se pudo leer la lista de hosts: {reason}",
+    "switchBlocked": "No se pudo guardar el borrador, así que esta ventana sigue en el host actual.",
+    "tofuTitleNew": "¿Confiar en este host nuevo?",
+    "tofuTitleChanged": "La conexión de este host cambió. ¿Confiar de nuevo?",
+    "tofuFingerprint": "Huella de la clave {fingerprint}",
+    "tofuConfirm": "Confiar y conectar",
+    "status": {
+      "connecting": "Conectando",
+      "online": "En línea",
+      "offline": "Sin conexión",
+      "credentialInvalid": "Requiere emparejar",
+      "saveFailed": "Sin guardar"
+    },
+    "change": {
+      "daemonKey": "Clave: {saved} → {offered}",
+      "relayEndpoint": "Relay: {saved} → {offered}",
+      "useTls": "TLS: {saved} → {offered}"
+    }
+  },
   "sidebar": {
     "loadingSessions": "Cargando sesiones...",
     "failedToLoadSessions": "Error al cargar sesiones.",
@@ -841,6 +875,21 @@
         "enableFailed": "No se pudo activar el emparejamiento remoto: {reason}",
         "offerFailed": "No se pudo crear el código de emparejamiento: {reason}",
         "disableFailed": "No se pudo desactivar el emparejamiento remoto: {reason}"
+      },
+      "devices": {
+        "title": "Dispositivos emparejados",
+        "subtitle": "Dispositivos que pueden acceder a este Picot por el relay.",
+        "empty": "Todavía no hay dispositivos emparejados.",
+        "pairedAt": "Emparejado {time}",
+        "owner": "Propietario {owner}",
+        "ownerUnknown": "Propietario desconocido",
+        "revoke": "Revocar",
+        "revokeCancel": "Cancelar",
+        "revokeAction": "Revocar",
+        "revokeConfirm": "¿Revocar {device}? Pierde el acceso de inmediato y se corta la sesión que tenga abierta.",
+        "revoked": "Se revocó {device}.",
+        "revokeFailed": "No se pudo revocar el dispositivo: {reason}",
+        "readFailed": "No se pudieron leer los dispositivos emparejados: {reason}"
       }
     },
     "remote": {

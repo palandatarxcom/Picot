@@ -601,6 +601,40 @@
       "action": "モデル設定を開く"
     }
   },
+  "hostPicker": {
+    "title": "ホスト",
+    "local": "このMac",
+    "remove": "削除",
+    "removeAction": "削除",
+    "removeConfirm": "このMacから {host} を削除しますか？リモートホストはこのデバイスをまだ信頼しているため、解除はリモート側の所有者が行う必要があります。",
+    "removed": "{host} を削除しました。",
+    "removeFailed": "ホストを削除できません：{reason}",
+    "add": "ホストを追加",
+    "addPlaceholder": "ホストの接続オファーを貼り付け",
+    "addSubmit": "追加",
+    "added": "{host} に接続しました。",
+    "addFailed": "ホストを追加できません：{reason}",
+    "cancelled": "キャンセルしました。",
+    "saveFailed": "ペアリングは完了しましたが、認証情報を保存できませんでした。Picot を終了した後で再ペアリングしてください。",
+    "readFailed": "ホスト一覧を読み込めません：{reason}",
+    "switchBlocked": "下書きを保存できなかったため、このウィンドウは現在のホストのままです。",
+    "tofuTitleNew": "この新しいホストを信頼しますか？",
+    "tofuTitleChanged": "このホストの接続情報が変更されました。再度信頼しますか？",
+    "tofuFingerprint": "鍵のフィンガープリント {fingerprint}",
+    "tofuConfirm": "信頼して接続",
+    "status": {
+      "connecting": "接続中",
+      "online": "オンライン",
+      "offline": "オフライン",
+      "credentialInvalid": "再ペアリングが必要",
+      "saveFailed": "未保存"
+    },
+    "change": {
+      "daemonKey": "鍵：{saved} → {offered}",
+      "relayEndpoint": "リレー：{saved} → {offered}",
+      "useTls": "TLS：{saved} → {offered}"
+    }
+  },
   "sidebar": {
     "loadingSessions": "セッションを読み込み中...",
     "failedToLoadSessions": "セッションの読み込みに失敗しました。",
@@ -841,6 +875,21 @@
         "enableFailed": "リモートペアリングを有効にできませんでした：{reason}",
         "offerFailed": "ペアリングコードを作成できませんでした：{reason}",
         "disableFailed": "リモートペアリングをオフにできませんでした：{reason}"
+      },
+      "devices": {
+        "title": "ペアリング済みデバイス",
+        "subtitle": "リレー経由でこの Picot にアクセスできるデバイス。",
+        "empty": "ペアリング済みのデバイスはまだありません。",
+        "pairedAt": "ペアリング {time}",
+        "owner": "所有者 {owner}",
+        "ownerUnknown": "所有者不明",
+        "revoke": "解除",
+        "revokeCancel": "キャンセル",
+        "revokeAction": "解除",
+        "revokeConfirm": "{device} を解除しますか？アクセス権はすぐに失われ、現在開いているセッションは切断されます。",
+        "revoked": "{device} を解除しました。",
+        "revokeFailed": "デバイスを解除できません：{reason}",
+        "readFailed": "ペアリング済みデバイスを読み込めません：{reason}"
       }
     },
     "remote": {

@@ -601,6 +601,40 @@
       "action": "Open model settings"
     }
   },
+  "hostPicker": {
+    "title": "Hosts",
+    "local": "This Mac",
+    "remove": "Remove",
+    "removeAction": "Remove",
+    "removeConfirm": "Remove {host} from this Mac? The remote host still trusts this device — its owner has to revoke it there.",
+    "removed": "Removed {host}.",
+    "removeFailed": "Could not remove the host: {reason}",
+    "add": "Add host",
+    "addPlaceholder": "Paste the host's connection offer",
+    "addSubmit": "Add",
+    "added": "Connected to {host}.",
+    "addFailed": "Could not add the host: {reason}",
+    "cancelled": "Cancelled.",
+    "saveFailed": "Paired, but the credential could not be saved. Pair again after quitting Picot.",
+    "readFailed": "Could not read the host list: {reason}",
+    "switchBlocked": "Could not save your draft, so this window stays on the current host.",
+    "tofuTitleNew": "Trust this new host?",
+    "tofuTitleChanged": "This host's connection changed. Trust it again?",
+    "tofuFingerprint": "Key fingerprint {fingerprint}",
+    "tofuConfirm": "Trust and connect",
+    "status": {
+      "connecting": "Connecting",
+      "online": "Online",
+      "offline": "Offline",
+      "credentialInvalid": "Needs pairing",
+      "saveFailed": "Not saved"
+    },
+    "change": {
+      "daemonKey": "Key: {saved} → {offered}",
+      "relayEndpoint": "Relay: {saved} → {offered}",
+      "useTls": "TLS: {saved} → {offered}"
+    }
+  },
   "sidebar": {
     "loadingSessions": "Loading sessions...",
     "failedToLoadSessions": "Failed to load sessions.",
@@ -841,6 +875,21 @@
         "enableFailed": "Could not enable remote pairing: {reason}",
         "offerFailed": "Could not create a pairing code: {reason}",
         "disableFailed": "Could not turn off remote pairing: {reason}"
+      },
+      "devices": {
+        "title": "Paired devices",
+        "subtitle": "Devices that can reach this Picot through the relay.",
+        "empty": "No devices are paired yet.",
+        "pairedAt": "Paired {time}",
+        "owner": "Owner {owner}",
+        "ownerUnknown": "Owner unknown",
+        "revoke": "Revoke",
+        "revokeCancel": "Cancel",
+        "revokeAction": "Revoke",
+        "revokeConfirm": "Revoke {device}? It loses access right away, and a session it has open now is dropped.",
+        "revoked": "Revoked {device}.",
+        "revokeFailed": "Could not revoke the device: {reason}",
+        "readFailed": "Could not read the paired devices: {reason}"
       }
     },
     "remote": {

@@ -36,7 +36,7 @@ use daemon_client::window_ledger::{route_for_url, LedgerRow, WindowLedger};
 #[cfg(target_os = "macos")]
 use host_client::commands::{
     host_add, host_confirm_tofu, host_grant, host_list, host_release, host_remove, host_retry_save,
-    host_status, relay_device_list,
+    host_status, relay_device_list, relay_revoke_device,
 };
 use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::{child_supervision, window_owner};
@@ -3287,7 +3287,8 @@ fn main() {
             host_grant,
             host_retry_save,
             host_release,
-            relay_device_list
+            relay_device_list,
+            relay_revoke_device
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

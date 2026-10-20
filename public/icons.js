@@ -223,6 +223,12 @@ const ICONS = {
     ["rect", { width: "14", height: "20", x: "5", y: "2", rx: "2", ry: "2" }],
     ["path", { d: "M12 18h.01" }],
   ],
+  server: [
+    ["rect", { width: "20", height: "8", x: "2", y: "2", rx: "2", ry: "2" }],
+    ["rect", { width: "20", height: "8", x: "2", y: "14", rx: "2", ry: "2" }],
+    ["line", { x1: "6", y1: "6", x2: "6.01", y2: "6" }],
+    ["line", { x1: "6", y1: "18", x2: "6.01", y2: "18" }],
+  ],
   shield: [
     [
       "path",

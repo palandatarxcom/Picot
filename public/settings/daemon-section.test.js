@@ -1089,7 +1089,11 @@ describe("locale coverage", () => {
     // The pairDevice subtree has its own coverage suite
     // (pair-device-section.test.js): its keys are excluded on both sides.
     const isDaemonKey = (key) =>
-      key.startsWith(SECTION_KEYS) && !key.startsWith(`${SECTION_KEYS}pairDevice.`);
+      key.startsWith(SECTION_KEYS) &&
+      !key.startsWith(`${SECTION_KEYS}pairDevice.`) &&
+      // The paired-device list lives in the same tab but in its own module and
+      // markup: device-manage.test.js owns its coverage (like pairDevice).
+      !key.startsWith(`${SECTION_KEYS}devices.`);
     const keys = new Set([...requested, ...MARKUP_KEYS].filter(isDaemonKey));
     expect(keys.size).toBeGreaterThan(10);
     for (const key of requested) {

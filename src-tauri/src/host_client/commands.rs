@@ -115,3 +115,18 @@ pub async fn relay_device_list(
         "deviceId":device.get("deviceId"), "pairedAt":device.get("pairedAt"), "owner":device.get("owner")
     })).collect::<Vec<_>>()}))
 }
+
+/// Revoke one paired device (spec §3.4): the daemon drops its tokens and kicks
+/// its live sessions through the host server's one teardown path. Device ids
+/// are the only argument; no token ever crosses this boundary.
+#[tauri::command]
+pub async fn relay_revoke_device(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    device_id: String,
+) -> Result<Value, String> {
+    let link = caller_link(&app, &window)?;
+    link.client()
+        .request("relay.revoke_device", json!({ "deviceId": device_id }))
+        .await
+}

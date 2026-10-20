@@ -5,6 +5,7 @@
 import { t as i18n, onLocaleChange } from "../i18n.js";
 import { bindDialogEscape } from "../ui/dialog-escape.js";
 import { runtimeKey, setupDaemonRuntimes } from "./daemon-runtimes.js";
+import { setupDeviceManage } from "./device-manage.js";
 import { setupPairDeviceSection } from "./pair-device-section.js";
 
 /**
@@ -171,6 +172,9 @@ export function setupDaemonSection({
   // §3.2): its lifecycle and poll are this section's, so its reads ride
   // refreshAll and its leave rides this section's leave.
   const pairDevice = setupPairDeviceSection({ root, t });
+  // The paired-device list is the same page's mirror view (relay Phase 2.5
+  // §3.4): who this daemon lets in, read from the local admin surface.
+  const devices = setupDeviceManage({ root, t });
 
   function setNotice(message) {
     if (!message) {
@@ -257,6 +261,7 @@ export function setupDaemonSection({
     const fresh = await refresh();
     if (!active || visit !== activation) return;
     await pairDevice.refresh(fresh);
+    if (active && visit === activation) await devices.refresh();
   }
 
   function stopPolling() {
@@ -517,6 +522,7 @@ export function setupDaemonSection({
       refreshRound++;
       runtimes.invalidate();
       pairDevice.leave();
+      devices.leave();
       stopPolling();
       closeConfirm();
       closeStopConfirm();

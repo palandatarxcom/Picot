@@ -247,4 +247,34 @@ describe("settings page split", () => {
       expect(messages.settings.models.title.trim()).not.toBe("");
     }
   });
+
+  test("puts the host picker in the sidebar footer beside Settings", () => {
+    const dom = new JSDOM(html, { url: "http://localhost" });
+    const { document } = dom.window;
+    const row = document.querySelector(".sidebar-settings-row");
+    const hostBtn = document.getElementById("host-switcher-btn");
+    const picker = document.getElementById("host-picker");
+
+    expect(hostBtn).not.toBeNull();
+    // Host button left of the Settings button (spec §3.1: 设置按钮旁).
+    expect(row.children[0]).toBe(hostBtn);
+    expect(hostBtn.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(picker).not.toBeNull();
+    expect(picker.classList.contains("hidden")).toBe(true);
+    // Local row is not markup: it is the picker's fixed first row.
+    expect(picker.querySelector("#host-picker-list")).not.toBeNull();
+    expect(appJs).toContain("setupHostSwitcher({ flush: flushDraftNow })");
+  });
+
+  test("keeps the paired-device list in the Daemon tab next to pairing", () => {
+    const dom = new JSDOM(html, { url: "http://localhost" });
+    const { document } = dom.window;
+    const panel = document.querySelector('[data-settings-panel="daemon"]');
+
+    expect(panel.querySelector("#setting-paired-devices")).not.toBeNull();
+    expect(panel.querySelector("#device-manage-list")).not.toBeNull();
+    expect(panel.querySelector("#device-revoke-confirm")).not.toBeNull();
+    // Same tab as the pair block: two sides of one relationship.
+    expect(panel.querySelector("#setting-pair-device")).not.toBeNull();
+  });
 });

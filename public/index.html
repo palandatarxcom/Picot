@@ -221,7 +221,100 @@
           </div>
         </div>
         <div class="sidebar-footer">
+          <!-- Host picker (relay spec §3.1): local fixed first, saved remote
+               hosts below, add-host with its TOFU question inline. -->
+          <div
+            class="host-picker hidden"
+            id="host-picker"
+            role="dialog"
+            aria-label="Hosts"
+            data-i18n-aria-label="hostPicker.title"
+          >
+            <div class="host-picker-title" data-i18n="hostPicker.title">Hosts</div>
+            <div class="host-picker-list" id="host-picker-list"></div>
+            <p class="settings-help hidden" id="host-picker-notice" role="status"></p>
+            <div class="daemon-confirm hidden" id="host-remove-confirm">
+              <p class="settings-help" id="host-remove-confirm-text"></p>
+              <div class="daemon-confirm-actions">
+                <button
+                  type="button"
+                  class="settings-value-btn"
+                  id="btn-host-remove-cancel"
+                  data-i18n="actions.cancel"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="settings-value-btn is-danger"
+                  id="btn-host-remove-confirm"
+                  data-i18n="hostPicker.removeAction"
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+            <div class="daemon-confirm hidden" id="host-tofu">
+              <span class="settings-label-main" id="host-tofu-title"></span>
+              <p class="settings-help" id="host-tofu-fingerprint"></p>
+              <div class="host-tofu-changes" id="host-tofu-changes"></div>
+              <div class="daemon-confirm-actions">
+                <button
+                  type="button"
+                  class="settings-value-btn"
+                  id="btn-host-tofu-cancel"
+                  data-i18n="actions.cancel"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="settings-value-btn is-primary"
+                  id="btn-host-tofu-confirm"
+                  data-i18n="hostPicker.tofuConfirm"
+                >
+                  Trust and connect
+                </button>
+              </div>
+            </div>
+            <form class="host-picker-add hidden" id="host-add-form">
+              <input
+                id="host-add-url"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                data-i18n-ph="hostPicker.addPlaceholder"
+              />
+              <button
+                type="submit"
+                class="settings-value-btn is-primary"
+                id="host-add-submit"
+                data-i18n="hostPicker.addSubmit"
+              >
+                Add
+              </button>
+            </form>
+            <button
+              type="button"
+              class="host-picker-add-btn"
+              id="host-add-btn"
+              data-i18n="hostPicker.add"
+            >
+              Add host
+            </button>
+          </div>
           <div class="sidebar-settings-row">
+            <button
+              class="sidebar-settings-btn sidebar-host-btn hidden"
+              id="host-switcher-btn"
+              title="Hosts"
+              aria-label="Hosts"
+              aria-haspopup="dialog"
+              data-i18n-title="hostPicker.title"
+              data-i18n-aria-label="hostPicker.title"
+            >
+              <span id="host-switcher-label">This Mac</span>
+            </button>
             <button
               class="sidebar-settings-btn"
               id="settings-btn"
@@ -1522,6 +1615,54 @@
                   >
                     Treat the pairing code like a password.
                   </p>
+                </div>
+              </div>
+              <!-- Paired devices (spec §3.4): who this daemon lets in, the
+                   mirror of the sidebar picker's "who this Mac connects to". -->
+              <div class="settings-row" id="setting-paired-devices">
+                <span class="settings-label settings-label-stack">
+                  <span
+                    class="settings-label-main"
+                    data-i18n="settings.daemon.devices.title"
+                    >Paired devices</span
+                  >
+                  <span
+                    class="settings-label-sub"
+                    data-i18n="settings.daemon.devices.subtitle"
+                    >Devices that can reach this Picot through the relay.</span
+                  >
+                </span>
+              </div>
+              <p
+                class="settings-help hidden"
+                id="device-manage-notice"
+                aria-live="polite"
+              ></p>
+              <div class="device-manage-list" id="device-manage-list"></div>
+              <div
+                class="pkg-manager-empty"
+                id="device-manage-empty"
+                data-i18n="settings.daemon.devices.empty"
+              >
+                No devices are paired yet.
+              </div>
+              <div class="daemon-confirm" id="device-revoke-confirm" hidden>
+                <p class="settings-help" id="device-revoke-confirm-text"></p>
+                <div class="daemon-confirm-actions">
+                  <button
+                    class="settings-value-btn"
+                    id="btn-device-revoke-cancel"
+                    data-i18n="settings.daemon.devices.revokeCancel"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    class="settings-value-btn is-danger"
+                    id="btn-device-revoke-confirm"
+                    data-i18n="settings.daemon.devices.revokeAction"
+                  >
+                    Revoke
+                  </button>
                 </div>
               </div>
             </div>

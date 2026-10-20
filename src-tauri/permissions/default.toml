@@ -89,6 +89,11 @@ identifier = "allow-relay-device-list"
 description = "Read safe paired-device fields from the local daemon"
 commands.allow = ["relay_device_list"]
 
+[[permission]]
+identifier = "allow-relay-revoke-device"
+description = "Revoke one paired device and drop its live sessions (Settings → General → Daemon → Paired devices)"
+commands.allow = ["relay_revoke_device"]
+
 # Permission set that bundles all custom command permissions.
 # Referenced from capabilities/default.json as "pi-desktop:default".
 [default]
@@ -110,4 +115,5 @@ permissions = [
   "allow-host-retry-save",
   "allow-host-release",
   "allow-relay-device-list",
+  "allow-relay-revoke-device",
 ]

@@ -601,6 +601,40 @@
       "action": "打开模型设置"
     }
   },
+  "hostPicker": {
+    "title": "主机",
+    "local": "此 Mac",
+    "remove": "删除",
+    "removeAction": "删除",
+    "removeConfirm": "从此 Mac 删除 {host}？远端主机仍然认这台设备，需要它的 owner 在远端撤销。",
+    "removed": "已删除 {host}。",
+    "removeFailed": "无法删除主机：{reason}",
+    "add": "添加主机",
+    "addPlaceholder": "粘贴主机的连接 offer",
+    "addSubmit": "添加",
+    "added": "已连接 {host}。",
+    "addFailed": "无法添加主机：{reason}",
+    "cancelled": "已取消。",
+    "saveFailed": "已配对，但凭据未能保存。退出 Picot 后需要重新配对。",
+    "readFailed": "无法读取主机列表：{reason}",
+    "switchBlocked": "草稿未能保存，此窗口仍留在当前主机。",
+    "tofuTitleNew": "信任这台新主机？",
+    "tofuTitleChanged": "这台主机的连接信息已变更。再次信任？",
+    "tofuFingerprint": "密钥指纹 {fingerprint}",
+    "tofuConfirm": "信任并连接",
+    "status": {
+      "connecting": "连接中",
+      "online": "在线",
+      "offline": "离线",
+      "credentialInvalid": "需重新配对",
+      "saveFailed": "未保存"
+    },
+    "change": {
+      "daemonKey": "密钥：{saved} → {offered}",
+      "relayEndpoint": "中继：{saved} → {offered}",
+      "useTls": "TLS：{saved} → {offered}"
+    }
+  },
   "sidebar": {
     "loadingSessions": "正在加载会话...",
     "failedToLoadSessions": "加载会话失败。",
@@ -841,6 +875,21 @@
         "enableFailed": "无法启用远程配对：{reason}",
         "offerFailed": "无法生成配对码：{reason}",
         "disableFailed": "无法停用远程配对：{reason}"
+      },
+      "devices": {
+        "title": "已配对设备",
+        "subtitle": "可通过中继访问此 Picot 的设备。",
+        "empty": "尚无已配对设备。",
+        "pairedAt": "配对时间 {time}",
+        "owner": "所属 owner {owner}",
+        "ownerUnknown": "所属 owner 未知",
+        "revoke": "撤销",
+        "revokeCancel": "取消",
+        "revokeAction": "撤销",
+        "revokeConfirm": "撤销 {device}？它将立即失去访问权限；若它当前有活跃会话，该会话会被断开。",
+        "revoked": "已撤销 {device}。",
+        "revokeFailed": "无法撤销该设备：{reason}",
+        "readFailed": "无法读取已配对设备：{reason}"
       }
     },
     "remote": {

@@ -51,6 +51,7 @@ import {
 import { FilePreviewPanel } from "./file-preview-panel.js";
 import { GitClient } from "./git-client.js";
 import { GitPanel } from "./git-panel.js";
+import { setupHostSwitcher } from "./host-switcher.js";
 import {
   getLanguagePreference,
   initI18n,
@@ -8150,6 +8151,11 @@ const piPathToggle = setupPiPathToggle({
 const daemonSection = setupDaemonSection({
   loadWorkspaceSessions: (workspaceId) => transport.workspaceSessions(workspaceId),
 });
+
+// Sidebar host picker (relay Phase 2.5 §3.1). The window's host is its URL, so
+// a pick is a whole-window reload: unsent input flushes first (the quit path's
+// own flush) and the window's bridge grant is released before navigating.
+setupHostSwitcher({ flush: flushDraftNow });
 
 ({ loadInlineConfigEditor, loadAgentsMdEditor, loadAppendSystemMdEditor } = setupSettingsConfig({
   configGateway,
