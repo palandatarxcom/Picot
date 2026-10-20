@@ -111,12 +111,22 @@ pub fn test_certificate() -> TestCertificate {
 pub struct TlsMockRelay {
     addr: std::net::SocketAddr,
     upgrades: Arc<AtomicU32>,
+    plaintext_dials: Arc<AtomicU32>,
 }
 
 #[allow(dead_code)] // shared support: per-target subset usage
 impl TlsMockRelay {
     /// Bind an ephemeral loopback TLS port serving the control contract.
     pub async fn start(cert: &TestCertificate) -> TlsMockRelay {
+        Self::start_role(cert, false).await
+    }
+
+    /// Same TLS listener, answering the client-role E2EE handshake instead of sync.
+    pub async fn start_client(cert: &TestCertificate) -> TlsMockRelay {
+        Self::start_role(cert, true).await
+    }
+
+    async fn start_role(cert: &TestCertificate, client_role: bool) -> TlsMockRelay {
         let identity = native_tls::Identity::from_pkcs8(
             cert.server_pem.as_bytes(),
             cert.server_key_pem.as_bytes(),
@@ -131,6 +141,8 @@ impl TlsMockRelay {
         let addr = listener.local_addr().expect("TLS mock relay port");
         let upgrades = Arc::new(AtomicU32::new(0));
         let counter = Arc::clone(&upgrades);
+        let plaintext_dials = Arc::new(AtomicU32::new(0));
+        let plaintext = plaintext_dials.clone();
         tokio::spawn(async move {
             loop {
                 // Serial by design: the daemon holds one control socket, and
@@ -139,6 +151,16 @@ impl TlsMockRelay {
                 let Ok((tcp, _)) = listener.accept().await else {
                     return;
                 };
+                // A WS downgrade starts with GET, not a TLS handshake record.
+                let mut first = [0];
+                if matches!(
+                    tokio::time::timeout(Duration::from_secs(2), tcp.peek(&mut first)).await,
+                    Ok(Ok(1))
+                ) && first[0] == b'G'
+                {
+                    plaintext.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     continue;
                 };
@@ -146,10 +168,22 @@ impl TlsMockRelay {
                     continue;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
-                let sync = "{\"type\":\"sync\",\"connectionIds\":[]}";
+                let initial = if client_role {
+                    let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(hello)))) =
+                        tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+                    else {
+                        continue;
+                    };
+                    let hello: serde_json::Value =
+                        serde_json::from_str(&hello).expect("client E2EE hello");
+                    assert_eq!(hello["type"], "e2ee_hello");
+                    "{\"type\":\"e2ee_ready\"}"
+                } else {
+                    "{\"type\":\"sync\",\"connectionIds\":[]}"
+                };
                 if socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
-                        sync.to_string(),
+                        initial.to_string(),
                     ))
                     .await
                     .is_err()
@@ -161,7 +195,11 @@ impl TlsMockRelay {
                 while let Some(Ok(_)) = socket.next().await {}
             }
         });
-        TlsMockRelay { addr, upgrades }
+        TlsMockRelay {
+            addr,
+            upgrades,
+            plaintext_dials,
+        }
     }
 
     pub fn addr(&self) -> std::net::SocketAddr {
@@ -171,6 +209,11 @@ impl TlsMockRelay {
     /// Completed WS upgrades over TLS — a rejected TLS handshake never counts.
     pub fn control_upgrades(&self) -> u32 {
         self.upgrades.load(Ordering::SeqCst)
+    }
+
+    /// Plaintext WS upgrade attempts made against this TLS-only endpoint.
+    pub fn plaintext_dials(&self) -> u32 {
+        self.plaintext_dials.load(Ordering::SeqCst)
     }
 }
 use axum::extract::{Query, State};
@@ -203,9 +246,11 @@ pub enum SilentMode {
 pub struct MockRelay {
     inner: Arc<Inner>,
     addr: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<()>,
 }
 
 struct Inner {
+    shutdown: watch::Sender<bool>,
     gate_open: Mutex<bool>,
     silent: Mutex<Option<SilentMode>>,
     /// Park client-role sockets after registration: never reading them means
@@ -228,7 +273,13 @@ struct Inner {
 impl MockRelay {
     /// Bind an ephemeral loopback port and serve the mock relay.
     pub async fn start() -> MockRelay {
+        Self::start_at((std::net::Ipv4Addr::LOCALHOST, 0).into()).await
+    }
+
+    /// Restart tests rebind the exact endpoint clients already know.
+    pub async fn start_at(addr: std::net::SocketAddr) -> MockRelay {
         let inner = Arc::new(Inner {
+            shutdown: watch::channel(false).0,
             gate_open: Mutex::new(true),
             silent: Mutex::new(None),
             client_park: watch::channel(false).0,
@@ -244,14 +295,21 @@ impl MockRelay {
             .route("/health", get(health))
             .route("/ws", get(ws_upgrade))
             .with_state(inner.clone());
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
             .expect("bind mock relay");
         let addr = listener.local_addr().expect("mock relay port");
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock relay serve");
         });
-        MockRelay { inner, addr }
+        MockRelay { inner, addr, task }
+    }
+
+    /// Drop the listener and sever established pipes, not merely control.
+    pub async fn stop(self) {
+        self.inner.shutdown.send_replace(true);
+        self.task.abort();
+        let _ = self.task.await;
     }
 
     pub fn addr(&self) -> std::net::SocketAddr {
@@ -491,6 +549,7 @@ async fn ws_upgrade(
 }
 
 async fn control_socket(inner: Arc<Inner>, socket: WebSocket) {
+    let mut stopped = inner.shutdown.subscribe();
     inner.control_upgrades.fetch_add(1, Ordering::SeqCst);
     if !*inner.gate_open.lock().unwrap() {
         // Close at once: dial success + immediate drop is the reconnect-cycle
@@ -513,7 +572,11 @@ async fn control_socket(inner: Arc<Inner>, socket: WebSocket) {
         }
     }
     if silent.is_some() {
-        park((sink, stream)).await;
+        tokio::select! {
+            _ = park((sink, stream)) => {},
+            _ = stopped.wait_for(|stop| *stop) => {},
+        }
+        return;
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     *inner.control.lock().unwrap() = Some(tx);
@@ -526,12 +589,16 @@ async fn control_socket(inner: Arc<Inner>, socket: WebSocket) {
     });
     // Pump reads: axum answers the daemon's WS pings while the socket is polled.
     let mut read = stream;
-    while let Some(Ok(_)) = read.next().await {}
+    while let Some(Ok(_)) = tokio::select! {
+        _ = stopped.wait_for(|stop| *stop) => None,
+        frame = read.next() => frame,
+    } {}
     writer.abort();
     inner.control.lock().unwrap().take();
 }
 
 async fn client_socket(inner: Arc<Inner>, socket: WebSocket) {
+    let mut stopped = inner.shutdown.subscribe();
     let mut parked = inner.client_park.subscribe();
     inner.client_upgrades.fetch_add(1, Ordering::SeqCst);
     let id = format!("c-{}", inner.next_id.fetch_add(1, Ordering::SeqCst) + 1);
@@ -548,6 +615,7 @@ async fn client_socket(inner: Arc<Inner>, socket: WebSocket) {
     loop {
         // Stop polling before tungstenite can queue an automatic pong.
         let message = tokio::select! {
+            _ = stopped.wait_for(|stop| *stop) => break,
             _ = parked.changed() => continue,
             message = stream.next(), if !*parked.borrow() => message,
         };
@@ -570,6 +638,7 @@ async fn client_socket(inner: Arc<Inner>, socket: WebSocket) {
 }
 
 async fn data_socket(inner: Arc<Inner>, connection_id: String, socket: WebSocket) {
+    let mut stopped = inner.shutdown.subscribe();
     let client = inner.clients.lock().unwrap().get(&connection_id).cloned();
     let Some(client) = client else {
         // The client vanished between `connected` and this dial.
@@ -591,7 +660,10 @@ async fn data_socket(inner: Arc<Inner>, connection_id: String, socket: WebSocket
     // shortcut: a loop blocked on a stalled peer cannot observe the daemon
     // closing the socket; eviction tests assert daemon-side close, not mock
     // cleanup (the stuck task dies with the test runtime).
-    while let Some(Ok(message)) = stream.next().await {
+    while let Some(Ok(message)) = tokio::select! {
+        _ = stopped.wait_for(|stop| *stop) => None,
+        frame = stream.next() => frame,
+    } {
         if client.send(message).await.is_err() {
             break;
         }
