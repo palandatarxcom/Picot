@@ -13,6 +13,8 @@ mod tauri_app_surface;
 // navigation mirror it feeds, the surface pump, and the blocked-instance policy.
 // Wired into startup by T5; T10 exposes it through the admin commands.
 mod daemon_client;
+#[cfg(target_os = "macos")]
+mod host_client;
 
 use daemon_client::admin_client::{AdminClient, SurfaceExecutor};
 use daemon_client::commands::{
@@ -31,6 +33,11 @@ use daemon_client::restart::{
 use daemon_client::startup_failure::StartupFailure;
 use daemon_client::surface_ops::ForwardedSurfaceOps;
 use daemon_client::window_ledger::{route_for_url, LedgerRow, WindowLedger};
+#[cfg(target_os = "macos")]
+use host_client::commands::{
+    host_add, host_confirm_tofu, host_grant, host_list, host_release, host_remove, host_retry_save,
+    host_status, relay_device_list,
+};
 use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::{child_supervision, window_owner};
 
@@ -2015,6 +2022,9 @@ fn setup_daemon_runtime(
     // Per-window focus stamps (multi-window §7): the notification-click route
     // ranks candidate windows by most-recently-focused.
     app.manage(FocusTimes::new());
+    app.manage(host_client::HostClientState(host_client::HostClient::load(
+        picot_host::relay::host_store::hosts_path(&config_dir),
+    )));
     // The app's navigation/authorization image and the pump that executes
     // forwarded surface ops.
     let mirror = Arc::new(NavigationMirror::new());
@@ -3229,6 +3239,17 @@ fn main() {
             }
             tauri::WindowEvent::Destroyed => {
                 handle_window_destroyed(window);
+                if let Some(state) = window.try_state::<host_client::HostClientState>() {
+                    if let Ok(client) = &state.0 {
+                        // Sync registry revoke first (contract 3), async join after.
+                        client.revoke_window_now(window.label());
+                        let client = client.clone();
+                        let label = window.label().to_owned();
+                        tauri::async_runtime::spawn(async move {
+                            client.close_window(&label).await;
+                        });
+                    }
+                }
             }
             tauri::WindowEvent::Focused(true) => {
                 // The §7 focus stamp: which window was looked at last decides
@@ -3257,7 +3278,16 @@ fn main() {
             daemon_agent_stop,
             relay_status,
             relay_set_enabled,
-            relay_offer
+            relay_offer,
+            host_list,
+            host_add,
+            host_confirm_tofu,
+            host_remove,
+            host_status,
+            host_grant,
+            host_retry_save,
+            host_release,
+            relay_device_list
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -3468,6 +3498,11 @@ fn run_app_exit_flow(app_handle: &AppHandle) {
 /// One shutdown, whatever the trigger. A boot failure (no `DaemonLink`) still
 /// clears the pi runtime registry, exactly as the pre-T8 exit path did.
 fn run_shutdown(app_handle: &AppHandle) {
+    if let Some(state) = app_handle.try_state::<host_client::HostClientState>() {
+        if let Ok(client) = &state.0 {
+            tauri::async_runtime::block_on(client.shutdown());
+        }
+    }
     match app_handle.try_state::<DaemonLink>() {
         Some(link) => log::info!("[picot] app exit resolved: {:?}", link.shutdown()),
         None => child_supervision::clear_registry(),

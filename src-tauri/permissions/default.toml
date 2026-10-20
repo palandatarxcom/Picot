@@ -44,6 +44,51 @@ identifier = "allow-relay-offer"
 description = "Allow minting a one-scan relay pairing offer (Settings → General → Daemon → Pair Device)"
 commands.allow = ["relay_offer"]
 
+[[permission]]
+identifier = "allow-host-list"
+description = "List saved remote host profiles without credentials"
+commands.allow = ["host_list"]
+
+[[permission]]
+identifier = "allow-host-add"
+description = "Stage a pasted remote host offer for TOFU confirmation"
+commands.allow = ["host_add"]
+
+[[permission]]
+identifier = "allow-host-confirm-tofu"
+description = "Answer the calling window's pending host trust question"
+commands.allow = ["host_confirm_tofu"]
+
+[[permission]]
+identifier = "allow-host-remove"
+description = "Cancel and delete a local remote host profile"
+commands.allow = ["host_remove"]
+
+[[permission]]
+identifier = "allow-host-status"
+description = "Read remote host connection and save-recovery status"
+commands.allow = ["host_status"]
+
+[[permission]]
+identifier = "allow-host-grant"
+description = "Mint a host grant bound to the injected calling window"
+commands.allow = ["host_grant"]
+
+[[permission]]
+identifier = "allow-host-retry-save"
+description = "Retry saving an authenticated in-memory pairing candidate"
+commands.allow = ["host_retry_save"]
+
+[[permission]]
+identifier = "allow-host-release"
+description = "Release the calling window's host references before reload navigation"
+commands.allow = ["host_release"]
+
+[[permission]]
+identifier = "allow-relay-device-list"
+description = "Read safe paired-device fields from the local daemon"
+commands.allow = ["relay_device_list"]
+
 # Permission set that bundles all custom command permissions.
 # Referenced from capabilities/default.json as "pi-desktop:default".
 [default]
@@ -56,4 +101,13 @@ permissions = [
   "allow-relay-status",
   "allow-relay-set-enabled",
   "allow-relay-offer",
+  "allow-host-list",
+  "allow-host-add",
+  "allow-host-confirm-tofu",
+  "allow-host-remove",
+  "allow-host-status",
+  "allow-host-grant",
+  "allow-host-retry-save",
+  "allow-host-release",
+  "allow-relay-device-list",
 ]

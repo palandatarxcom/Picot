@@ -1196,6 +1196,11 @@ async fn run_op_inner(
                 "serverId": status.server_id,
             }))
         }
+        // Local admin read only; no token/hash or fabricated last-active field.
+        "relay.device_list" => {
+            let devices = state.metadata.lock().unwrap().paired_devices()?;
+            Ok(json!({ "devices": devices }))
+        }
         "relay.offer" => {
             require_lease(inner, conn_id)?;
             // The minting owner (Gate B, spec §2.8): the settings window the

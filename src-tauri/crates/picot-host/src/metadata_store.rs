@@ -805,6 +805,24 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Local admin projection only: credentials and hashes are never selected.
+    pub fn paired_devices(&self) -> Result<Vec<serde_json::Value>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT device_id, paired_at, owner_id FROM paired_devices WHERE revoked_at IS NULL ORDER BY paired_at, device_id",
+        ).map_err(|error| format!("Cannot list paired devices: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "deviceId": row.get::<_, String>(0)?,
+                    "pairedAt": row.get::<_, i64>(1)?,
+                    "owner": row.get::<_, Option<String>>(2)?,
+                }))
+            })
+            .map_err(|error| format!("Cannot list paired devices: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Cannot read paired devices: {error}"))
+    }
+
     pub fn verify_device_token(&self, token: &str) -> Result<bool, String> {
         let token_hash = token_hash(token);
         self.connection

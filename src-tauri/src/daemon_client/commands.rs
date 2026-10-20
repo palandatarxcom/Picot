@@ -233,7 +233,7 @@ fn caller_owner(app: &AppHandle, window: &tauri::WebviewWindow) -> Result<String
 /// Validate the caller against the two injected states and hand back the
 /// daemon link. Every command starts here; none of them trusts an argument for
 /// its own identity.
-fn caller_link<'a>(
+pub(crate) fn caller_link<'a>(
     app: &'a AppHandle,
     window: &tauri::WebviewWindow,
 ) -> Result<tauri::State<'a, DaemonLink>, String> {

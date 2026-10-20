@@ -1834,3 +1834,37 @@ async fn agent_stop_stops_exactly_the_matching_runtime() {
     assert_eq!(agents[0]["instanceId"], "i2");
     fixture.state.shutdown_graceful("test").await;
 }
+
+#[tokio::test]
+async fn relay_device_list_exposes_only_safe_fields_and_omits_revoked() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let fixture = Fixture::boot(MIRROR_ACK_TIMEOUT).await;
+        let (mut socket, _) = fixture.attach().await;
+        {
+            let mut metadata = fixture.state.metadata.lock().unwrap();
+            metadata
+                .store_device_token("device-live", "never-return-this-token", Some("owner-safe"))
+                .unwrap();
+            metadata
+                .store_device_token("device-revoked", "revoked-secret", None)
+                .unwrap();
+            metadata.revoke_device("device-revoked").unwrap();
+        }
+        let response = request(&mut socket, "device-list", "relay.device_list", json!({})).await;
+        assert_eq!(response["ok"], true, "{response}");
+        let devices = response["result"]["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 1);
+        let row = devices[0].as_object().unwrap();
+        assert_eq!(
+            row.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["deviceId", "owner", "pairedAt"]
+        );
+        assert_eq!(row["deviceId"], "device-live");
+        assert_eq!(row["owner"], "owner-safe");
+        assert!(row["pairedAt"].as_i64().unwrap() > 0);
+        assert!(!response.to_string().contains("token"));
+        fixture.state.shutdown_graceful("device list test").await;
+    })
+    .await
+    .expect("device list deadline");
+}

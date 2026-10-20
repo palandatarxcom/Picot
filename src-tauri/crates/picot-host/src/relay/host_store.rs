@@ -309,6 +309,24 @@ impl HostStore {
         Ok(true)
     }
 
+    /// Explicit remote rejection clears the bearer but keeps the trust anchors.
+    pub fn clear_token(&self, server_id: &str) -> Result<(), StoreError> {
+        let mut document = self.lock();
+        let Some(index) = document
+            .hosts
+            .iter()
+            .position(|host| host.profile.server_id == server_id && host.device_token.is_some())
+        else {
+            return Ok(());
+        };
+        let mut next = document.clone();
+        next.hosts[index].device_token = None;
+        next.hosts[index].generation += 1;
+        self.write(&next)?;
+        *document = next;
+        Ok(())
+    }
+
     /// Generation-checked replace, then publish. `expected` is `None` when the
     /// host must not exist yet (a first pairing).
     fn commit_profile(
