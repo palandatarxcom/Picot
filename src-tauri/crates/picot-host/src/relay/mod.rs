@@ -13,12 +13,17 @@
 //! - [`client_role`] — the desktop client's outbound role=client socket:
 //!   dial, E2EE client handshake, bounded frames, redial, half-open.
 //! - [`controller`] — enablement lifecycle, status view, pairing-offer ops.
+//! - [`host_store`] — the desktop client's host profiles and device tokens:
+//!   0600 JSON, fail-closed corruption, staged generation-guarded commits.
+//! - [`host_tofu`] — trust-on-first-use decisions and the key fingerprint.
 //! - [`pairing`] — pairing offer payload and `#offer=` fragment URL codec.
 //! - [`transport`] — control/data sockets, reconnect backoff, sync reconcile.
 
 pub mod client_role;
 pub mod controller;
 pub mod e2ee;
+pub mod host_store;
+pub mod host_tofu;
 pub mod pairing;
 pub mod smoke_client;
 pub mod transport;
