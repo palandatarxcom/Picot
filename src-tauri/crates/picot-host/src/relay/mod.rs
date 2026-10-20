@@ -16,12 +16,14 @@
 //! - [`host_store`] — the desktop client's host profiles and device tokens:
 //!   0600 JSON, fail-closed corruption, staged generation-guarded commits.
 //! - [`host_tofu`] — trust-on-first-use decisions and the key fingerprint.
+//! - [`host_bridge`] — per-host loopback WS grants, hello/ack boundary and window refs.
 //! - [`pairing`] — pairing offer payload and `#offer=` fragment URL codec.
 //! - [`transport`] — control/data sockets, reconnect backoff, sync reconcile.
 
 pub mod client_role;
 pub mod controller;
 pub mod e2ee;
+pub mod host_bridge;
 pub mod host_store;
 pub mod host_tofu;
 pub mod pairing;
