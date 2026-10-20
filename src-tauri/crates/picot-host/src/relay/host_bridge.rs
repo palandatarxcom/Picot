@@ -62,6 +62,7 @@ pub enum HostBridgeStatus {
     Offline,
     SaveFailed,
     CredentialInvalid,
+    PairingFailed,
     Stopped,
 }
 
@@ -106,6 +107,7 @@ impl Shared {
                 *current,
                 HostBridgeStatus::SaveFailed
                     | HostBridgeStatus::CredentialInvalid
+                    | HostBridgeStatus::PairingFailed
                     | HostBridgeStatus::Stopped
             ) {
                 return false;
@@ -155,6 +157,12 @@ impl HostBridgeHandle {
     pub async fn stop(self) {
         self.shared.shutdown.send_replace(true);
         let _ = self.task.await;
+    }
+    /// Test seam (`test-seams`, same posture as `DaemonIdentity::for_tests`): force a
+    /// terminal status so app-side reactions to bridge states need no live relay.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn force_status_for_tests(&self, status: HostBridgeStatus) {
+        self.shared.status.send_replace(status);
     }
 }
 
@@ -412,7 +420,9 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
         let mut auth = shared.auth.lock().unwrap();
         if matches!(
             *shared.status.borrow(),
-            HostBridgeStatus::SaveFailed | HostBridgeStatus::CredentialInvalid
+            HostBridgeStatus::SaveFailed
+                | HostBridgeStatus::CredentialInvalid
+                | HostBridgeStatus::PairingFailed
         ) {
             return;
         }
@@ -468,8 +478,13 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
             return;
         }
         // Only the first response is interpreted. All later business frames are opaque.
+        // Bounded by the same seam as the app hello: a peer that swallows hello must not
+        // pin this proxy (and `auth.pairing_busy`) forever; timeout ends as a failure.
+        let deadline = tokio::time::sleep(shared.seams.first_frame_timeout);
+        tokio::pin!(deadline);
         let ack = loop {
             tokio::select! {
+                _ = &mut deadline => return,
                 frame = frames.recv() => { let Some(ack) = frame else { return; }; break ack; },
                 frame = reader.next() => match frame {
                     Some(Ok(Message::Ping(bytes))) => { if out.try_send(Message::Pong(bytes)).is_err() { return; } },
@@ -479,8 +494,18 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
             }
         };
         let Ok(mut fields) = serde_json::from_str::<Fields>(&ack) else {
+            if pairing {
+                shared.set_status(HostBridgeStatus::PairingFailed);
+            }
             return;
         };
+        let is_ack = string_field(&fields, "type").as_deref() == Some("hello_ack");
+        if pairing && !is_ack {
+            // Terminal: the single-use offer was refused (expired/used). Re-sending the
+            // same token would loop, so no retry — only a new candidate bridge clears this.
+            shared.set_status(HostBridgeStatus::PairingFailed);
+            return;
+        }
         if fields
             .get("error")
             .and_then(|raw| serde_json::from_str::<Fields>(raw.get()).ok())
@@ -490,12 +515,8 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
         {
             shared.set_status(HostBridgeStatus::CredentialInvalid);
         }
-        let is_ack = string_field(&fields, "type").as_deref() == Some("hello_ack");
         let token = fields.remove("deviceToken");
         if pairing {
-            if !is_ack {
-                return;
-            }
             let Some(token) = token
                 .as_ref()
                 .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())

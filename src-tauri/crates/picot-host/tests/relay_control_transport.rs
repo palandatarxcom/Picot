@@ -186,7 +186,9 @@ async fn encrypted_client(
 ) -> (MockClientSocket, [u8; 32]) {
     let before = relay.data_dials().len();
     let mut client = relay.connect_client().await;
-    for _ in 0..400 {
+    // Load-tolerant budget: the whole workspace suite runs in parallel and the
+    // daemon's dial can queue behind it. 30s stays bounded but no longer flakes.
+    for _ in 0..1200 {
         if relay.data_dials().len() > before {
             let shared = e2ee_client::handshake(&mut client, daemon_public_key_b64).await;
             return (client, shared);

@@ -578,3 +578,98 @@ async fn explicit_auth_rejection_before_transport_close_wins_over_generic_offlin
         }
     }).await.expect("terminal auth frame deadline");
 }
+
+#[tokio::test]
+async fn pairing_ack_deadline_abandons_the_exchange_and_frees_the_pairing_slot() {
+    tokio::time::timeout(BUDGET, async {
+        let saved = Arc::new(Saved {
+            tokens: Mutex::new(vec![]),
+            fail: false,
+        });
+        let r = rig(
+            Credential::Pairing {
+                pairing_token: DeviceToken::new("offer-secret"),
+                device_id: "stable-id".into(),
+            },
+            Some(saved.clone()),
+        )
+        .await;
+        let mut seen = vec![];
+        let mut a = dial(&r.bridge, Some(ORIGIN)).await;
+        send(&mut a, &hello("w1")).await;
+        let mut p = peer(&r, &mut seen).await;
+        let exchanged: Value = serde_json::from_str(&p.recv().await).unwrap();
+        assert_eq!(exchanged["pairingToken"], "offer-secret");
+        // Peer swallows hello: no ack, no error, no close. The bridge must give up on
+        // its own budget (BridgeSeams::first_frame_timeout) and close the proxy socket.
+        let started = tokio::time::Instant::now();
+        closed(&mut a).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "ack wait is bounded by first_frame_timeout"
+        );
+        // pairing_busy released: the next window is an ordinary attempt, not "busy".
+        let mut b = dial(&r.bridge, Some(ORIGIN)).await;
+        send(&mut b, &hello("w2")).await;
+        let mut q = peer(&r, &mut seen).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&q.recv().await).unwrap()["pairingToken"],
+            "offer-secret"
+        );
+        q.send(r#"{"type":"hello_ack","deviceToken":"minted-secret"}"#)
+            .await;
+        assert!(!recv(&mut b).await.contains("minted-secret"));
+        assert_eq!(saved.tokens.lock().unwrap().len(), 1);
+        assert_eq!(*r.bridge.status.borrow(), HostBridgeStatus::Online);
+        r.bridge.stop().await;
+    })
+    .await
+    .expect("pairing ack deadline test deadline");
+}
+
+#[tokio::test]
+async fn pairing_rejection_is_terminal_and_never_replays_the_spent_token() {
+    tokio::time::timeout(BUDGET, async {
+        let saved = Arc::new(Saved {
+            tokens: Mutex::new(vec![]),
+            fail: false,
+        });
+        let r = rig(
+            Credential::Pairing {
+                pairing_token: DeviceToken::new("offer-secret"),
+                device_id: "stable-id".into(),
+            },
+            Some(saved.clone()),
+        )
+        .await;
+        let mut seen = vec![];
+        let mut a = dial(&r.bridge, Some(ORIGIN)).await;
+        send(&mut a, &hello("w1")).await;
+        let mut p = peer(&r, &mut seen).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&p.recv().await).unwrap()["pairingToken"],
+            "offer-secret"
+        );
+        p.send("{\"type\":\"error\",\"error\":{\"code\":\"unauthorized_device\",\"message\":\"Pairing offer expired or used\"}}").await;
+        closed(&mut a).await;
+        assert_eq!(*r.bridge.status.borrow(), HostBridgeStatus::PairingFailed);
+        assert!(saved.tokens.lock().unwrap().is_empty());
+        // Terminal for this bridge: no hello replay on the relay session, no redial and
+        // no new exchange for the next window that dials the same proxy origin.
+        assert_eq!(p.socket.next_text_or_close(Duration::from_millis(200)).await, None);
+        let upgrades = r.relay.client_upgrades();
+        let mut b = dial(&r.bridge, Some(ORIGIN)).await;
+        send(&mut b, &hello("w2")).await;
+        closed(&mut b).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            r.relay.client_upgrades(),
+            upgrades,
+            "a spent pairing token never dials the relay again"
+        );
+        assert_eq!(*r.bridge.status.borrow(), HostBridgeStatus::PairingFailed);
+        r.bridge.stop().await;
+    })
+    .await
+    .expect("terminal pairing rejection test deadline");
+}

@@ -184,6 +184,23 @@ impl HostClient {
             return Ok(json!({"status":"cancelled", "serverId":pending.offer.server_id}));
         }
         let offer = pending.offer;
+        // F-02: a refused pairing must not block the next offer. Discard the
+        // failed candidate (its token is spent) before the in-progress guard,
+        // so a freshly generated offer replaces it instead of being rejected.
+        let mut replaced: Option<Bridge> = None;
+        if let Some(runtime) = core.hosts.get_mut(&offer.server_id) {
+            let failed = runtime.candidate.as_ref().is_some_and(|candidate| {
+                *candidate.bridge.handle.status.borrow() == HostBridgeStatus::PairingFailed
+            });
+            if failed {
+                let mut candidate = runtime.candidate.take().unwrap();
+                candidate.staged.cancel();
+                replaced = Some(candidate.bridge);
+            }
+        }
+        if let Some(bridge) = replaced {
+            bridge.handle.stop().await;
+        }
         if core
             .hosts
             .get(&offer.server_id)
@@ -508,7 +525,12 @@ impl HostClient {
         }
     }
 
+    /// Consume bridge terminal states. `CredentialInvalid` clears the stored token and
+    /// stops that host's bridge: a dead bridge would otherwise keep publishing its
+    /// `wsUrl` and close every reconnect. Host-scoped, so no other host is touched.
+    /// `PairingFailed` stays visible as a status and is cleared by `confirm`.
     async fn refresh_invalid(&self, core: &mut Core) -> Result<(), String> {
+        let mut stopped: Vec<Bridge> = Vec::new();
         for (server_id, runtime) in &mut core.hosts {
             if runtime.active.as_ref().is_some_and(|bridge| {
                 *bridge.handle.status.borrow() == HostBridgeStatus::CredentialInvalid
@@ -516,7 +538,21 @@ impl HostClient {
                 self.store
                     .clear_token(server_id)
                     .map_err(|_| "Could not clear invalid host credential")?;
+                // F-07: a dead bridge must not keep publishing its wsUrl (every
+                // reconnect would be closed) nor hold window references. Taking
+                // it here also makes the reported status settle on `offline`.
+                self.grants
+                    .0
+                    .lock()
+                    .unwrap()
+                    .retain(|_, binding| binding.server_id != *server_id);
+                if let Some(bridge) = runtime.active.take() {
+                    stopped.push(bridge);
+                }
             }
+        }
+        for bridge in stopped {
+            bridge.handle.stop().await;
         }
         Ok(())
     }
@@ -615,6 +651,7 @@ fn status_name(runtime: Option<&HostRuntime>) -> &'static str {
         Some(HostBridgeStatus::Online) => "online",
         Some(HostBridgeStatus::SaveFailed) => "saveFailed",
         Some(HostBridgeStatus::CredentialInvalid) => "credentialInvalid",
+        Some(HostBridgeStatus::PairingFailed) => "pairingFailed",
         Some(HostBridgeStatus::Stopped) => "stopped",
         _ => "offline",
     }

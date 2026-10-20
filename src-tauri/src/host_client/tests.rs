@@ -246,3 +246,86 @@ async fn host_client_release_and_destroy_stop_last_ref_but_keep_other_window() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn host_client_credential_invalid_clears_token_and_stops_the_host_bridge() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (_dir, c) = client();
+        begin(&c, KEY).await;
+        sink(&c)
+            .await
+            .persist(DeviceToken::new("private-device"))
+            .await
+            .unwrap();
+        let first = c.grant("w1", ORIGIN, "host").await.unwrap();
+        c.grant("w2", ORIGIN, "host").await.unwrap();
+        let mut stopped = {
+            let core = c.core.lock().await;
+            let bridge = core.hosts["host"].active.as_ref().unwrap();
+            assert_eq!(bridge.windows.len(), 2);
+            // picot-host owns how CredentialInvalid is reached; this case owns the reaction.
+            bridge
+                .handle
+                .force_status_for_tests(HostBridgeStatus::CredentialInvalid);
+            bridge.handle.status.clone()
+        };
+        assert_eq!(c.status("host").await.unwrap()["status"], "offline");
+        assert!(!c.store.host("host").unwrap().has_token());
+        while *stopped.borrow_and_update() != HostBridgeStatus::Stopped {
+            stopped.changed().await.unwrap();
+        }
+        assert!(c.core.lock().await.hosts["host"].active.is_none());
+        assert!(c
+            .grants
+            .validate(first["grant"].as_str().unwrap(), "host", ORIGIN)
+            .is_none());
+        // No dead bridge is reused: the window is told to pair again.
+        assert_eq!(
+            c.grant("w1", ORIGIN, "host").await.unwrap_err(),
+            "Host credential invalid; a fresh pairing offer is required"
+        );
+        c.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn host_client_pairing_failure_is_reported_and_replaced_by_a_fresh_offer() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (_dir, c) = client();
+        begin(&c, KEY).await;
+        let (mut stopped, spent) = {
+            let core = c.core.lock().await;
+            let candidate = core.hosts["host"].candidate.as_ref().unwrap();
+            candidate
+                .bridge
+                .handle
+                .force_status_for_tests(HostBridgeStatus::PairingFailed);
+            (candidate.bridge.handle.status.clone(), candidate.id.clone())
+        };
+        assert_eq!(c.status("host").await.unwrap()["status"], "pairingFailed");
+        assert!(c.store.host("host").is_none());
+        // A refused offer does not block the next one behind "pairing in progress".
+        let pending = c.add("w1", ORIGIN, &offer(KEY2)).await.unwrap();
+        assert_eq!(pending["status"], "tofuPending");
+        c.confirm("w1", ORIGIN, pending["questionId"].as_u64().unwrap(), true)
+            .await
+            .unwrap();
+        while *stopped.borrow_and_update() != HostBridgeStatus::Stopped {
+            stopped.changed().await.unwrap();
+        }
+        let core = c.core.lock().await;
+        let candidate = core.hosts["host"].candidate.as_ref().unwrap();
+        assert_ne!(candidate.id, spent);
+        assert_ne!(
+            *candidate.bridge.handle.status.borrow(),
+            HostBridgeStatus::PairingFailed
+        );
+        drop(core);
+        assert!(c.store.host("host").is_none());
+        c.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
