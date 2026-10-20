@@ -203,6 +203,29 @@ relay 数据面绕开 axum 入口的物理帧上限，各上限统一进契约�
 
 备份/恢复语义：metadata DB 备份会把 identity 私钥与 device tokens 一并带走——恢复到新机器 = **信任锚迁移**（旧配对关系保留），不是静默生成新 key；旧机器若仍以同一 serverId 连 relay，两台 daemon 竞争（行为依 relay 服务端语义），用户自行保证旧机停用；备份文件按敏感凭据对待。
 
+### Phase 2.5 目标设计：桌面多 host 客户端（未实现）
+
+> **本节是目标设计，不是现行事实。** 口径来自 spec `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-desktop-host-client-design.md`（修订 2）与 plan Draft 3；实现落在 `daemon-phase1` 分支，T11 验收通过时本节才翻转为现行事实。在此之前代码里没有这些模块与帧字段，本节读作约束，不是描述。
+
+- **归属**：远程 host 的 E2EE 通道与 per-host loopback 桥都在 **app 进程**（Tauri 壳）内，不进本机 daemon——客户端会话生死跟 UI 走，本机 daemon 仍只服务本机工作区。新增 `picot-host::relay::{client_role, host_bridge, host_store, host_tofu}` 与 `src-tauri/src/host_client/`；前端帧协议零改动，连接管理层把 wsUrl 从页面 origin 切到该 host 的桥 origin（端口统一 `/v2/ws`）。本机 daemon 停止时远程 host 不可用（UI 本身由本机静态资源承载），不做无本机 daemon 的纯远程模式。
+- **device view（契约 1）**：每个已配对设备在 daemon 侧持有独立视图状态（当前 workspace + 会话绑定 + generation，存 `relay.device_view.<deviceId>`），与窗口 owner registry **完全正交**；远程导航只操作 device view，绝不触碰窗口 owner 的绑定、navigation permit 与 `focusedExisting` 语义。视图随设备存活，不随宿主窗口 detach 消亡（D1）；daemon 重启后设备免重新配对、按磁盘会话重开——恢复的是会话，不是运行中的 turn。
+- **D2 动作矩阵**：按真实 handler 逐项分支，不是只改 `admits()` 分类——路由层直查点（`host_router.rs` 直查、`host_server.rs` HostControl gate）同属改动面。
+
+| 面 | 远程 device | 口径 |
+| --- | --- | --- |
+| 数据面：runtime 订阅/请求/快照、文件、聊天、steer | 放行 | 授权对象改为 device view（原为窗口 owner + generation 复读） |
+| 导航：`workspace.list`、`workspace_target_prepare/commit/cancel`、打开会话 | 放行 | 全部走 device view 分支；并发 prepare/commit 按 generation 拒绝旧请求并显式报错 |
+| Git（`git.*`） | 放行 | 归入导航面，cwd 按请求参数校验（同现状） |
+| terminal（`terminal_command`） | 放行 | 新 device 分支，cwd 取 device view 的 workspace 根 |
+| 工作区创建/删除/停止、设置类、admin（`daemon.status`/`stop`/`restart`） | 永拒 | Desktop-only 不变 |
+
+- **grant 链（契约 3）**：随机 loopback 端口不构成认证。bridge grant 由 app 铸造，身份从**注入的 `WebviewWindow`** 推导（复用 caller check，不信客户端自报 window id），绑定 (窗口, host)；随首帧 hello 的 `bridgeGrant` 字段传输（不走 HTTP header），并校验 Origin = 本机页面 origin。无 grant、伪造、异源、跨 host、窗口已关、首帧非 hello 或 15s 超时——一律关连接、不注入凭据。窗口存活期内断线重连由桥续发新 grant；窗口关闭或切 host 即作废该 grant，并**主动关闭该窗口的活 proxy 连接**。
+- **hello_ack 净化（契约 3）**：配对模式下远端 `hello_ack` 携带新铸 deviceToken——桥解析该帧、接管持久化，向 WebView 只转发**剔除 `deviceToken` 后**的 ack；持久化失败则关连接并把配对状态置「保存失败」（不静默丢 token，也不假装成功）。普通模式 ack 不含凭据，原样转发；其余业务帧不解析、双向透传。本机 desktopCapability 绝不出本机，deviceToken 只在 Rust 侧出现（日志走既有 token redaction）。
+- **wire 白名单（§12 已点头）**：既有帧一律不改；新增仅限三项——`workspace.bootstrap` 受限 op（由 HTTP 盘点定名单方法、固定 schema，长度/超时沿 `transport_limits`，**禁止任意 URL 代理**）、hello 的 `bridgeGrant` 字段、`hello_ack.capabilities` 对象（additive，前端据此放行管理面；老客户端忽略）。其余扩展须先改 spec。
+- **HTTP 面处置（契约 2）**：relay 通道只隧道 WS 会话帧，没有 HTTP 承接协议，本地加代理路由也不会让远端 handler 可达——因此**不做通用 HTTP 代理**，前端每个相对 HTTP 调用逐项三选一：映射到既有/新增受限 WS op、远程模式显式禁用、显式保持本机（静态资源）。清盘与逐项处置见 `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-http-inventory.md`，并有一条测试守住新增调用点必须入表。
+- **切换 = 页面级重载（契约 4）**：host 参数在**窗口 URL** 上，切换即导航 + 整页重载，模块闭包、投影、pending、在途请求随旧页面消亡；草稿与 keyed cache 按 host 命名空间存 localStorage 跨重载保留；切前 flush 复用既有 quit 前 flush 机制。桥**按 host 共享、按窗口引用计数**：同一 host 多窗口共享一个桥，桥上每条 proxy 连接 = 一条独立 relay 会话；最后一个窗口离开才停桥。同 host 双窗口共享同一个 device view。
+- **host_store 威胁边界**：`app_config_dir/picot-hosts.json`（0600，tmp+rename 原子替换，写失败保旧文件）存 HostProfile 与 deviceToken。服务端只存 token hash，这里存的是**明文 bearer token**——泄露后果**重于**服务端库，本机同用户任意进程可读；本期接受，macOS Keychain 留作后续加固。此文件同时是 TOFU 信任基线，**损坏不回退默认值**：保留原文件、阻塞覆盖性保存、UI 要求重新配对或手动恢复。本机删 host 只删本地 profile+token，远端设备记录仍在（撤销是远端 owner 的动作）。
+
 ## 授权模型
 
 ### 窗口 Owner 注册
