@@ -169,6 +169,18 @@ describe("setupHostSwitcher", () => {
     expect(refs.dom.window.localStorage.getItem(LAST_HOST_KEY)).toBeNull();
   });
 
+  it("stays put when the flush reports the draft is not durable", async () => {
+    const { navigate } = setup(refs, { flush: async () => false });
+    await openPicker(refs);
+
+    refs.list.querySelectorAll(".host-row-main")[1].click();
+    await tick();
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(refs.notice.textContent).toContain("Could not save your draft");
+    expect(refs.dom.window.localStorage.getItem(LAST_HOST_KEY)).toBeNull();
+  });
+
   it("posts the pasted offer, clears the input, and shows the new-host question", async () => {
     const invoke = vi.fn(async (command) => {
       if (command === "host_list") return hosts;
@@ -206,6 +218,66 @@ describe("setupHostSwitcher", () => {
     expect(invoke).toHaveBeenCalledWith("host_confirm_tofu", { questionId: 4, approved: true });
     expect(refs.tofu.classList.contains("hidden")).toBe(true);
     expect(refs.notice.textContent).toContain("Connected to r4");
+  });
+
+  it("names the added host by its saved label, not a missing status field", async () => {
+    const invoke = vi.fn(async (command) => {
+      if (command === "host_list") return hosts;
+      // status_payload carries serverId and status only — no label (F-05).
+      return { status: "connected", serverId: "r1" };
+    });
+    setup(refs, { invoke });
+    await openPicker(refs);
+
+    refs.addBtn.click();
+    refs.input.value = offer;
+    refs.form.dispatchEvent(
+      new refs.dom.window.Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await tick();
+
+    expect(refs.notice.textContent).toBe("Connected to desk.");
+    expect(refs.notice.textContent).not.toContain("undefined");
+  });
+
+  it("keeps the question across close and reopen, and answers it afterwards", async () => {
+    const invoke = vi.fn(async (command) => {
+      if (command === "host_list") return hosts;
+      if (command === "host_add")
+        return {
+          status: "tofuPending",
+          questionId: 7,
+          serverId: "r4",
+          keyFingerprint: "FFFF 0000",
+          kind: "newHost",
+          changes: [],
+        };
+      return { status: "connected", serverId: "r4" };
+    });
+    setup(refs, { invoke });
+    await openPicker(refs);
+
+    refs.addBtn.click();
+    refs.input.value = offer;
+    refs.form.dispatchEvent(
+      new refs.dom.window.Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await tick();
+    expect(refs.tofu.classList.contains("hidden")).toBe(false);
+
+    refs.button.click(); // close
+    await tick();
+    expect(refs.picker.classList.contains("hidden")).toBe(true);
+
+    refs.button.click(); // reopen: the app still binds this question to this window
+    await tick();
+    expect(refs.tofu.classList.contains("hidden")).toBe(false);
+    expect(refs.tofuFingerprint.textContent).toContain("FFFF 0000");
+
+    refs.tofuConfirm.click();
+    await tick();
+    expect(invoke).toHaveBeenCalledWith("host_confirm_tofu", { questionId: 7, approved: true });
+    expect(refs.tofu.classList.contains("hidden")).toBe(true);
   });
 
   it("shows the changed-connection question with its diff lines", async () => {

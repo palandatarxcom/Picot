@@ -95,23 +95,29 @@ export function createComposerDraftStore({
     return cache.get(identity)?.text ?? "";
   }
 
-  /** Write-through save. An empty text deletes the draft. */
+  /**
+   * Write-through save. An empty text deletes the draft. Resolves true when
+   * the text is durable (or there is none), false when a reload would lose it:
+   * no persistence channel, or a failed write (F-04 switch/quit guard).
+   */
   async function save(identity, text) {
     const clamped = clampDraft(text);
     if (!clamped) {
       await clear(identity);
-      return;
+      return true;
     }
     cache.set(identity, { text: clamped, updatedAt: now() });
     evictOverCapacity();
-    if (!available()) return;
+    if (!available()) return false;
     try {
       await preferences.set(draftKeyFor(identity), {
         text: clamped,
         updatedAt: cache.get(identity).updatedAt,
       });
+      return true;
     } catch (error) {
       console.warn("[draft-store] persist failed:", error);
+      return false;
     }
   }
 

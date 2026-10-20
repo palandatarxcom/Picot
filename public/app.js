@@ -4219,14 +4219,16 @@ function scheduleDraftSave() {
   }, 300);
 }
 
-function flushDraftNow() {
+/** Force-save the draft. Resolves false when a reload would lose it (F-04):
+ *  the host switch respects that, pagehide/visibilitychange ignore it. */
+async function flushDraftNow() {
   if (draftSaveTimer) {
     clearTimeout(draftSaveTimer);
     draftSaveTimer = null;
   }
   const text = messageInput.value;
-  if (text.trim()) void composerDraftStore.save(composerIdentity(), text);
-  else void composerDraftStore.clear(composerIdentity());
+  if (text.trim()) return composerDraftStore.save(composerIdentity(), text);
+  return composerDraftStore.clear(composerIdentity());
 }
 
 window.addEventListener("pagehide", flushDraftNow);

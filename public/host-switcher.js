@@ -261,7 +261,8 @@ export function setupHostSwitcher({
     picker.classList.toggle("hidden", !open);
     button.setAttribute("aria-expanded", String(open));
     if (!open) {
-      question = null;
+      // F-06: the pending question stays in memory — the app still binds it to
+      // this window, so closing the picker must not lose the only way to answer.
       removing = null;
       addForm.classList.add("hidden");
       setNotice(null);
@@ -270,12 +271,12 @@ export function setupHostSwitcher({
   }
 
   /** One switch, one reload. A refused flush keeps the window where it is. */
-  function select(hostId) {
+  async function select(hostId) {
     if (hostId === current) {
       setOpen(false);
       return;
     }
-    const url = switchHost(hostId, {
+    const url = await switchHost(hostId, {
       env,
       flush,
       release: () => invoke("host_release"),
@@ -295,7 +296,7 @@ export function setupHostSwitcher({
   }
 
   /** The add/confirm reply is the same document shape for both commands. */
-  function settle(reply) {
+  async function settle(reply) {
     const status = reply?.status;
     if (status === "tofuPending") {
       // The app keeps one question: a new one already superseded the old.
@@ -316,9 +317,11 @@ export function setupHostSwitcher({
       void refresh();
       return;
     }
-    setNotice(t("hostPicker.added", { host: reply?.label || reply?.serverId || "—" }));
+    // F-05: the status payload carries no label; `host_list` does.
+    const fresh = await refresh();
+    const added = fresh.find((host) => host.serverId === reply?.serverId);
+    setNotice(t("hostPicker.added", { host: labelOf(added ?? { serverId: reply?.serverId }) }));
     render();
-    void refresh();
   }
 
   async function run(job) {
@@ -326,7 +329,7 @@ export function setupHostSwitcher({
     busy = true;
     render();
     try {
-      settle(await job());
+      await settle(await job());
     } catch (error) {
       setNotice(t("hostPicker.addFailed", { reason: errorMessage(error) }));
     } finally {
@@ -374,7 +377,7 @@ export function setupHostSwitcher({
       render();
       return;
     }
-    if (hostId) select(hostId);
+    if (hostId) void select(hostId);
   };
 
   /** Delete the local profile. §2.5: the remote host still trusts this device,
@@ -393,7 +396,7 @@ export function setupHostSwitcher({
     }
     await refresh();
     // A window still pointed at the deleted host has to come home.
-    if (host.serverId === current) select(LOCAL_HOST);
+    if (host.serverId === current) void select(LOCAL_HOST);
   }
 
   const onRemoveConfirm = () => {

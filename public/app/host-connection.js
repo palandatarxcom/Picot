@@ -106,14 +106,15 @@ export function hostUrl(hostId, env = globalThis.window || globalThis) {
  * Switch this window's host (contract 4): flush unsent input, release the
  * window's grant, then reload onto the host param. No in-page transaction —
  * every module closure, pending request, and projection dies with the page.
- * Returns the navigation URL, or null when the flush refused to switch.
+ * Returns the navigation URL, or null when the flush refused to switch — a
+ * throwing flush, or one that reports `false` (F-04: not durable).
  */
-export function switchHost(
+export async function switchHost(
   hostId,
   { env = globalThis.window || globalThis, flush, release, navigate } = {},
 ) {
   try {
-    flush?.();
+    if ((await flush?.()) === false) return null;
   } catch {
     // A draft that could not be saved keeps the window on the current host.
     return null;
@@ -129,6 +130,45 @@ export function switchHost(
   const go = navigate || ((href) => locationOf(env).assign(href));
   go(url);
   return url;
+}
+
+/** Session flag marking a host whose recovery redirect already ran. */
+export const HOST_RECOVERY_KEY = "picot:host-recovery";
+
+const recoveryMark = (host) => `${HOST_RECOVERY_KEY}:${host}`;
+
+/**
+ * F-03 self-rescue: drop the dead `host` param and come home. The first
+ * attempt is a real reload (clean module state); if the same host fails again
+ * — or sessionStorage is unavailable — the URL is rewritten in place, so the
+ * rescue path can never loop on itself.
+ */
+function recoverToLocal(host, env) {
+  let href = null;
+  try {
+    const url = new URL(locationOf(env).href);
+    url.searchParams.delete(HOST_PARAM);
+    href = url.toString();
+  } catch {
+    return;
+  }
+  let recovered = true;
+  try {
+    recovered = Boolean(env?.sessionStorage?.getItem(recoveryMark(host)));
+    env?.sessionStorage?.setItem(recoveryMark(host), "1");
+  } catch {
+    // No storage to remember the attempt: the in-place rewrite cannot loop.
+  }
+  const location = locationOf(env);
+  if (!recovered && typeof location?.replace === "function") {
+    location.replace(href);
+    return;
+  }
+  try {
+    (env?.history ?? globalThis.history).replaceState(null, "", href);
+  } catch {
+    // An unrewritable URL still boots local below, so the window keeps working.
+  }
 }
 
 /**
@@ -179,32 +219,47 @@ function tauriInvoke(env = globalThis.window || globalThis) {
  * Boot an entry module's connection: local hosts resolve without any IPC, a
  * remote host resolves its bridge URL and window grant from the app commands.
  * Never falls back to the local socket for a remote host (contract 2).
+ *
+ * Both entry modules await this at module top level, so it must not throw: a
+ * dead remote host (deleted, broken store, stopped bridge, no grant) hands the
+ * window back to the local host instead of blanking the page (F-03).
  */
 export async function connectHost({
   env = globalThis.window || globalThis,
   invoke = tauriInvoke(env),
 } = {}) {
   const host = resolveHostFromUrl(env);
-  if (host === LOCAL_HOST) {
-    return {
-      host: LOCAL_HOST,
-      identity: "desktop",
-      wsUrl: resolveWsUrlForHost(LOCAL_HOST, env),
-      clientOptions: { capabilitiesFromAck: readCapabilities },
-    };
-  }
-  if (!invoke) throw new Error("Remote host needs the app shell (Tauri IPC unavailable)");
-  const status = await invoke("host_status", { serverId: host });
-  const grant = await invoke("host_grant", { serverId: host });
-  if (!grant?.grant) throw new Error("Host grant is unavailable");
-  return {
-    host,
-    identity: "bridge",
-    wsUrl: resolveWsUrlForHost({ wsUrl: status?.wsUrl, bridgeOrigin: status?.bridgeOrigin }, env),
-    clientOptions: {
+  const local = () => ({
+    host: LOCAL_HOST,
+    identity: "desktop",
+    wsUrl: resolveWsUrlForHost(LOCAL_HOST, env),
+    clientOptions: { capabilitiesFromAck: readCapabilities },
+  });
+  if (host === LOCAL_HOST) return local();
+  try {
+    if (!invoke) throw new Error("Remote host needs the app shell (Tauri IPC unavailable)");
+    const status = await invoke("host_status", { serverId: host });
+    const grant = await invoke("host_grant", { serverId: host });
+    if (!grant?.grant) throw new Error("Host grant is unavailable");
+    const connection = {
+      host,
       identity: "bridge",
-      grant: grant.grant,
-      capabilitiesFromAck: readCapabilities,
-    },
-  };
+      wsUrl: resolveWsUrlForHost({ wsUrl: status?.wsUrl, bridgeOrigin: status?.bridgeOrigin }, env),
+      clientOptions: {
+        identity: "bridge",
+        grant: grant.grant,
+        capabilitiesFromAck: readCapabilities,
+      },
+    };
+    try {
+      env?.sessionStorage?.removeItem(recoveryMark(host));
+    } catch {
+      // A stale recovery mark only costs one in-place rewrite on the next failure.
+    }
+    return connection;
+  } catch (error) {
+    console.warn(`[host] ${host} is unavailable, booting the local host:`, error);
+    recoverToLocal(host, env);
+    return local();
+  }
 }
