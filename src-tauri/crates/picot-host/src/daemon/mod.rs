@@ -134,6 +134,10 @@ pub struct DaemonState {
     pub metadata: SharedMetadataStore,
     /// Window-owner authority: labels, capabilities, workspace generations.
     pub owner_registry: Arc<WindowOwnerRegistry>,
+    /// Paired-device authority (contract 1): device tokens, the per-device
+    /// view, and pending device navigations. The navigation face reads it
+    /// instead of the window registry.
+    pub auth: Arc<Mutex<RemoteAuth>>,
     /// Git service (row D4: workspace-transition cleanup).
     pub git: Arc<GitService>,
     /// Per-session UI profile store.
@@ -335,6 +339,7 @@ impl DaemonState {
             static_dir: cfg.static_dir,
             metadata: Arc::clone(&shared_metadata),
             owner_registry,
+            auth: remote_auth,
             git,
             session_ui_profiles,
             ephemeral_hub,

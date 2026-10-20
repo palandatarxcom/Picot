@@ -107,15 +107,19 @@ impl HostClientContext {
     }
 }
 
-/// The request faces the session pipeline admits against (Gate B, spec §2.8).
-/// Extracted verbatim from the inline checks (relay plan T9 slice A,
-/// zero behavior drift); slice B widens the remote device arm.
+/// The request faces the session pipeline admits against (Gate B, spec §2.8;
+/// split into the D2 management and navigation faces by contract 1, plan T5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestFace {
-    /// Router-level host_request class gate: Desktop kind only.
-    HostRequest,
-    /// Host control dispatch gate: Desktop kind + owner.
-    HostControl,
+    /// Management face: workspace registry mutations, host control ops,
+    /// preferences, settings, admin. Desktop kind only — a paired device never
+    /// reaches these regardless of its owner binding (D2, permanent).
+    HostManagement,
+    /// Navigation face (D2 / contract 1): the workspace list, target
+    /// prepare/commit/cancel, and `git_*`. A desktop owner or a paired device
+    /// principal; the target authority (window registry vs device view) stays
+    /// with the caller.
+    HostNavigation,
     /// runtime_request / snapshot / capabilities (`authorize_target`).
     RuntimeCommand,
     /// runtime_subscribe admission.
@@ -124,24 +128,34 @@ pub enum RequestFace {
     DataRequest,
 }
 
+/// Every operation on the navigation face (contract 1, D2). One classifier for
+/// the router's direct check, the host_request gate, and the dispatcher's
+/// device branch: the three sites must never disagree about which ops a paired
+/// device may reach.
+pub fn host_navigation_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "workspace.list"
+            | "workspace_target_prepare"
+            | "workspace_transition_commit"
+            | "workspace_transition_cancel"
+    ) || operation.starts_with("git_")
+}
+
 /// Pure admission predicate: principal class × request face. The
 /// state-dependent facts (owner registered, runtime live, workspace
 /// generation match) are the caller's inputs, not this function's.
 pub fn admits(context: &HostClientContext, face: RequestFace) -> bool {
     match face {
-        // Management plane is desktop-only (spec §2.8): a paired device
-        // never reaches host_request/host_control regardless of its owner
-        // binding — rejection is permanent for the Remote class.
-        RequestFace::HostRequest => context.kind == ClientKind::Desktop,
-        RequestFace::HostControl => {
-            context.kind == ClientKind::Desktop && context.owner_id.is_some()
-        }
-        // Data plane follows the principal (Gate B slice B): a paired device
-        // rides the same runtime/data faces as its desktop owner; the
-        // owner-registered/workspace checks stay with the callers.
-        RequestFace::RuntimeCommand | RequestFace::RuntimeSubscribe | RequestFace::DataRequest => {
-            context.data_plane_owner().is_some()
-        }
+        RequestFace::HostManagement => context.kind == ClientKind::Desktop,
+        // Navigation follows the principal: a desktop owner (its own window
+        // binding) or a paired device (its own view) — the caller re-derives
+        // which, and data-plane / runtime / subscription faces ride the same
+        // owner rule (Gate B slice B).
+        RequestFace::HostNavigation
+        | RequestFace::RuntimeCommand
+        | RequestFace::RuntimeSubscribe
+        | RequestFace::DataRequest => context.data_plane_owner().is_some(),
     }
 }
 
@@ -346,16 +360,6 @@ impl HostRouter {
                 validate(frame, PayloadKind::HostRequest).map_err(|code| {
                     RouterError::new(code, "Host request exceeds protocol limit")
                 })?;
-                if self
-                    .clients
-                    .get(client_id)
-                    .is_some_and(|context| context.kind != ClientKind::Desktop)
-                {
-                    return Err(RouterError::new(
-                        "forbidden_class",
-                        "Host operation requires desktop owner",
-                    ));
-                }
                 let operation =
                     frame
                         .get("operation")
@@ -363,6 +367,24 @@ impl HostRouter {
                         .ok_or_else(|| {
                             RouterError::new("invalid_host_request", "operation is required")
                         })?;
+                // Routing-layer direct check (the gate `admits()` also guards):
+                // both reads go through the one classifier, so a paired device
+                // reaches exactly the navigation ops and nothing else.
+                let face = if host_navigation_operation(operation) {
+                    RequestFace::HostNavigation
+                } else {
+                    RequestFace::HostManagement
+                };
+                if !self
+                    .clients
+                    .get(client_id)
+                    .is_some_and(|context| admits(context, face))
+                {
+                    return Err(RouterError::new(
+                        "forbidden_class",
+                        "Host operation requires desktop owner",
+                    ));
+                }
                 Ok(RoutedAction::Host {
                     client_id: client_id.to_owned(),
                     request_id,
@@ -482,18 +504,22 @@ mod admission_tests {
             assert!(admits(&desktop, face), "desktop owner admits {face:?}");
             assert!(admits(&bound, face), "paired device admits {face:?}");
         }
-        for face in [RequestFace::HostRequest, RequestFace::HostControl] {
-            assert!(admits(&desktop, face), "desktop owner admits {face:?}");
-            assert!(
-                !admits(&bound, face),
-                "management face {face:?} must reject the device principal"
-            );
-        }
+        // Management stays desktop-only (D2): the device's navigation grant
+        // never widens into registry mutations, host control, or settings.
+        assert!(admits(&desktop, RequestFace::HostManagement));
+        assert!(
+            !admits(&bound, RequestFace::HostManagement),
+            "management face must reject the device principal"
+        );
+        // Navigation (D2/contract 1): workspace list + target prepare/commit/
+        // cancel + git — both principals, each against its own authority.
+        assert!(admits(&desktop, RequestFace::HostNavigation));
+        assert!(admits(&bound, RequestFace::HostNavigation));
         // Legacy remote (device token without owner binding) and the public
         // classes are refused everywhere, exactly as today.
         for face in [
-            RequestFace::HostRequest,
-            RequestFace::HostControl,
+            RequestFace::HostManagement,
+            RequestFace::HostNavigation,
             RequestFace::RuntimeCommand,
             RequestFace::RuntimeSubscribe,
             RequestFace::DataRequest,

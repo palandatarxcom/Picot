@@ -517,6 +517,7 @@ async fn drive_control(
         client_id: 1,
         class: ClientClass::Native,
         owner_id: Some(owner.clone()),
+        device_id: None,
     };
     handler(
         ctx,

@@ -137,6 +137,25 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                 };
                 let arg_bool = |key: &str| args.get(key).and_then(Value::as_bool);
 
+                // D2 action matrix (contract 1): a paired device reaches
+                // exactly the navigation face, resolved against its own device
+                // view. The branch runs before every owner-scoped path below,
+                // so no window binding, permit, or rebind is touched.
+                if ctx.class == ClientClass::Remote {
+                    let request_id = canonical
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    return dispatch_device_navigation(
+                        &daemon_state,
+                        &ctx,
+                        request_id,
+                        &command,
+                        &args,
+                    )
+                    .await;
+                }
+
                 if command.starts_with("git_") {
                     require_native_owner(&ctx)?;
                     let owner = ctx
@@ -147,17 +166,24 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         .get("requestId")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let result = dispatch_git_host_operation(
-                        &command,
-                        &args,
-                        request_id,
-                        owner,
-                        &owner_registry,
-                        &git_service,
-                        &static_dir,
-                        &host_events,
-                    )
-                    .await;
+                    let result = match registered_workspace(&owner_registry, owner) {
+                        Ok((_wid, root, generation)) => {
+                            dispatch_git_host_operation(
+                                &command,
+                                &args,
+                                request_id,
+                                owner,
+                                root,
+                                generation,
+                                Some(&owner_registry),
+                                &git_service,
+                                &static_dir,
+                                &host_events,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
                     if let Err(error) = result {
                         let generation = owner_registry
                             .current_workspace_generation(owner)
@@ -2686,18 +2712,255 @@ fn extract_session_cwd(session_path: &PathBuf) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// D2 navigation for a paired device (contract 1, plan T5). Every op here acts
+/// on the device's own persisted view; the window-owner registry is never read
+/// or written, so a device switch cannot disturb a local window's binding,
+/// navigation permit, or `focusedExisting` answer (and vice versa).
+///
+/// The op set is the navigation face and nothing else — the same classifier the
+/// router and the host_request gate apply (`host_router::host_navigation_operation`).
+async fn dispatch_device_navigation(
+    state: &DaemonState,
+    ctx: &VerifiedClientContext,
+    request_id: &str,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let Some(device_id) = ctx.device_id.clone() else {
+        return Err("device navigation requires a paired device".to_string());
+    };
+    let Some(owner) = ctx.owner_id.clone() else {
+        return Err("device navigation requires a pairing owner".to_string());
+    };
+    match command {
+        // Read-only registry view (the sidebar's workspace list): the same
+        // handler the desktop runs, without the Native-only precondition.
+        "workspace.list" => {
+            let (result, change) =
+                workspace_controls::handle_control(command, args, &state.metadata)?;
+            if let Some(change) = change {
+                state.host_events.broadcast_native_event(serde_json::json!({
+                    "type": "registry_changed",
+                    "reason": change.reason(),
+                }));
+            }
+            Ok(result)
+        }
+        other if other.starts_with("git_") => {
+            let (root, generation) = device_workspace_scope(state, &device_id)?;
+            dispatch_git_host_operation(
+                command,
+                args,
+                request_id,
+                &owner,
+                root,
+                generation,
+                None,
+                &state.git,
+                &state.static_dir,
+                &state.host_events,
+            )
+            .await
+        }
+        "workspace_target_prepare" => device_target_prepare(state, &device_id, &owner, args).await,
+        "workspace_transition_commit" => {
+            let generation = device_transition_generation(args)?;
+            let transition = state
+                .auth
+                .lock()
+                .map_err(|_| "device authority unavailable".to_string())?
+                .commit_device_transition(&device_id, generation)?;
+            Ok(serde_json::json!({
+                "targetOrigin": format!(
+                    "{}/workspaces/{}/sessions/{}",
+                    state.host_origin, transition.workspace_id, transition.session_id
+                ),
+                "workspaceGeneration": transition.generation,
+            }))
+        }
+        "workspace_transition_cancel" => {
+            let generation = device_transition_generation(args)?;
+            let transition = state
+                .auth
+                .lock()
+                .map_err(|_| "device authority unavailable".to_string())?
+                .cancel_device_transition(&device_id, generation)?;
+            // Cancel stops only what the prepare spawned (desktop parity); a
+            // reused runtime keeps running.
+            if let Some(instance) = transition.created_instance {
+                if let Some(target) = state
+                    .runtimes
+                    .target_for_session(&transition.workspace_id, &transition.session_id)
+                    .filter(|target| {
+                        target.instance_id == instance
+                            && target.owner_id.as_deref() == Some(owner.as_str())
+                    })
+                {
+                    let _ = state.runtimes.stop(&target);
+                }
+            }
+            Ok(Value::Null)
+        }
+        other => Err(format!("remote navigation does not support {other}")),
+    }
+}
+
+fn device_transition_generation(args: &Value) -> Result<u64, String> {
+    args.get("transitionGeneration")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "transitionGeneration is required".to_string())
+}
+
+/// The device view's workspace root and generation: the scope every
+/// workspace-bound device op resolves instead of the window registry.
+fn device_workspace_scope(state: &DaemonState, device_id: &str) -> Result<(PathBuf, u64), String> {
+    let view = state
+        .auth
+        .lock()
+        .map_err(|_| "device authority unavailable".to_string())?
+        .device_view(device_id)?
+        .ok_or_else(|| "the device has no workspace view yet".to_string())?;
+    let root = state
+        .metadata
+        .lock()
+        .map_err(|_| "metadata store unavailable".to_string())?
+        .canonical_root_for_workspace_id(&view.workspace_id)
+        .map_err(|_| "workspace is not registered".to_string())?;
+    Ok((root, view.generation))
+}
+
+/// `workspace_target_prepare` against the device view. The runtime it resolves
+/// carries the pairing owner (so runtime admission still holds) and the
+/// generation the device view will take at commit, which is also the
+/// generation `authorize_target` compares against the live runtime.
+async fn device_target_prepare(
+    state: &DaemonState,
+    device_id: &str,
+    owner: &window_owner::OwnerId,
+    args: &Value,
+) -> Result<Value, String> {
+    let target_cwd = args
+        .get("targetCwd")
+        .and_then(Value::as_str)
+        .ok_or("targetCwd is required")?
+        .to_string();
+    // Same canonicalization and registration rule as the desktop path: only a
+    // registered workspace root may become a target.
+    let canonical_target =
+        fs::canonicalize(&target_cwd).map_err(|error| format!("Invalid targetCwd: {error}"))?;
+    let session_path = args
+        .get("sessionPath")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let persisted_session_id = session_path
+        .as_deref()
+        .map(|path| {
+            persisted_session_id_for_workspace(std::path::Path::new(path), &canonical_target)
+        })
+        .transpose()?;
+    let force_new_session = args
+        .get("forceNewSession")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let workspace_id = state
+        .metadata
+        .lock()
+        .map_err(|_| "metadata store unavailable".to_string())?
+        .workspace_id_for_canonical_root(&canonical_target)
+        .map_err(|_| "workspace is not registered".to_string())?;
+    let current = state
+        .auth
+        .lock()
+        .map_err(|_| "device authority unavailable".to_string())?
+        .device_view(device_id)?
+        .ok_or_else(|| "the device has no workspace view yet".to_string())?;
+    let same_cwd = current.workspace_id == workspace_id;
+    let session_id = persisted_session_id
+        .clone()
+        .unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4().simple()));
+
+    // Reuse the resident runtime for this session — the device's authority is
+    // its view, but the runtime it names is the daemon's (D1). A live runtime
+    // under another owner is never stolen (no rebind, no focus: those are the
+    // desktop path's semantics).
+    let live = state
+        .runtimes
+        .target_for_session(&workspace_id, &session_id);
+    let (target, generation, created) = match live {
+        Some(live) if !force_new_session && live.owner_id.as_deref() == Some(owner.as_str()) => {
+            let generation = live.workspace_generation;
+            (live, generation, None)
+        }
+        Some(_) => {
+            return Err("that session is running for another owner".to_string());
+        }
+        None => {
+            let generation = current.generation + 1;
+            let launch = pi_launch::native_launch_spec(
+                &state.static_dir,
+                &canonical_target.to_string_lossy(),
+                session_path.as_deref(),
+            )?;
+            let target = RuntimeTarget::with_owner(
+                workspace_id.clone(),
+                session_id.clone(),
+                format!("instance-{}", uuid::Uuid::new_v4().simple()),
+                owner.as_str(),
+                generation,
+            );
+            state.runtimes.spawn(target.clone(), launch)?;
+            let instance = target.instance_id.clone();
+            (target, generation, Some(instance))
+        }
+    };
+    {
+        let mut auth = state
+            .auth
+            .lock()
+            .map_err(|_| "device authority unavailable".to_string())?;
+        auth.begin_device_transition(device_id, &workspace_id, &session_id, generation);
+        if let Some(instance) = created.as_deref() {
+            auth.note_device_transition_instance(device_id, instance);
+        }
+    }
+    if created.is_some() {
+        record_session_bucket_after_spawn(
+            state.runtimes.clone(),
+            state.metadata.clone(),
+            state.host_events.clone(),
+            target.clone(),
+            Some(owner.clone()),
+        )
+        .await;
+    }
+    Ok(serde_json::json!({
+        "classification": if same_cwd { "same" } else { "cross" },
+        "transitionGeneration": generation,
+        "targetOrigin": format!(
+            "{}/workspaces/{}/sessions/{}",
+            state.host_origin, target.workspace_id, target.session_id
+        ),
+        "targetWorkspaceId": target.workspace_id,
+        "targetSessionId": target.session_id,
+        "settleRequired": !same_cwd,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_git_host_operation(
     operation: &str,
     args: &Value,
     request_id: &str,
     owner: &window_owner::OwnerId,
-    owner_registry: &WindowOwnerRegistry,
+    root: PathBuf,
+    generation: u64,
+    // Desktop-only transition guard: a device has no window transition, and
+    // its authority is its view (contract 1), so it passes `None`.
+    owner_registry: Option<&WindowOwnerRegistry>,
     service: &GitService,
     static_dir: &std::path::Path,
     host_events: &HostEventSink,
 ) -> Result<Value, String> {
-    // Git is workspace-scoped: Registered-only, never a landing placeholder.
-    let (_wid, root, generation) = registered_workspace(owner_registry, owner)?;
     let emit = |value: Value| {
         host_events.send_owner_event(owner, value);
     };
@@ -2928,13 +3191,16 @@ async fn dispatch_git_host_operation(
             // request timeout, so it runs detached and reports through owner
             // events — the same shape as the AI commit-message job above.
             let owner = owner.clone();
-            let registry = owner_registry.clone();
+            let registry = owner_registry.cloned();
             let events = host_events.clone();
             let request_id = request_id.to_string();
             let root = root.clone();
             let service = service.clone();
             tokio::task::spawn_blocking(move || {
-                if registry.workspace_transition_in_progress(&owner) {
+                if registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.workspace_transition_in_progress(&owner))
+                {
                     events.send_owner_event(
                         &owner,
                         serde_json::json!({
@@ -2981,14 +3247,17 @@ async fn dispatch_git_host_operation(
                 }
             );
             let owner = owner.clone();
-            let registry = owner_registry.clone();
+            let registry = owner_registry.cloned();
             let events = host_events.clone();
             let request_id = request_id.to_string();
             let snapshot_for_event = snapshot.clone();
             let generation_for_event = generation;
             let root_for_run = root.clone();
             tokio::task::spawn_blocking(move || {
-                if registry.workspace_transition_in_progress(&owner) {
+                if registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.workspace_transition_in_progress(&owner))
+                {
                     events.send_owner_event(
                         &owner,
                         serde_json::json!({

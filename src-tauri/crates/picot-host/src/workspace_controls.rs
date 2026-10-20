@@ -221,6 +221,7 @@ mod tests {
             client_id: 1,
             class: ClientClass::Native,
             owner_id: Some(OwnerId::from_string("owner-native".to_string())),
+            device_id: None,
         }
     }
 
@@ -229,6 +230,7 @@ mod tests {
             client_id: 2,
             class: ClientClass::Remote,
             owner_id: None,
+            device_id: None,
         }
     }
 
@@ -252,6 +254,7 @@ mod tests {
                 client_id: 3,
                 class: ClientClass::Native,
                 owner_id: None,
+                device_id: None,
             });
             assert_eq!(ownerless_native.unwrap_err(), NATIVE_OWNER_REQUIRED);
         }

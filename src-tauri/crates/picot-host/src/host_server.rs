@@ -1919,6 +1919,10 @@ pub(crate) async fn run_session<S, E>(
             return;
         }
     };
+    // Wire whitelist (spec §12): `hello_ack.capabilities` is the additive
+    // field that tells the client which faces it was admitted to. Old clients
+    // read the ack by key and ignore it; the face set mirrors `admits()`.
+    let capabilities = hello_capabilities(&context);
     let handshake = state
         .router
         .lock()
@@ -1934,7 +1938,11 @@ pub(crate) async fn run_session<S, E>(
     }
     // A one-scan pairing hello gets the freshly minted device token back in
     // the ack (spec §2.6); returning devices already hold theirs.
-    let mut hello_ack = json!({ "type": "hello_ack", "protocolVersion": PROTOCOL_VERSION });
+    let mut hello_ack = json!({
+        "type": "hello_ack",
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": capabilities,
+    });
     if pairing_minted {
         if let Some(token) = device_token.as_deref() {
             hello_ack["deviceToken"] = json!(token);
@@ -2157,6 +2165,31 @@ pub(crate) async fn run_session<S, E>(
                         .ok()
                         .and_then(|slot| slot.clone());
                     let outcome = match (manager, client_context.as_ref()) {
+                        // D2 device branch (contract 1): a paired device drives
+                        // a terminal rooted at its own view's workspace — never
+                        // the pairing window's registry binding, which may be a
+                        // different workspace or gone entirely (D1).
+                        (Some(manager), Some(context))
+                            if context.kind != crate::host_router::ClientKind::Desktop =>
+                        {
+                            let root = context
+                                .device
+                                .as_ref()
+                                .and_then(|device| device_view_for(&state, &device.device_id))
+                                .and_then(|view| {
+                                    state.data.workspace_root(&view.workspace_id).ok()
+                                });
+                            match (context.data_plane_owner(), root) {
+                                (Some(owner), Some(root)) => manager.dispatch(
+                                    &crate::window_owner::OwnerId::from_string(owner.to_owned()),
+                                    &root,
+                                    &frame.get("payload").cloned().unwrap_or(Value::Null),
+                                ),
+                                _ => Err(
+                                    "terminal commands require a registered workspace".to_string(),
+                                ),
+                            }
+                        }
                         (Some(manager), Some(context))
                             if context.kind == crate::host_router::ClientKind::Desktop =>
                         {
@@ -2573,6 +2606,23 @@ fn extension_ui_requires_owner(event: &Value) -> bool {
     )
 }
 
+/// The faces this principal is admitted to, advertised in `hello_ack`
+/// (contract 1 sender, plan T5). Field names are the face set — `native` (the
+/// desktop control plane), `navigation`, `git`, `terminal`, `management` — and
+/// each one is exactly a row of the D2 action matrix. A client that does not
+/// know the field keeps its old behavior (T8 gates on it).
+fn hello_capabilities(context: &HostClientContext) -> Value {
+    let desktop = context.kind == crate::host_router::ClientKind::Desktop;
+    let navigation = desktop || context.data_plane_owner().is_some();
+    json!({
+        "native": desktop,
+        "navigation": navigation,
+        "git": navigation,
+        "terminal": navigation,
+        "management": desktop,
+    })
+}
+
 fn current_registered_context(state: &HostState, context: &HostClientContext) -> bool {
     let Some(owner) = context.owner_id.as_ref() else {
         return false;
@@ -2949,6 +2999,65 @@ fn authorize_target(
     authority_scope(state, context).is_some_and(|binding| {
         binding.workspace_id == live.workspace_id && binding.generation == live.workspace_generation
     })
+}
+
+/// `workspace.bootstrap` (contract 2): resolve the routing triple for one
+/// workspace/session, exactly like the desktop-only `/v2/bootstrap` HTTP
+/// handler — and only for a runtime this principal owns.
+fn workspace_bootstrap_target(
+    state: &HostState,
+    context: Option<&HostClientContext>,
+    frame: &Value,
+    request_id: &str,
+) -> Result<Value, (&'static str, String)> {
+    let context = context.ok_or(("unauthenticated", "Authentication required".into()))?;
+    let owner = context
+        .data_plane_owner()
+        .ok_or(("unauthorized_target", "Registered owner required".into()))?;
+    // Fixed schema: the caller may name the target and nothing else. Anything
+    // else is refused rather than ignored, so no field can ever ride along.
+    const FIELDS: [&str; 5] = ["type", "requestId", "operation", "workspaceId", "sessionId"];
+    let fields = frame.as_object().ok_or((
+        "invalid_bootstrap_request",
+        "Bootstrap frame is required".into(),
+    ))?;
+    if fields.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err((
+            "invalid_bootstrap_request",
+            "workspace.bootstrap takes workspaceId and sessionId only".into(),
+        ));
+    }
+    let workspace_id = fields
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or((
+            "invalid_bootstrap_request",
+            "workspaceId is required".into(),
+        ))?;
+    let session_id = fields
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(("invalid_bootstrap_request", "sessionId is required".into()))?;
+    let target = state
+        .runtimes
+        .target_for_session(workspace_id, session_id)
+        .ok_or((
+            "runtime_not_found",
+            "No live runtime for that session".into(),
+        ))?;
+    if target.owner_id.as_deref() != Some(owner) {
+        return Err(("unauthorized_target", "Workspace is not authorized".into()));
+    }
+    let target = serde_json::to_value(&target)
+        .map_err(|_| ("bootstrap_failed", "Cannot serialize the target".into()))?;
+    Ok(json!({
+        "type": "data_response",
+        "requestId": request_id,
+        "operation": "workspace.bootstrap",
+        "target": target,
+    }))
 }
 
 fn operation_scope(
@@ -3440,16 +3549,27 @@ async fn dispatch(
             // unbound by design, so requiring a Registered snapshot here would
             // lock the whole control surface behind the very state landing
             // exists to move past.
-            if !crate::host_router::admits(context, crate::host_router::RequestFace::HostControl) {
+            // One classifier decides the face for both this gate and the
+            // router's direct check: navigation ops (D2) ride the owner rule,
+            // everything else stays management and desktop-only.
+            let face = if crate::host_router::host_navigation_operation(&operation) {
+                crate::host_router::RequestFace::HostNavigation
+            } else {
+                crate::host_router::RequestFace::HostManagement
+            };
+            if !crate::host_router::admits(context, face) {
                 return Err((
                     "stale_generation",
                     "Verified desktop workspace context is stale".into(),
                 ));
             }
-            let owner = context.owner_id.clone().ok_or((
-                "unauthorized_target",
-                "Registered desktop owner required".into(),
-            ))?;
+            let owner = context
+                .data_plane_owner()
+                .map(|owner| crate::window_owner::OwnerId::from_string(owner.to_owned()))
+                .ok_or((
+                    "unauthorized_target",
+                    "Registered desktop owner required".into(),
+                ))?;
             if matches!(
                 operation.as_str(),
                 "mcp_login_start"
@@ -3876,10 +3996,22 @@ async fn dispatch(
                     "Host control handler unavailable".into(),
                 ))?;
             let client_id = client_id.parse::<u64>().unwrap_or(0);
+            // A paired device keeps its Remote class (so every desktop-only
+            // op inside the dispatcher still refuses it through
+            // `require_native_owner`) and carries its device id, which is the
+            // navigation authority the dispatcher branches on (contract 1).
             let verified = VerifiedClientContext {
                 client_id,
-                class: crate::host_control::ClientClass::Native,
+                class: if context.kind == crate::host_router::ClientKind::Desktop {
+                    crate::host_control::ClientClass::Native
+                } else {
+                    crate::host_control::ClientClass::Remote
+                },
                 owner_id: Some(owner),
+                device_id: context
+                    .device
+                    .as_ref()
+                    .map(|device| device.device_id.clone()),
             };
             let args = frame.get("args").cloned().unwrap_or(Value::Null);
             let canonical = json!({
@@ -3963,6 +4095,14 @@ async fn dispatch(
                 .get("workspaceId")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // Contract 2 restricted op (T1 inventory): the one relative-HTTP
+            // call the remote mode needs — `/v2/bootstrap` becomes a WS op.
+            // Fixed schema (workspaceId + sessionId, nothing forwarded), the
+            // same RuntimeTarget reply, and the same owner admission the HTTP
+            // handler applies; the frame's workspace is already bound above.
+            if operation == "workspace.bootstrap" {
+                return workspace_bootstrap_target(state, context, &frame, &request_id);
+            }
             match Some(operation) {
                 Some("file_mentions") => {
                     let query = frame

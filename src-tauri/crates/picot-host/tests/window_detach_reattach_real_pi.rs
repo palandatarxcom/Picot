@@ -313,6 +313,7 @@ impl Chain {
             client_id: 1,
             class: ClientClass::Native,
             owner_id: Some(owner.clone()),
+            device_id: None,
         };
         let progress: ProgressSink = Arc::new(|_| {});
         handler(
@@ -337,6 +338,7 @@ impl Chain {
             client_id: 1,
             class: ClientClass::Native,
             owner_id: Some(owner.clone()),
+            device_id: None,
         };
         let progress: ProgressSink = Arc::new(|_| {});
         handler(

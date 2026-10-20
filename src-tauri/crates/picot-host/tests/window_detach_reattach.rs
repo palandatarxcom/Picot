@@ -212,6 +212,7 @@ impl Fixture {
             client_id: 1,
             class: ClientClass::Native,
             owner_id: Some(owner.clone()),
+            device_id: None,
         }
     }
 

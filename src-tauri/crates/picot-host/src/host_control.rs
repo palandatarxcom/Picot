@@ -18,6 +18,10 @@ pub struct VerifiedClientContext {
     pub client_id: u64,
     pub class: ClientClass,
     pub owner_id: Option<OwnerId>,
+    /// The paired device behind a `Remote` context (contract 1): its
+    /// persisted view is the navigation authority, so the dispatcher branches
+    /// on it instead of the window-owner registry. `None` for Native.
+    pub device_id: Option<String>,
 }
 
 pub type ProgressSink = Arc<dyn Fn(Value) + Send + Sync>;

@@ -55,6 +55,22 @@ pub enum PairingError {
 pub struct RemoteAuth {
     store: Arc<Mutex<MetadataStore>>,
     pending: HashMap<Vec<u8>, PendingPairing>,
+    /// Device navigations prepared but not yet committed (contract 1, T5).
+    /// In memory like the window registry's pending transition: a process
+    /// restart ends a half-done navigation instead of replaying it.
+    transitions: HashMap<String, DeviceTransition>,
+}
+
+/// One device navigation in flight: the target a `workspace_target_prepare`
+/// resolved, its generation, and whether the prepare created the runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceTransition {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub generation: u64,
+    /// The runtime instance this prepare spawned; cancel stops only what the
+    /// transition created (a reused runtime stays alive, desktop parity).
+    pub created_instance: Option<String>,
 }
 
 /// One unconsumed pairing token: its expiry plus the minting owner the
@@ -69,6 +85,7 @@ impl RemoteAuth {
         Self {
             store,
             pending: HashMap::new(),
+            transitions: HashMap::new(),
         }
     }
 
@@ -163,6 +180,7 @@ impl RemoteAuth {
     }
 
     pub fn revoke(&mut self, device_id: &str) -> Result<(), String> {
+        self.transitions.remove(device_id);
         self.with_store(|store| store.revoke_device(device_id))?;
         // The view dies with the tokens: a re-paired device starts from a fresh
         // seed, never from the pre-revocation workspace (contract 1).
@@ -189,6 +207,80 @@ impl RemoteAuth {
         let value = serde_json::to_value(view)
             .map_err(|error| format!("Cannot serialize device view: {error}"))?;
         self.with_store(|store| store.relay_pref_set(&key, &value))
+    }
+
+    /// Open a device navigation (contract 1, T5). The device's own view is the
+    /// only state that moves: no window binding, permit, or focus record is
+    /// read or written here.
+    pub fn begin_device_transition(
+        &mut self,
+        device_id: &str,
+        workspace_id: &str,
+        session_id: &str,
+        generation: u64,
+    ) {
+        self.transitions.insert(
+            device_id.to_owned(),
+            DeviceTransition {
+                workspace_id: workspace_id.to_owned(),
+                session_id: session_id.to_owned(),
+                generation,
+                created_instance: None,
+            },
+        );
+    }
+
+    /// Record the runtime instance this prepare spawned (cancel-only handle).
+    pub fn note_device_transition_instance(&mut self, device_id: &str, instance_id: &str) {
+        if let Some(transition) = self.transitions.get_mut(device_id) {
+            transition.created_instance = Some(instance_id.to_owned());
+        }
+    }
+
+    fn device_transition(
+        &mut self,
+        device_id: &str,
+        generation: u64,
+    ) -> Result<DeviceTransition, String> {
+        let transition = self
+            .transitions
+            .get(device_id)
+            .ok_or("no pending workspace transition")?;
+        if transition.generation != generation {
+            return Err("stale transition generation".to_string());
+        }
+        self.transitions
+            .remove(device_id)
+            .ok_or_else(|| "no pending workspace transition".to_string())
+    }
+
+    /// Commit the pending navigation into the device's view: the next frame
+    /// resolves against the new workspace/session/generation.
+    pub fn commit_device_transition(
+        &mut self,
+        device_id: &str,
+        generation: u64,
+    ) -> Result<DeviceTransition, String> {
+        let transition = self.device_transition(device_id, generation)?;
+        self.store_device_view(
+            device_id,
+            &DeviceView {
+                workspace_id: transition.workspace_id.clone(),
+                session_id: Some(transition.session_id.clone()),
+                generation: transition.generation,
+            },
+        )?;
+        Ok(transition)
+    }
+
+    /// Drop the pending navigation; the device view keeps its previous
+    /// binding. The caller stops the instance the prepare created, if any.
+    pub fn cancel_device_transition(
+        &mut self,
+        device_id: &str,
+        generation: u64,
+    ) -> Result<DeviceTransition, String> {
+        self.device_transition(device_id, generation)
     }
 }
 
