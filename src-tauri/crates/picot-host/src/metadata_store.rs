@@ -1034,6 +1034,17 @@ impl MetadataStore {
         self.write_preference(key, value)
     }
 
+    /// Relay-reserved namespace delete; see [`Self::relay_pref_get`]. Revoking
+    /// a device drops its `relay.device_view.*` row through here.
+    pub(crate) fn relay_pref_delete(&self, key: &str) -> Result<bool, String> {
+        Self::validate_relay_preference_key(key)?;
+        let deleted = self
+            .connection
+            .execute("DELETE FROM preferences WHERE key = ?1", [key])
+            .map_err(|error| format!("Cannot delete Picot preference: {error}"))?;
+        Ok(deleted > 0)
+    }
+
     fn validate_relay_preference_key(key: &str) -> Result<(), String> {
         if !key.starts_with("relay.") {
             return Err("relay preference key must use the relay.* namespace".to_string());

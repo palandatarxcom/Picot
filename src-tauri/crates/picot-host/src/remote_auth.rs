@@ -4,6 +4,7 @@
 // database without a second SQLite connection.
 
 use crate::metadata_store::{MetadataStore, SharedMetadataStore};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,24 @@ pub struct DevicePrincipal {
     pub device_id: String,
     pub owner_id: Option<String>,
 }
+
+/// Per-paired-device view state (契约 1, D1): the device's own current
+/// workspace, session binding, and generation. Persisted in the relay-reserved
+/// MetadataStore namespace, so the device's authority outlives the pairing
+/// window's owner registration and the daemon process; it is fully orthogonal
+/// to the window-owner registry (no window binding is read or written to
+/// resolve a device target).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceView {
+    pub workspace_id: String,
+    /// The device's own session binding (`None` until a device navigation
+    /// picks one — contract 1, plan T5).
+    pub session_id: Option<String>,
+    pub generation: u64,
+}
+
+/// Reserved key prefix: one row per paired device (plan T4).
+const DEVICE_VIEW_PREFIX: &str = "relay.device_view.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingError {
@@ -144,12 +163,50 @@ impl RemoteAuth {
     }
 
     pub fn revoke(&mut self, device_id: &str) -> Result<(), String> {
-        self.with_store(|store| store.revoke_device(device_id))
+        self.with_store(|store| store.revoke_device(device_id))?;
+        // The view dies with the tokens: a re-paired device starts from a fresh
+        // seed, never from the pre-revocation workspace (contract 1).
+        let _ = device_view_key(device_id)
+            .map(|key| self.with_store(|store| store.relay_pref_delete(&key)));
+        Ok(())
+    }
+
+    /// The device's persisted view (contract 1): `None` until the pairing seed
+    /// or a device navigation writes one.
+    pub fn device_view(&self, device_id: &str) -> Result<Option<DeviceView>, String> {
+        let key = device_view_key(device_id)?;
+        let Some(value) = self.with_store(|store| store.relay_pref_get(&key))? else {
+            return Ok(None);
+        };
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| format!("device view for {device_id} holds invalid state: {error}"))
+    }
+
+    /// Write the device's view (pairing seed here; device navigation in T5).
+    pub fn store_device_view(&self, device_id: &str, view: &DeviceView) -> Result<(), String> {
+        let key = device_view_key(device_id)?;
+        let value = serde_json::to_value(view)
+            .map_err(|error| format!("Cannot serialize device view: {error}"))?;
+        self.with_store(|store| store.relay_pref_set(&key, &value))
     }
 }
 
 fn hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
+}
+/// Trust boundary: `device_id` arrives in a pairing hello and becomes part of a
+/// reserved preference key — reject anything that could reshape the key.
+fn device_view_key(device_id: &str) -> Result<String, String> {
+    if device_id.is_empty()
+        || device_id.len() > 128
+        || device_id
+            .chars()
+            .any(|c| c.is_control() || !c.is_ascii() || c == '.')
+    {
+        return Err("invalid device id".to_string());
+    }
+    Ok(format!("{DEVICE_VIEW_PREFIX}{device_id}"))
 }
 
 #[cfg(test)]

@@ -1825,6 +1825,12 @@ pub(crate) async fn run_session<S, E>(
         } else {
             (None, None, false)
         };
+    // Contract 1 (D1): a paired device's view is seeded from the pairing
+    // owner's live binding the moment the device first authenticates, so the
+    // device keeps operating after the window detaches or the daemon restarts.
+    if let Some(principal) = device_principal.as_ref() {
+        seed_device_view(&state, principal);
+    }
     // T10 (spec §2.9): a remote-authenticated session is kickable. The DB
     // re-check right after registration closes the revoke-vs-hello race: a
     // revoke that deleted the device record between the hello-time
@@ -2597,6 +2603,9 @@ struct PreviewScope {
     owner: crate::window_owner::OwnerId,
     workspace_id: String,
     generation: u64,
+    /// `Some` iff the scope came from a device view (contract 1): a device
+    /// scope is validated against its own persisted view, never the registry.
+    device_id: Option<String>,
 }
 
 fn preview_scope_from(context: &HostClientContext) -> Option<PreviewScope> {
@@ -2604,10 +2613,18 @@ fn preview_scope_from(context: &HostClientContext) -> Option<PreviewScope> {
         owner: context.owner_id.clone()?,
         workspace_id: context.workspace_id.clone()?,
         generation: context.workspace_generation?,
+        device_id: None,
     })
 }
 
 fn preview_scope_valid(state: &HostState, scope: &PreviewScope) -> bool {
+    if let Some(device_id) = scope.device_id.as_deref() {
+        // Contract 1: the device's own view is the authority for the whole
+        // lifetime of its requests — a window transition is not its business.
+        return device_view_for(state, device_id).is_some_and(|current| {
+            current.workspace_id == scope.workspace_id && current.generation == scope.generation
+        });
+    }
     state
         .owner_registry
         .lock()
@@ -2642,13 +2659,12 @@ async fn convert_office_preview(
     path: &str,
 ) -> Result<Value, (&'static str, String)> {
     let context = context.ok_or(("unauthenticated", "Authentication required".into()))?;
-    // Desktop keeps its handshake-binding scope; a device principal (Gate B)
-    // scopes to its owner's current registered workspace — the data-plane
-    // admission already matched the frame's workspaceId against that same
-    // snapshot.
+    // Desktop keeps its handshake-binding scope; a device principal scopes to
+    // its own persisted view (contract 1) — the data-plane admission already
+    // matched the frame's workspaceId against that same view.
     let scope = match context.kind {
         crate::host_router::ClientKind::Desktop => preview_scope_from(context),
-        _ => remote_registered_binding(state, context),
+        _ => remote_device_binding(state, context),
     }
     .ok_or(("unauthorized_target", "Workspace is not authorized".into()))?;
     if !preview_scope_valid(state, &scope) {
@@ -2750,11 +2766,41 @@ fn dialog_response_allowed(context: Option<&HostClientContext>, live_owner: Opti
     live_owner == Some(owner)
 }
 
-/// The data-plane authority of a remote device principal (Gate B): the
-/// registry's current snapshot of its owner is the only binding a remote
-/// context has — re-read on every check, so an owner unregister or a
-/// workspace transition invalidates remote admission on the next frame.
-fn remote_registered_binding(
+/// The persisted view of one paired device (contract 1, D1): current
+/// workspace + session binding + generation, read from the relay-reserved
+/// MetadataStore row. Re-read on every check so a device navigation (T5) lands
+/// on the next frame; the window-owner registry is not consulted at all.
+fn device_view_for(state: &HostState, device_id: &str) -> Option<crate::remote_auth::DeviceView> {
+    state
+        .auth
+        .lock()
+        .ok()?
+        .device_view(device_id)
+        .ok()
+        .flatten()
+}
+
+/// The device-view authority snapshot a remote principal resolves to. The
+/// owner stays the pairing-stamped owner (operation scopes and runtime
+/// ownership still need it), but workspace/generation come from the device's
+/// own view — so detaching the pairing window, switching its workspace, or
+/// restarting the daemon no longer revokes the device (D1/R4).
+fn device_view_scope(
+    state: &HostState,
+    device: &crate::host_router::DevicePrincipal,
+) -> Option<PreviewScope> {
+    let view = device_view_for(state, &device.device_id)?;
+    Some(PreviewScope {
+        owner: crate::window_owner::OwnerId::from_string(device.owner_id.clone()),
+        workspace_id: view.workspace_id,
+        generation: view.generation,
+        device_id: Some(device.device_id.clone()),
+    })
+}
+
+/// Window-registry binding: the desktop owner's live snapshot, re-read per
+/// check (unchanged for the Desktop class).
+fn window_registered_binding(
     state: &HostState,
     context: &HostClientContext,
 ) -> Option<PreviewScope> {
@@ -2773,9 +2819,98 @@ fn remote_registered_binding(
             owner: owner_id,
             workspace_id: wid,
             generation,
+            device_id: None,
         }),
         _ => None,
     }
+}
+
+/// The authority snapshot a request resolves to: the window registry for a
+/// desktop principal, the device's own persisted view for a paired device
+/// (contract 1). Desktop behavior is byte-identical to the pre-T4 path.
+fn authority_scope(state: &HostState, context: &HostClientContext) -> Option<PreviewScope> {
+    match context.kind {
+        crate::host_router::ClientKind::Desktop => window_registered_binding(state, context),
+        _ => remote_device_binding(state, context),
+    }
+}
+
+/// Binding for a device principal's data-plane/runtime requests.
+///
+/// A view exists for every device paired through this daemon (seeded at hello,
+/// see [`seed_device_view`]); the fallback only serves a token minted before
+/// the view existed. It adopts the pairing owner's live snapshot once and
+/// persists it, so the next detach or restart keeps the binding (D1).
+fn remote_device_binding(state: &HostState, context: &HostClientContext) -> Option<PreviewScope> {
+    let device = context.device.as_ref()?;
+    if device_view_for(state, &device.device_id).is_some() {
+        return device_view_scope(state, device);
+    }
+    let owner_id = crate::window_owner::OwnerId::from_string(device.owner_id.clone());
+    let snapshot = state
+        .owner_registry
+        .lock()
+        .ok()
+        .and_then(|registry| registry.clone())
+        .map(|registry| registry.owner_current_workspace(&owner_id))?;
+    let crate::window_owner::OwnerWorkspaceSnapshot::Registered {
+        wid, generation, ..
+    } = snapshot
+    else {
+        return None;
+    };
+    if let Ok(auth) = state.auth.lock() {
+        let _ = auth.store_device_view(
+            &device.device_id,
+            &crate::remote_auth::DeviceView {
+                workspace_id: wid.clone(),
+                session_id: None,
+                generation,
+            },
+        );
+    }
+    Some(PreviewScope {
+        owner: owner_id,
+        workspace_id: wid,
+        generation,
+        device_id: Some(device.device_id.clone()),
+    })
+}
+
+/// Seed the device's view from its pairing owner's live binding (contract 1):
+/// pairing is the moment the daemon knows both the device id and the owner's
+/// workspace, and it is the only moment the window registry is guaranteed to
+/// still carry it. An existing view is never overwritten — from here on the
+/// view belongs to the device's own navigation (T5).
+fn seed_device_view(state: &HostState, principal: &crate::remote_auth::DevicePrincipal) {
+    let Some(owner) = principal.owner_id.as_deref() else {
+        return;
+    };
+    let Ok(auth) = state.auth.lock() else { return };
+    if !matches!(auth.device_view(&principal.device_id), Ok(None)) {
+        return;
+    }
+    let owner_id = crate::window_owner::OwnerId::from_string(owner.to_owned());
+    let snapshot = state
+        .owner_registry
+        .lock()
+        .ok()
+        .and_then(|registry| registry.clone())
+        .map(|registry| registry.owner_current_workspace(&owner_id));
+    let Some(crate::window_owner::OwnerWorkspaceSnapshot::Registered {
+        wid, generation, ..
+    }) = snapshot
+    else {
+        return;
+    };
+    let _ = auth.store_device_view(
+        &principal.device_id,
+        &crate::remote_auth::DeviceView {
+            workspace_id: wid,
+            session_id: None,
+            generation,
+        },
+    );
 }
 
 /// Wire frames carry only the routing triple (workspace/session/instance).
@@ -2805,12 +2940,13 @@ fn authorize_target(
     if live.owner_id.as_deref() != Some(owner) {
         return false;
     }
-    // Re-read registry authority for every admission. Handshake context is only
-    // an identity proof; workspace/generation can change while socket remains open.
-    // The device-principal arm (Gate B) rides the same registry-vs-live
-    // comparison: a paired device may touch only the owner's current,
-    // generation-matched runtime.
-    remote_registered_binding(state, context).is_some_and(|binding| {
+    // Re-read authority for every admission. Handshake context is only an
+    // identity proof; workspace/generation can change while the socket stays
+    // open. A desktop scope re-reads the window registry; a device scope
+    // re-reads its own persisted view (contract 1) — both compare against the
+    // live runtime's workspace and spawn generation, so a device may touch only
+    // the runtime its view names.
+    authority_scope(state, context).is_some_and(|binding| {
         binding.workspace_id == live.workspace_id && binding.generation == live.workspace_generation
     })
 }
@@ -2823,10 +2959,10 @@ fn operation_scope(
 ) -> Result<crate::operation_registry::OperationScope, (&'static str, String)> {
     let context = context.ok_or(("unauthenticated", "Authentication required".into()))?;
     if context.kind == crate::host_router::ClientKind::Remote {
-        // Gate B: a device principal has no handshake binding — the registry
-        // re-read is its authority, and the caller's workspace (already
-        // matched against that snapshot) is the scope it rides.
-        let binding = remote_registered_binding(state, context).ok_or((
+        // A device principal has no handshake binding — its persisted view is
+        // the authority (contract 1), and the caller's workspace (already
+        // matched against that view) is the scope it rides.
+        let binding = remote_device_binding(state, context).ok_or((
             "not_registered",
             "Paired owner has no registered workspace".into(),
         ))?;
@@ -3801,17 +3937,17 @@ async fn dispatch(
                     return true;
                 }
                 // Workspace-bound ops: the desktop owner matches its live
-                // handshake binding; a device principal (Gate B) has none, so
-                // the frame's workspaceId must equal its owner's current
-                // registered workspace — the registry re-read makes a
-                // transition or unregister invalidate the next frame.
+                // handshake binding; a device principal has none, so the
+                // frame's workspaceId must equal its device view's workspace —
+                // the view re-read makes a device navigation land on the next
+                // frame.
                 match ctx.kind {
                     crate::host_router::ClientKind::Desktop => {
                         current_registered_context(state, ctx)
                             && ctx.workspace_id.as_deref()
                                 == frame.get("workspaceId").and_then(Value::as_str)
                     }
-                    _ => remote_registered_binding(state, ctx).is_some_and(|binding| {
+                    _ => remote_device_binding(state, ctx).is_some_and(|binding| {
                         Some(binding.workspace_id.as_str())
                             == frame.get("workspaceId").and_then(Value::as_str)
                     }),
@@ -8953,9 +9089,12 @@ mod tests {
             serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(refusal["error"]["code"], "forbidden_class", "{refusal}");
 
-        // Unregistering the owner invalidates the data plane on the very
-        // next frame (registry re-read, not a cached handshake; the same
-        // registry object, so only the owner record went away).
+        // D1 / contract 1 (relay phase-2.5 T4): detaching the pairing window no
+        // longer invalidates the device. The paired device's own view — seeded
+        // at hello, persisted in the relay-reserved namespace — is its
+        // authority, so the remote survives the host app quitting. The
+        // device-view matrix (stale generation, two devices, restart) lives in
+        // `tests/relay_device_authorization.rs`.
         registry.detach_owner(&owner);
         remote
             .send(Message::Text(
@@ -8967,9 +9106,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        let stale: Value =
+        let detached: Value =
             serde_json::from_str(remote.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(stale["error"]["code"], "unauthorized_target", "{stale}");
+        assert_eq!(detached["requestId"], "data-2", "{detached}");
+        assert_ne!(
+            detached["error"]["code"], "unauthorized_target",
+            "{detached}"
+        );
         let _ = remote.close(None).await;
 
         // The legacy token (no owner stamp) authenticates but every
