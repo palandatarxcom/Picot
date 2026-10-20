@@ -148,3 +148,27 @@ describe("setupComposerPasteOffload", () => {
     );
   });
 });
+
+// T1 inventory row `/v2/paste-offload`: the host has no remote offload face, so
+// the pasted text stays inline and the prompt says why — no fetch, no fallback.
+it("keeps pasted text inline and explains why a remote host never offloads", async () => {
+  const local = setupDom();
+  const offload = vi.fn();
+  const reason = "Remote host: pasted text stays inline";
+  const handle = setupComposerPasteOffload({ ...local, offload, t, disabledReason: reason });
+  const text = "x".repeat(PASTE_OFFLOAD_BYTE_THRESHOLD);
+
+  paste(local.dom, local.textarea, text);
+  await Promise.resolve();
+
+  const prompt = local.container.querySelector(".paste-offload-prompt");
+  expect(prompt.classList.contains("hidden")).toBe(false);
+  expect(prompt.querySelector(".paste-offload-label").textContent).toBe(reason);
+  expect(prompt.querySelector(".paste-offload-as-file").classList.contains("hidden")).toBe(true);
+  expect(handle.isDisabled()).toBe(true);
+
+  prompt.querySelector(".paste-offload-keep-inline").click();
+  expect(local.textarea.value).toBe(text);
+  expect(offload).not.toHaveBeenCalled();
+  expect(prompt.classList.contains("hidden")).toBe(true);
+});

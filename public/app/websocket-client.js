@@ -257,16 +257,45 @@ export class WebSocketClient extends EventTarget {
   }
 
   async loadCanonicalTarget(fetchImpl = globalThis.fetch?.bind(globalThis)) {
-    if (!this.canonicalRoute || typeof fetchImpl !== "function") return null;
+    if (!this.canonicalRoute) return null;
+    // A remote host has no HTTP data plane (contract 2 / T1 inventory): the
+    // bridge client resolves the same triple over the restricted WS op.
+    const target =
+      this.identity === "bridge"
+        ? await this._bootstrapRemoteTarget()
+        : await this._bootstrapHttpTarget(fetchImpl);
+    if (!target) return null;
+    this.setRoutingContext(target);
+    return target;
+  }
+
+  async _bootstrapHttpTarget(fetchImpl) {
+    if (typeof fetchImpl !== "function") return null;
     const query = new URLSearchParams({
       workspaceId: this.workspaceId,
       sessionId: this.sessionId,
     });
     const response = await fetchImpl(`/v2/bootstrap?${query}`);
     if (!response.ok) throw new Error(`Host bootstrap failed (${response.status})`);
-    const target = await response.json();
-    this.setRoutingContext(target);
-    return target;
+    return response.json();
+  }
+
+  // The op has a fixed schema host-side — any field beyond these five is
+  // refused — so the frame is built here instead of sendData(), which adds
+  // `protocolVersion`. `workspace.bootstrap` answers `data_response.target`.
+  async _bootstrapRemoteTarget() {
+    if (!this.ws || this.ws.readyState !== WS_OPEN) this.connect();
+    const reply = await this._sendRequest(
+      (requestId) => ({
+        type: "data_request",
+        requestId,
+        operation: "workspace.bootstrap",
+        workspaceId: this.workspaceId,
+        sessionId: this.sessionId,
+      }),
+      { label: 'Data operation "workspace.bootstrap"' },
+    );
+    return reply?.target ?? null;
   }
 
   // Wire frames carry only the routing triple. Owner binding and workspace

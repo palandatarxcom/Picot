@@ -168,6 +168,7 @@
     "pasteAsFile": "Attach as file",
     "keepInline": "Keep inline",
     "pasteOffloadFailed": "Could not save pasted text",
+    "pasteRemoteDisabled": "Remote host: pasted text stays inline and is not saved as a file.",
     "typeMessageFollowUpHint": ", ⌥/Alt+Enter queues while running"
   },
   "tools": {
@@ -586,6 +587,14 @@
   },
   "landing": {
     "hint": "Select a session from the sidebar to begin, or click a workspace's + to start a new session.",
+    "addHost": "Add remote host",
+    "addHostPlaceholder": "Paste the host's connection offer",
+    "addHostSubmit": "Add",
+    "addHostPending": "New host, key {fingerprint}. Trust it?",
+    "addHostConfirm": "Trust and add",
+    "addHostAdded": "Host added: {host}",
+    "addHostFailed": "Could not add host: {error}",
+    "addHostCancelled": "Cancelled",
     "credentials": {
       "title": "Set up a model first",
       "body": "No API key or login found. Add one to start chatting.",

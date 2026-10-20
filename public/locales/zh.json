@@ -168,6 +168,7 @@
     "pasteAsFile": "作为文件附加",
     "keepInline": "保持内联",
     "pasteOffloadFailed": "无法保存粘贴的文本",
+    "pasteRemoteDisabled": "远程主机：粘贴内容仅保留在输入框，不会保存为文件。",
     "typeMessageFollowUpHint": "，⌥/Alt+Enter 运行中入队"
   },
   "tools": {
@@ -586,6 +587,14 @@
   },
   "landing": {
     "hint": "从侧栏选择一个会话开始，或点击工作区的 + 开始新会话。",
+    "addHost": "添加远程主机",
+    "addHostPlaceholder": "粘贴主机的连接凭据",
+    "addHostSubmit": "添加",
+    "addHostPending": "新主机，密钥 {fingerprint}。是否信任？",
+    "addHostConfirm": "信任并添加",
+    "addHostAdded": "已添加主机：{host}",
+    "addHostFailed": "无法添加主机：{error}",
+    "addHostCancelled": "已取消",
     "credentials": {
       "title": "先配置模型",
       "body": "未检测到 API 密钥或登录凭据，添加后即可开始对话。",

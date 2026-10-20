@@ -597,9 +597,12 @@ installHostOriginFetch(window);
 // to today's origin socket, a remote one to its app-owned bridge socket.
 const hostConnection = await connectHost({ env: window });
 const wsClient = new WebSocketClient(hostConnection.wsUrl, hostConnection.clientOptions);
+// Remote host: no HTTP data plane (contract 2 / T1 inventory), so the surfaces
+// below disable rather than fall back to the local host.
+const remoteHost = hostConnection.identity === "bridge";
 // §2.5: only an explicit rejection invalidates a stored credential — stop
 // retrying it (the host picker owns the visible state).
-if (hostConnection.identity === "bridge") {
+if (remoteHost) {
   watchCredentialInvalid(wsClient, () => wsClient.disconnect());
 }
 // Unified control transport: every process/window lifecycle and native op goes
@@ -1461,6 +1464,7 @@ const createEphemeralView = (runtime) =>
     runtime,
     kind: runtime.kind,
     toolsEnabled: runtime.kind === "side-chat",
+    remoteHost,
     // Ephemeral chats share the window's owner workspace (served by the
     // main-session Pi), never the Quick Chat temporary cwd.
     getWorkspaceRoot: () => getCurrentWorkspacePath(),
@@ -4029,6 +4033,7 @@ const mainPasteOffload = setupComposerPasteOffload({
       );
     return result?.path;
   },
+  disabledReason: remoteHost ? t("input.pasteRemoteDisabled") : null,
   t,
 });
 const mainImageAttachments = setupComposerImageAttachments({
@@ -4700,12 +4705,17 @@ const commands = [
     desc: t("input.compactDesc"),
     action: () => requestCompact(),
   },
-  {
-    icon: "clipboard",
-    label: t("input.exportHtml"),
-    desc: t("input.exportHtmlDesc"),
-    action: () => rpcExportHtml(),
-  },
+  // Session export rides a desktop-only host op (D2): a remote host hides it.
+  ...(remoteHost
+    ? []
+    : [
+        {
+          icon: "clipboard",
+          label: t("input.exportHtml"),
+          desc: t("input.exportHtmlDesc"),
+          action: () => rpcExportHtml(),
+        },
+      ]),
   {
     icon: "bar-chart",
     label: t("input.sessionStats"),
@@ -8206,6 +8216,7 @@ const packageBrowse = setupPackageBrowse({
   root: document,
   transport,
   nativeAvailable,
+  managementAvailable: () => transport.capabilities.management,
   t,
   createIcon,
   renderPackageInstallFailure,

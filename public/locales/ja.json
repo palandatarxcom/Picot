@@ -168,6 +168,7 @@
     "pasteAsFile": "ファイルとして添付",
     "keepInline": "インラインを維持",
     "pasteOffloadFailed": "貼り付けたテキストを保存できませんでした",
+    "pasteRemoteDisabled": "リモートホスト：貼り付けたテキストは入力欄に残り、ファイルとして保存されません。",
     "typeMessageFollowUpHint": "、実行中は ⌥/Alt+Enter でキュー"
   },
   "tools": {
@@ -586,6 +587,14 @@
   },
   "landing": {
     "hint": "サイドバーからセッションを選ぶか、ワークスペースの + をクリックして新しいセッションを開始してください。",
+    "addHost": "リモートホストを追加",
+    "addHostPlaceholder": "ホストの接続オファーを貼り付け",
+    "addHostSubmit": "追加",
+    "addHostPending": "新しいホスト、キー {fingerprint}。信頼しますか？",
+    "addHostConfirm": "信頼して追加",
+    "addHostAdded": "ホストを追加しました：{host}",
+    "addHostFailed": "ホストを追加できません：{error}",
+    "addHostCancelled": "キャンセルしました",
     "credentials": {
       "title": "まずモデルを設定",
       "body": "APIキーまたはログインが見つかりません。追加すると会話を開始できます。",

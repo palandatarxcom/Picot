@@ -168,6 +168,7 @@
     "pasteAsFile": "Adjuntar como archivo",
     "keepInline": "Mantener en línea",
     "pasteOffloadFailed": "No se pudo guardar el texto pegado",
+    "pasteRemoteDisabled": "Host remoto: el texto pegado permanece en el campo y no se guarda como archivo.",
     "typeMessageFollowUpHint": ", ⌥/Alt+Enter encola durante la ejecución"
   },
   "tools": {
@@ -586,6 +587,14 @@
   },
   "landing": {
     "hint": "Selecciona una sesión en la barra lateral para empezar, o pulsa el + de un espacio de trabajo para iniciar una nueva.",
+    "addHost": "Añadir host remoto",
+    "addHostPlaceholder": "Pega la oferta de conexión del host",
+    "addHostSubmit": "Añadir",
+    "addHostPending": "Host nuevo, clave {fingerprint}. ¿Confiar?",
+    "addHostConfirm": "Confiar y añadir",
+    "addHostAdded": "Host añadido: {host}",
+    "addHostFailed": "No se pudo añadir el host: {error}",
+    "addHostCancelled": "Cancelado",
     "credentials": {
       "title": "Configura un modelo primero",
       "body": "No se encontró ninguna clave API ni inicio de sesión. Añade una para empezar.",

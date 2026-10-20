@@ -896,3 +896,65 @@ describe("WebSocketClient broker routing", () => {
     await expect(runtimePending).resolves.toEqual({ isStreaming: false });
   });
 });
+
+// Contract 2 (T1 inventory row `/v2/bootstrap`): a remote host has no HTTP data
+// plane, so the canonical triple comes back over the restricted WS op. The op's
+// schema is fixed host-side — any extra field is refused, so the frame must not
+// ride the ordinary `sendData()` envelope either.
+describe("WebSocketClient remote canonical bootstrap", () => {
+  function remoteClient() {
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+      identity: "bridge",
+      grant: "grant-1",
+    });
+    client.canonicalRoute = true;
+    client.workspaceId = "ws-1";
+    client.sessionId = "session-1";
+    const sent = [];
+    client.ws = { readyState: WebSocket.OPEN, send: (message) => sent.push(JSON.parse(message)) };
+    return { client, sent };
+  }
+
+  test("resolves the target over workspace.bootstrap and never over HTTP", async () => {
+    const { client, sent } = remoteClient();
+    const http = vi.fn();
+    const pending = client.loadCanonicalTarget(http);
+
+    expect(sent[0]).toEqual({
+      type: "data_request",
+      requestId: "req-1",
+      operation: "workspace.bootstrap",
+      workspaceId: "ws-1",
+      sessionId: "session-1",
+    });
+
+    client.handleMessage({
+      type: "data_response",
+      requestId: "req-1",
+      operation: "workspace.bootstrap",
+      target: { workspaceId: "ws-1", sessionId: "session-1", instanceId: "instance-9" },
+    });
+    await expect(pending).resolves.toMatchObject({
+      workspaceId: "ws-1",
+      sessionId: "session-1",
+      instanceId: "instance-9",
+    });
+    expect(http).not.toHaveBeenCalled();
+    expect(client.getRuntimeTarget()).toMatchObject({ instanceId: "instance-9" });
+  });
+
+  test("a refused bootstrap rejects instead of falling back to HTTP", async () => {
+    const { client } = remoteClient();
+    const http = vi.fn();
+    const pending = client.loadCanonicalTarget(http);
+
+    client.handleMessage({
+      type: "error",
+      requestId: "req-1",
+      error: { code: "runtime_not_found", message: "No live runtime for that session" },
+    });
+
+    await expect(pending).rejects.toThrow("No live runtime for that session");
+    expect(http).not.toHaveBeenCalled();
+  });
+});

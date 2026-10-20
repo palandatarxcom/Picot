@@ -1,6 +1,6 @@
 # Relay Phase 2.5：前端 HTTP 调用盘点与逐项处置
 
-**状态：** Task 1 完成（plan `2026-10-19-relay-phase2-5-desktop-host-client.md` Draft 3）— 2026-10-20
+**状态：** Task 1 完成（plan `2026-10-19-relay-phase2-5-desktop-host-client.md` Draft 3）— 2026-10-20；Task 8 第二片（T8b）已按本表改写 4 个数据面调用点（2026-10-20）
 **上游：** spec `not-started/2026-10-19-relay-phase2-5-desktop-host-client-design.md` §2.7 + §5.2 契约 2（R2-01）
 **用途：** 远程 host 模式下 relay 通道只隧道 WS 会话帧，没有 HTTP 承接协议（`RelaySessionBridge` 只转发会话帧，`bootstrap_target` 是只认 desktop capability 的独立 HTTP handler）。因此前端每个相对 HTTP 调用都必须逐项处置：映射到既有/新增受限 WS op、远程模式显式禁用，或显式保持本机。**静默回落本机一律禁止。** 本表是 T5（服务端 op）与 T8（前端改写）的输入，并由 `public/http-inventory-drift.test.js` 守住新增调用点必须入表。
 
@@ -17,11 +17,11 @@
 
 | 调用点（file:line） | 方法/路径 | 消费方 | 处置（既有 WS op / 新受限 op / 远程禁用） | 测试钩子 |
 | --- | --- | --- | --- | --- |
-| `public/app/websocket-client.js:260` | GET `/v2/bootstrap?workspaceId&sessionId`（`loadCanonicalTarget`，header 走 `host-origin.js` 注入的 desktop capability） | hello 前的 canonical 路由三元组（workspace/session/instance）解析 | **新受限 op `workspace.bootstrap`**：单方法固定 schema（入参 workspaceId+sessionId，出参与现 `bootstrap_target` 的 `RuntimeTarget` 同形），长度/超时沿 `transport_limits`（`WS_PHYSICAL_FRAME_BYTES` / 数据面帧上限），**不接受任意 URL 代理**；归属 T5 服务端 + T8 前端改写 | 漂移守卫；T5 op 契约测试（固定 schema + 越界拒绝）；T8 前端用例 |
-| `public/app.js:4012` | POST `/v2/paste-offload`（body 上限 `PASTE_BODY_BYTES` 4 MiB） | 主界面 composer 的粘贴落盘（大段粘贴换成文件引用） | **远程禁用（v1）**：远程 host 上粘贴退化为纯文本就地处理，UI 显式提示不落盘，不回落本机 host | 漂移守卫；T8 远程禁用态用例 |
-| `public/ephemeral-chat-view.js:201` | POST `/v2/paste-offload` | Side/Quick Chat 浮窗的粘贴落盘（同一路由、独立调用点） | **远程禁用（v1）**：同主界面口径 | 漂移守卫；T8 远程禁用态用例 |
-| `public/sidebar/index.js:1802` | GET `result.exportUrl`（即 `/v2/session-export/{token}`，一次性 token，TTL 由 `SessionExportRegistry` 管） | 侧栏「导出会话 HTML」：先 `session_export` 换一次性 URL，再 fetch 成 blob 下载 | **远程禁用（v1）**：远程模式隐藏导出入口；本机原生保存路径（`save_session_export` 走 host_control）不受影响 | 漂移守卫；T8 导出入口可见性用例 |
-| `public/settings/package-browse.js:85` | GET `https://raw.githubusercontent.com/palandatarxcom/Picot/main/community-extensions.json`（绝对第三方 URL，非 host 相对） | Settings → 扩展「社区包市场」目录拉取 | **远程禁用**：设置面整体是 Desktop-only 本机 SSOT（D2），远程模式下设置页不提供该能力，不以「绝对 URL 与 host 无关」为由放行 | 漂移守卫 |
+| `public/app/websocket-client.js:260` | GET `/v2/bootstrap?workspaceId&sessionId`（`loadCanonicalTarget`，header 走 `host-origin.js` 注入的 desktop capability） | hello 前的 canonical 路由三元组（workspace/session/instance）解析 | **新受限 op `workspace.bootstrap`**：单方法固定 schema（入参 workspaceId+sessionId，出参与现 `bootstrap_target` 的 `RuntimeTarget` 同形），长度/超时沿 `transport_limits`（`WS_PHYSICAL_FRAME_BYTES` / 数据面帧上限），**不接受任意 URL 代理**；归属 T5 服务端 + T8 前端改写。**已按 T8b 改写**：bridge 客户端走 `data_request`（帧只含 type/requestId/operation/workspaceId/sessionId，`protocolVersion` 会触发固定 schema 拒绝），本机 HTTP 路径逐字不变 | 漂移守卫；T5 op 契约测试（固定 schema + 越界拒绝）；T8 前端用例 |
+| `public/app.js:4012` | POST `/v2/paste-offload`（body 上限 `PASTE_BODY_BYTES` 4 MiB） | 主界面 composer 的粘贴落盘（大段粘贴换成文件引用） | **远程禁用（v1）**：远程 host 上粘贴退化为纯文本就地处理，UI 显式提示不落盘，不回落本机 host。**已按 T8b 改写**：`isDisabled()` + `input.pasteRemoteDisabled` 提示行，隐藏“作为文件附加”按钮 | 漂移守卫；T8 远程禁用态用例 |
+| `public/ephemeral-chat-view.js:201` | POST `/v2/paste-offload` | Side/Quick Chat 浮窗的粘贴落盘（同一路由、独立调用点） | **远程禁用（v1）**：同主界面口径。**已按 T8b 改写**：视图收到 `remoteHost` 即禁用，口径与主界面一致 | 漂移守卫；T8 远程禁用态用例 |
+| `public/sidebar/index.js:1802` | GET `result.exportUrl`（即 `/v2/session-export/{token}`，一次性 token，TTL 由 `SessionExportRegistry` 管） | 侧栏「导出会话 HTML」：先 `session_export` 换一次性 URL，再 fetch 成 blob 下载 | **远程禁用（v1）**：远程模式隐藏导出入口；本机原生保存路径（`save_session_export` 走 host_control）不受影响。**已按 T8b 改写**：`exportSession` 在 bridge identity 下直接返回；命令面板的「导出 HTML」入口远程不渲染（`session_export` 属 HostManagement 面，host 端本就拒绝） | 漂移守卫；T8 导出入口可见性用例 |
+| `public/settings/package-browse.js:85` | GET `https://raw.githubusercontent.com/palandatarxcom/Picot/main/community-extensions.json`（绝对第三方 URL，非 host 相对） | Settings → 扩展「社区包市场」目录拉取 | **远程禁用**：设置面整体是 Desktop-only 本机 SSOT（D2），远程模式下设置页不提供该能力，不以「绝对 URL 与 host 无关」为由放行。**已按 T8b 改写**：`managementAvailable()` 为假时不发请求，列表渲染 `extensions.desktopOnly` | 漂移守卫 |
 | `public/i18n.js:108` | GET `/locales/${locale}.json`（静态资源，`cache: no-store`） | UI shell 文案加载（四语） | **显式保持本机**：UI 静态资源始终由本机 HostServer 服务（spec §2.7），不是数据面回落；host 切换不改变该 origin | 漂移守卫 |
 | `public/pair.html:133` | POST `/v2/auth/exchange`（body: pairingToken + deviceId） | 本机 LAN 配对页（浏览器/移动端直连本机 loopback） | **远程禁用**：relay 客户端配对走 hello 内嵌 exchange + `hello_ack` 铸 token，不经此页；远程 host 无 loopback HTTP 面 | 漂移守卫 |
 | `public/pair.html:155` | GET `/v2/mobile/status`（Bearer deviceToken） | 同上，配对成功后的连通性回显 | **远程禁用**：同上 | 漂移守卫 |

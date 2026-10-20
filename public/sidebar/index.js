@@ -1797,6 +1797,9 @@ export class SessionSidebar {
     try {
       const sessionId = session?.id;
       if (!sessionId || !this.transport?.exportSession) return;
+      // A remote host has no session-export face (D2 / T1 inventory): never
+      // ask an app-bridge page for a desktop-only one-shot export grant.
+      if (this.transport?.wsClient?.identity === "bridge") return;
       const result = await this.transport.exportSession(sessionId);
       if (!result?.exportUrl) return;
       const response = await fetch(result.exportUrl);

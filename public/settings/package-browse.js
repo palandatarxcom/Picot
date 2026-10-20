@@ -5,6 +5,7 @@ export function setupPackageBrowse({
   root = document,
   transport,
   nativeAvailable,
+  managementAvailable = () => true,
   t,
   createIcon,
   renderPackageInstallFailure,
@@ -43,6 +44,15 @@ export function setupPackageBrowse({
 
   async function loadBrowsePackages(force = false) {
     if (!browseListEl) return;
+    // Settings-class (management face) surface: a remote host never reaches the
+    // community catalog (T1 inventory), so it is not even fetched.
+    if (!managementAvailable()) {
+      const denied = document.createElement("div");
+      denied.className = "settings-api-keys-empty pkg-browse-full-row";
+      denied.textContent = t("extensions.desktopOnly");
+      browseListEl.replaceChildren(denied);
+      return;
+    }
     if (browseLoading) return;
     if (browseLoaded && !force) {
       renderBrowsePackages();

@@ -289,7 +289,26 @@
             <span class="landing-btn-icon" id="landing-add-project-icon"></span>
             <span data-i18n="sidebar.addProject">Add project</span>
           </button>
+          <button type="button" class="landing-btn" id="landing-add-host-btn">
+            <span data-i18n="landing.addHost">Add remote host</span>
+          </button>
         </div>
+        <form class="landing-add-host hidden" id="landing-add-host-form">
+          <input
+            id="landing-add-host-url"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            data-i18n-ph="landing.addHostPlaceholder"
+          />
+          <button
+            type="submit"
+            class="landing-btn"
+            id="landing-add-host-submit"
+            data-i18n="landing.addHostSubmit"
+          ></button>
+        </form>
+        <div class="landing-add-host-result hidden" id="landing-add-host-result" role="status"></div>
         <div class="landing-notice hidden" id="landing-notice" role="status"></div>
         <button
           type="button"

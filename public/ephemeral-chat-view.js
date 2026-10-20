@@ -42,10 +42,14 @@ export class EphemeralChatView {
     loadModelCatalog,
     configGateway = null,
     onOpenModelsSettings = null,
+    remoteHost = false,
   }) {
     this.runtime = runtime;
     this.kind = kind || "side-chat";
     this.toolsEnabled = toolsEnabled !== false;
+    // Remote host: no paste-offload face (T1 inventory), so the composer says
+    // why the paste stays inline instead of offering an action the host refuses.
+    this.remoteHost = remoteHost === true;
     this.destroyed = false;
     this._interactionLocked = false;
     // Model list for the shared selector; populated on first menu open.
@@ -210,6 +214,7 @@ export class EphemeralChatView {
           );
         return result?.path;
       },
+      disabledReason: this.remoteHost ? t("input.pasteRemoteDisabled") : null,
       t,
     });
 

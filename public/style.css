@@ -217,6 +217,46 @@ body.landing-mode #landing {
 .landing-btn:active {
   transform: translateY(1px);
 }
+.landing-add-host {
+  margin-top: var(--space-4);
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+.landing-add-host input {
+  width: 320px;
+  height: 40px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass-hover);
+  border: 1px solid var(--border-bright);
+  color: var(--text-primary);
+  font-size: var(--font-size-md);
+}
+.landing-add-host-result {
+  margin-top: var(--space-3);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  max-width: 560px;
+  text-align: center;
+}
+.landing-add-host-action {
+  height: 28px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--bg-glass-hover);
+  border: 1px solid var(--border-bright);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+.landing-add-host-action:hover {
+  background: var(--bg-glass-active);
+  border-color: var(--border-hover);
+}
 .landing-notice {
   margin-top: var(--space-6);
   color: var(--text-secondary);

@@ -49,6 +49,7 @@ const locale = {
     collapseAllTools: "Collapse tools",
     compactDesc: "Compact the context",
     exportHtmlDesc: "Export this chat",
+    pasteRemoteDisabled: "Remote host: pasted text stays inline",
     sessionStatsDesc: "Show session statistics",
     expandAllToolsDesc: "Expand all tools",
     collapseAllToolsDesc: "Collapse all tools",
@@ -607,5 +608,28 @@ describe("EphemeralChatView safety-guard teardown", () => {
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     expect(respond).not.toHaveBeenCalled();
     expect(view._dialogContainer.classList.contains("hidden")).toBe(true);
+  });
+});
+
+// T1 inventory row `/v2/paste-offload` (Side/Quick Chat call site): a remote
+// host never offers the offload action, and the composer says why.
+describe("EphemeralChatView remote paste", () => {
+  it("disables paste offload on a remote host and keeps it for the local host", () => {
+    const remote = new EphemeralChatView({
+      runtime: makeRuntime(),
+      kind: "side-chat",
+      toolsEnabled: true,
+      remoteHost: true,
+    });
+    const local = new EphemeralChatView({
+      runtime: makeRuntime(),
+      kind: "side-chat",
+      toolsEnabled: true,
+    });
+
+    expect(remote._pasteOffload.isDisabled()).toBe(true);
+    expect(local._pasteOffload.isDisabled()).toBe(false);
+    remote.destroy();
+    local.destroy();
   });
 });

@@ -28,6 +28,7 @@ export function setupComposerPasteOffload({
   container,
   document: doc = globalThis.document,
   offload,
+  disabledReason = null,
   t = (key, params) => key.replace(/\{(\w+)\}/g, (_, name) => params?.[name] ?? ""),
 }) {
   if (!textarea || !container || typeof offload !== "function") {
@@ -65,8 +66,13 @@ export function setupComposerPasteOffload({
       prompt.classList.add("hidden");
       return;
     }
-    label.textContent = t("input.pasteDetected", { size: formatSize(pending.bytes) });
+    // A remote host has no paste-offload face (T1 inventory): say so instead of
+    // offering an action the host would refuse.
+    label.textContent = disabledReason
+      ? disabledReason
+      : t("input.pasteDetected", { size: formatSize(pending.bytes) });
     asFileButton.textContent = t("input.pasteAsFile");
+    asFileButton.classList.toggle("hidden", Boolean(disabledReason));
     keepInlineButton.textContent = t("input.keepInline");
     prompt.classList.remove("hidden");
   };
@@ -147,6 +153,7 @@ export function setupComposerPasteOffload({
   return {
     dismiss,
     isBusy: () => busy,
+    isDisabled: () => Boolean(disabledReason),
     destroy: () => {
       busy = false;
       delete textarea.dataset.pasteOffloadBusy;

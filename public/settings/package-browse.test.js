@@ -179,3 +179,29 @@ describe("Community package browser", () => {
     expect(onInstalledChanged).toHaveBeenCalledTimes(1);
   });
 });
+
+// T1 inventory row: the community catalog is a settings-class (Desktop-only)
+// surface, so a host that denies the management face must not fetch it at all.
+it("never fetches the community catalog without the management face", async () => {
+  const root = createRoot();
+  const fetchSpy = vi.fn();
+  vi.stubGlobal("fetch", fetchSpy);
+  const browser = setupPackageBrowse({
+    root,
+    transport: { listPiPackages: vi.fn() },
+    nativeAvailable: () => false,
+    managementAvailable: () => false,
+    t: translations,
+    createIcon: () => document.createElement("span"),
+    renderPackageInstallFailure: vi.fn(),
+    setExtensionActionButton: (button, label) => {
+      button.textContent = label;
+    },
+    catalogUrl: "https://registry.test/catalog.json",
+  });
+
+  await browser.load();
+
+  expect(fetchSpy).not.toHaveBeenCalled();
+  expect(root.getElementById("pkg-browse-list").textContent).toContain("Desktop only");
+});

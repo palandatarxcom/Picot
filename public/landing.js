@@ -35,6 +35,7 @@ import {
   t,
 } from "./i18n.js";
 import { createIcon, replaceButtonGlyph, setButtonIcon } from "./icons.js";
+import { setupLandingAddHost } from "./landing/add-host.js";
 import { setupLandingConfigRuntime } from "./landing/landing-config-runtime.js";
 import { setupNotificationWindowEvents } from "./notification-window-events.js";
 import { renderPackageInstallFailure } from "./packages/install-status.js";
@@ -86,7 +87,10 @@ await initI18n();
 installHostOriginFetch(window);
 const hostConnection = await connectHost({ env: window });
 const wsClient = new WebSocketClient(hostConnection.wsUrl, hostConnection.clientOptions);
-if (hostConnection.identity === "bridge") {
+// Remote host: landing keeps working, but the surfaces with no remote face
+// (paste offload, community catalog) say so instead of falling back locally.
+const remoteHost = hostConnection.identity === "bridge";
+if (remoteHost) {
   watchCredentialInvalid(wsClient, () => wsClient.disconnect());
 }
 const transport = initTransport({ wsClient, env: window });
@@ -117,6 +121,7 @@ const createLandingEphemeralView = (runtime) =>
     runtime,
     kind: runtime.kind,
     toolsEnabled: runtime.kind === "side-chat",
+    remoteHost,
     getWorkspaceRoot: () => null,
     loadModelCatalog: () => Promise.resolve(null),
   });
@@ -326,6 +331,9 @@ function addProjectViaPicker() {
 }
 document.getElementById("add-project-btn")?.addEventListener("click", addProjectViaPicker);
 document.getElementById("landing-add-project-btn")?.addEventListener("click", addProjectViaPicker);
+// Remote host entry (T8): paste a connection offer, answer TOFU, done. T9
+// replaces this with the sidebar host picker; landing needs a working path now.
+setupLandingAddHost({ document, t });
 document.getElementById("refresh-sessions-btn")?.addEventListener("click", () => {
   void sidebar.refresh();
 });
@@ -1209,6 +1217,7 @@ const packageBrowse = setupPackageBrowse({
   root: document,
   transport,
   nativeAvailable: () => transport.capabilities.native,
+  managementAvailable: () => transport.capabilities.management,
   t,
   createIcon,
   renderPackageInstallFailure,
