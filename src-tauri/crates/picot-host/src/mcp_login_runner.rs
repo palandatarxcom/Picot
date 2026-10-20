@@ -616,12 +616,14 @@ mod tests {
     }
     #[cfg(unix)]
     fn wait_terminal(runner: &McpLoginRunner, owner: &OwnerId, id: &str) -> Value {
-        for _ in 0..100 {
+        // Load-tolerant budget: the fake binary's 0.3s sleep can stretch well
+        // past 2.5s when the full lib suite runs in parallel; 10s stays bounded.
+        for _ in 0..200 {
             let status = runner.status(owner, id).unwrap();
             if status["status"] != "pending" {
                 return status;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(50));
         }
         panic!("login did not finish");
     }
