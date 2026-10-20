@@ -30,9 +30,14 @@ export function resolveWebSocketUrl(env = globalThis.window || globalThis) {
 }
 
 export class WebSocketClient extends EventTarget {
-  constructor(url) {
+  constructor(url, { identity = "desktop", grant = null, capabilitiesFromAck } = {}) {
     super();
     this.url = url;
+    // "bridge" is a window behind the app-owned loopback bridge (remote host):
+    // its hello carries the window grant and never the desktop capability.
+    this.identity = identity;
+    this.bridgeGrant = grant;
+    this._capabilitiesFromAck = capabilitiesFromAck || (() => ({ native: true, class: "native" }));
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = Infinity;
@@ -306,8 +311,9 @@ export class WebSocketClient extends EventTarget {
       protocolVersion: 2,
       clientType: "desktop",
       clientId: this.clientId || `desktop-${globalThis.crypto?.randomUUID?.() || Date.now()}`,
-      desktopCapability: capability,
     };
+    if (this.identity === "desktop") hello.desktopCapability = capability;
+    else if (this.bridgeGrant) hello.bridgeGrant = this.bridgeGrant;
     try {
       this.ws.send(JSON.stringify(hello));
     } catch (err) {
@@ -679,6 +685,9 @@ export class WebSocketClient extends EventTarget {
         code: message.error?.code,
         message: message.error?.message || message.error?.code || "Request failed",
       };
+      // Handshake rejections carry no requestId, so they reach no promise;
+      // host-connection reads credential state from this frame.
+      this.dispatchEvent(new CustomEvent("hostError", { detail: error }));
       this.resolveControl({
         requestId: error.requestId,
         ok: false,
@@ -712,7 +721,7 @@ export class WebSocketClient extends EventTarget {
 
     // HostServer v2 acknowledges authenticated hello directly.
     if (message.type === "hello_ack") {
-      this.capabilities = { native: true, class: "native" };
+      this.capabilities = this._capabilitiesFromAck(message);
       this.authenticated = true;
       this.dispatchEvent(new CustomEvent("hostCapabilities", { detail: this.capabilities }));
       this._subscribeCanonicalTarget();

@@ -7,10 +7,11 @@
 // terminal, model picker, and their owner-bootstrap handlers. No Git refresh
 // or model-catalog request may run at landing generation 0.
 
+import { connectHost, watchCredentialInvalid } from "./app/host-connection.js";
 import { installHostOriginFetch } from "./app/host-origin.js";
 import { initTransport } from "./app/transport.js";
 import { createAppUpdater } from "./app/updater.js";
-import { resolveWebSocketUrl, WebSocketClient } from "./app/websocket-client.js";
+import { WebSocketClient } from "./app/websocket-client.js";
 import {
   applyAppearanceToDom,
   FONT_SIZE_LEVELS,
@@ -83,7 +84,11 @@ applyTheme(getCurrentTheme());
 await initI18n();
 
 installHostOriginFetch(window);
-const wsClient = new WebSocketClient(resolveWebSocketUrl(window));
+const hostConnection = await connectHost({ env: window });
+const wsClient = new WebSocketClient(hostConnection.wsUrl, hostConnection.clientOptions);
+if (hostConnection.identity === "bridge") {
+  watchCredentialInvalid(wsClient, () => wsClient.disconnect());
+}
 const transport = initTransport({ wsClient, env: window });
 const preferencesClient = createPreferencesClient({ transport });
 // Landing bridge-service config runtime (spec v2): lazy spawn on first

@@ -7,6 +7,7 @@
 
 import { createComposerDraftStore } from "./app/composer-draft-store.js";
 import { resolveComposerSessionIdentity } from "./app/composer-session-identity.js";
+import { connectHost, watchCredentialInvalid } from "./app/host-connection.js";
 import { installHostOriginFetch } from "./app/host-origin.js";
 import { createPromptDelivery } from "./app/prompt-delivery.js";
 import { createSessionStoppedBanner } from "./app/session-stopped-banner.js";
@@ -14,7 +15,7 @@ import { StateManager } from "./app/state.js";
 import { initTransport } from "./app/transport.js";
 import { createAppUpdater } from "./app/updater.js";
 import { setupVoiceInput } from "./app/voice-input.js";
-import { resolveWebSocketUrl, WebSocketClient } from "./app/websocket-client.js";
+import { WebSocketClient } from "./app/websocket-client.js";
 import {
   applyAppearanceToDom,
   defaultWebglRenderer,
@@ -592,8 +593,15 @@ function dismissBootSwapOverlayWhenReady() {
 
 // Initialize components
 installHostOriginFetch(window);
-const wsUrl = resolveWebSocketUrl(window);
-const wsClient = new WebSocketClient(wsUrl);
+// The window's host lives on its URL (`?host=<id>`); the local host resolves
+// to today's origin socket, a remote one to its app-owned bridge socket.
+const hostConnection = await connectHost({ env: window });
+const wsClient = new WebSocketClient(hostConnection.wsUrl, hostConnection.clientOptions);
+// §2.5: only an explicit rejection invalidates a stored credential — stop
+// retrying it (the host picker owns the visible state).
+if (hostConnection.identity === "bridge") {
+  watchCredentialInvalid(wsClient, () => wsClient.disconnect());
+}
 // Unified control transport: every process/window lifecycle and native op goes
 // through HostServer v2 WebSocket. Pi runtime commands use runtime_request;
 // host lifecycle uses host_request.
