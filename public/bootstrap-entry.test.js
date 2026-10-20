@@ -59,3 +59,30 @@ test("non-native / keeps the browser app entry", async () => {
 test("native canonical workspace routes keep the app entry", async () => {
   expect(await boot("/workspaces/wid/sessions/sid", "native-capability")).toEqual(["app"]);
 });
+
+const lastHostBoot = async (saved, hosts) => {
+  const invoke = vi.fn(async () => hosts);
+  globalThis.__TAURI__ = { core: { invoke } };
+  window.localStorage.setItem("picot-last-host", saved);
+  try {
+    const entries = await boot("/", "native-capability");
+    return { entries, search: window.location.search, invoke };
+  } finally {
+    delete globalThis.__TAURI__;
+    window.localStorage.removeItem("picot-last-host");
+    window.history.replaceState({}, "", "/");
+  }
+};
+
+test("native / opens the window on the last host the user picked", async () => {
+  const { entries, search, invoke } = await lastHostBoot("r1", [{ serverId: "r1" }]);
+  expect(entries).toEqual(["landing"]);
+  expect(search).toBe("?host=r1");
+  expect(invoke.mock.calls[0][0]).toBe("host_list");
+});
+
+test("a remembered host that is gone still boots the landing on the local host", async () => {
+  const { entries, search } = await lastHostBoot("r9", [{ serverId: "r1" }]);
+  expect(entries).toEqual(["landing"]);
+  expect(search).toBe("");
+});

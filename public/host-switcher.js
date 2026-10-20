@@ -1,7 +1,12 @@
 // ABOUTME: Sidebar host button and its picker: local plus saved remote hosts,
 // ABOUTME: status badges, add-host TOFU question, and §2.5 per-row removal.
 
-import { LOCAL_HOST, resolveHostFromUrl, switchHost } from "./app/host-connection.js";
+import {
+  LAST_HOST_KEY,
+  LOCAL_HOST,
+  resolveHostFromUrl,
+  switchHost,
+} from "./app/host-connection.js";
 import { t as i18n, onLocaleChange } from "./i18n.js";
 import { replaceButtonGlyph } from "./icons.js";
 
@@ -15,8 +20,8 @@ import { replaceButtonGlyph } from "./icons.js";
  * log line.
  */
 
-/** Where the last explicit host choice is kept (contract 4 window default). */
-export const LAST_HOST_KEY = "picot-last-host";
+/** Re-exported for the switcher's tests and callers. */
+export { LAST_HOST_KEY };
 
 /** Badge states the app reports per host (`host_client` status names). */
 const BADGES = ["connecting", "online", "offline", "credentialInvalid", "saveFailed"];
@@ -106,8 +111,8 @@ export function setupHostSwitcher({
     return { destroy: () => {}, open: async () => {}, refresh: async () => {} };
   }
 
-  // The landing shell shares this markup but never wires the picker (spec §7):
-  // the button ships hidden and only the app shell reveals it.
+  // Both shells wire the picker (spec §7): the button ships hidden in the
+  // markup and exists only where there is an app IPC to answer it.
   button.classList.remove("hidden");
   replaceButtonGlyph(button, "server", { size: 16, document: root });
   const current = resolveHostFromUrl(env);

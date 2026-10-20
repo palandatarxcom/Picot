@@ -26,6 +26,7 @@ import {
 } from "./appearance-preferences.js";
 import { EphemeralChatView } from "./ephemeral-chat-view.js";
 import { setupExtensionUpdateIndicator } from "./extension-update-indicator.js";
+import { setupHostSwitcher } from "./host-switcher.js";
 import {
   getLanguagePreference,
   initI18n,
@@ -334,6 +335,11 @@ document.getElementById("landing-add-project-btn")?.addEventListener("click", ad
 // Remote host entry (T8): paste a connection offer, answer TOFU, done. T9
 // replaces this with the sidebar host picker; landing needs a working path now.
 setupLandingAddHost({ document, t });
+// Host picker (spec §7): landing owns "pick a host" as well as "pick that
+// host's workspace", because a host switch lands on `/` — this very page.
+// Nothing to flush: landing has no composer draft (Quick Chat is
+// landing-scoped and dies with the page), so a switch saves nothing.
+setupHostSwitcher({ flush: () => {} });
 document.getElementById("refresh-sessions-btn")?.addEventListener("click", () => {
   void sidebar.refresh();
 });

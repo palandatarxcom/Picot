@@ -6,6 +6,8 @@
 // Storage channel: document.cookie, NOT sessionStorage/localStorage. Cookies
 // are shared by the host-origin routes while Web Storage remains origin-bound.
 
+import { LOCAL_HOST, resolveHostFromUrl } from "../app/host-connection.js";
+
 const STATE_COOKIE = "pi-studio:nav-state";
 const SIDEBAR_CACHE_COOKIE = "pi-studio:sidebar-cache";
 const SIDEBAR_CACHE_SHARD_PREFIX = "pi-studio:sidebar-cache:shard";
@@ -13,6 +15,17 @@ const SIDEBAR_CACHE_SHARD_PREFIX = "pi-studio:sidebar-cache:shard";
 const COOKIE_MAX_CHARS = 3500;
 const MAX_SHARDS = 20;
 const MAX_DRAFT_LENGTH = 1500;
+
+/**
+ * Sidebar-cache key suffix for this window's host (contract 4: cache keys are
+ * host-namespaced, or a remote host's sidebar hydrates the local projection).
+ * The local host keeps the bare keys, so cookies written before this change
+ * stay valid and nothing local has to migrate.
+ */
+function sidebarHostSuffix() {
+  const host = resolveHostFromUrl();
+  return host === LOCAL_HOST ? "" : `-host-${host}`;
+}
 
 function readCookie(name) {
   try {
@@ -173,8 +186,11 @@ export function isCompleteSidebarProject(project) {
 }
 
 function clearSidebarCache() {
-  deleteCookie(SIDEBAR_CACHE_COOKIE);
-  for (let i = 0; i < MAX_SHARDS; i += 1) deleteCookie(`${SIDEBAR_CACHE_SHARD_PREFIX}:${i}`);
+  const suffix = sidebarHostSuffix();
+  deleteCookie(`${SIDEBAR_CACHE_COOKIE}${suffix}`);
+  for (let i = 0; i < MAX_SHARDS; i += 1) {
+    deleteCookie(`${SIDEBAR_CACHE_SHARD_PREFIX}:${i}${suffix}`);
+  }
 }
 
 /**
@@ -198,12 +214,13 @@ export function cacheSidebarProjects(projects) {
       clearSidebarCache();
       return;
     }
+    const suffix = sidebarHostSuffix();
     clearSidebarCache();
     shards.forEach((shard, index) => {
-      writeCookie(`${SIDEBAR_CACHE_SHARD_PREFIX}:${index}`, shard, 300);
+      writeCookie(`${SIDEBAR_CACHE_SHARD_PREFIX}:${index}${suffix}`, shard, 300);
     });
     writeCookie(
-      SIDEBAR_CACHE_COOKIE,
+      `${SIDEBAR_CACHE_COOKIE}${suffix}`,
       JSON.stringify({ ts: Date.now(), shards: shards.length }),
       300,
     );
@@ -219,7 +236,8 @@ export function cacheSidebarProjects(projects) {
  */
 export function readCachedSidebarProjects(maxAgeMs = 120_000) {
   try {
-    const metaRaw = readCookie(SIDEBAR_CACHE_COOKIE);
+    const suffix = sidebarHostSuffix();
+    const metaRaw = readCookie(`${SIDEBAR_CACHE_COOKIE}${suffix}`);
     if (!metaRaw) return null;
     const meta = JSON.parse(metaRaw);
     if (typeof meta.ts !== "number" || Date.now() - meta.ts > maxAgeMs) {
@@ -229,7 +247,7 @@ export function readCachedSidebarProjects(maxAgeMs = 120_000) {
     if (typeof meta.shards !== "number" || meta.shards < 1) return null;
     let payload = "";
     for (let i = 0; i < meta.shards; i += 1) {
-      const shard = readCookie(`${SIDEBAR_CACHE_SHARD_PREFIX}:${i}`);
+      const shard = readCookie(`${SIDEBAR_CACHE_SHARD_PREFIX}:${i}${suffix}`);
       if (!shard) {
         clearSidebarCache();
         return null;

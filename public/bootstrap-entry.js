@@ -5,6 +5,7 @@
 // files; a second failure means it's a real bug, so we stop retrying.
 const RELOAD_GUARD_KEY = "picot:bootstrap-reload-attempted";
 
+import { applyLastHostDefault } from "./app/host-connection.js";
 import { readInjectedCapability } from "./app/host-origin.js";
 
 // Route discriminator, decided BEFORE any app module loads: app.js constructs
@@ -18,7 +19,13 @@ const native = Boolean(readInjectedCapability());
 const pathname = globalThis.location?.pathname || "";
 const landingEntry = "./landing.js";
 const appEntry = "./app.js";
-const entry = native && (pathname === "/" || pathname === "") ? landingEntry : appEntry;
+const landing = native && (pathname === "/" || pathname === "");
+// Contract 4 window default, and only here: the landing route is what a new
+// window opens, while every canonical workspace route already names its host
+// on the URL (a workspace route without one is a local workspace, never a
+// default). A stale or unreadable last host leaves the window local.
+if (landing) await applyLastHostDefault();
+const entry = landing ? landingEntry : appEntry;
 
 import(entry)
   .then(() => sessionStorage.removeItem(RELOAD_GUARD_KEY))

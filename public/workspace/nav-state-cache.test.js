@@ -47,6 +47,8 @@ describe("nav-state-cache", () => {
 
   afterEach(() => {
     clearCookies();
+    // Host namespacing reads the window URL: never leak a param to the next test.
+    window.history.replaceState({}, "", "/");
   });
 
   describe("snapshotNavState / consumeNavState", () => {
@@ -235,6 +237,30 @@ describe("nav-state-cache", () => {
       cacheSidebarProjects(undefined);
       cacheSidebarProjects("not-an-array");
       expect(readCachedSidebarProjects()).toBeNull();
+    });
+
+    it("namespaces the cache by host so a remote never hydrates the local projection", () => {
+      const goTo = (search) => window.history.replaceState({}, "", `/${search}`);
+      goTo("?host=r1");
+      cacheSidebarProjects(sampleProjects);
+      expect(readCachedSidebarProjects()).not.toBeNull();
+
+      // Another host shares this origin and document.cookie, not this cache.
+      goTo("?host=r2");
+      expect(readCachedSidebarProjects()).toBeNull();
+
+      goTo("?host=r1");
+      expect(readCachedSidebarProjects()).not.toBeNull();
+
+      // The local host keeps its own keys, so its cache survives a remote one.
+      goTo("");
+      expect(readCachedSidebarProjects()).toBeNull();
+      cacheSidebarProjects(sampleProjects);
+      goTo("?host=r1");
+      expect(readCachedSidebarProjects()).not.toBeNull();
+      goTo("");
+      expect(readCachedSidebarProjects()).not.toBeNull();
+      goTo("");
     });
   });
 });

@@ -2,9 +2,11 @@
 // ABOUTME: per-host ws URL, capability fallback, and the reload-based switch.
 import { describe, expect, test, vi } from "vitest";
 import {
+  applyLastHostDefault,
   connectHost,
   hostUrl,
   isCredentialRejection,
+  LAST_HOST_KEY,
   LOCAL_HOST,
   readCapabilities,
   resolveHostFromUrl,
@@ -247,5 +249,78 @@ describe("connectHost", () => {
     await expect(
       connectHost({ env: { location: { href: "http://127.0.0.1:47821/?host=r1" } }, invoke }),
     ).rejects.toThrow(/grant/i);
+  });
+});
+
+describe("applyLastHostDefault", () => {
+  const bootEnv = (href, stored) => {
+    const replaced = [];
+    return {
+      replaced,
+      env: {
+        location: { href },
+        localStorage: { getItem: (key) => (key === LAST_HOST_KEY ? stored : null) },
+        history: { replaceState: (_state, _title, url) => replaced.push(url) },
+      },
+    };
+  };
+  const hosts = [{ serverId: "local-gone" }, { serverId: "r1", label: "desk" }];
+
+  test("a window with no host param opens the remembered host", async () => {
+    const { env, replaced } = bootEnv("http://127.0.0.1:47821/", "r1");
+    const invoke = vi.fn(async () => hosts);
+    expect(await applyLastHostDefault({ env, invoke })).toBe("r1");
+    expect(invoke.mock.calls).toEqual([["host_list"]]);
+    // The param is written on this window's own URL, with no navigation.
+    expect(replaced).toEqual(["http://127.0.0.1:47821/?host=r1"]);
+    expect(resolveHostFromUrl({ location: { href: replaced[0] } })).toBe("r1");
+  });
+
+  test("a remembered host that was deleted leaves the window local", async () => {
+    const { env, replaced } = bootEnv("http://127.0.0.1:47821/", "r9");
+    expect(await applyLastHostDefault({ env, invoke: vi.fn(async () => hosts) })).toBeNull();
+    expect(replaced).toEqual([]);
+  });
+
+  test("no cache stays local without asking the app anything", async () => {
+    const { env, replaced } = bootEnv("http://127.0.0.1:47821/", null);
+    const invoke = vi.fn(async () => hosts);
+    expect(await applyLastHostDefault({ env, invoke })).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(replaced).toEqual([]);
+  });
+
+  test("the local host is never a default worth writing into the URL", async () => {
+    const { env, replaced } = bootEnv("http://127.0.0.1:47821/", LOCAL_HOST);
+    const invoke = vi.fn(async () => hosts);
+    expect(await applyLastHostDefault({ env, invoke })).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(replaced).toEqual([]);
+  });
+
+  test("an explicit host param wins over the cache", async () => {
+    const { env, replaced } = bootEnv("http://127.0.0.1:47821/?host=r2", "r1");
+    const invoke = vi.fn(async () => hosts);
+    expect(await applyLastHostDefault({ env, invoke })).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(replaced).toEqual([]);
+  });
+
+  test("a failing or absent host list never blocks startup", async () => {
+    const { env } = bootEnv("http://127.0.0.1:47821/", "r1");
+    const failing = vi.fn(async () => {
+      throw new Error("host_list unavailable");
+    });
+    expect(await applyLastHostDefault({ env, invoke: failing })).toBeNull();
+    expect(await applyLastHostDefault({ env, invoke: null })).toBeNull();
+    const unreadable = {
+      ...env,
+      localStorage: {
+        getItem: () => {
+          throw new Error("storage blocked");
+        },
+      },
+    };
+    expect(await applyLastHostDefault({ env: unreadable, invoke: failing })).toBeNull();
   });
 });

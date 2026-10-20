@@ -14,6 +14,9 @@ import { resolveWebSocketUrl } from "./websocket-client.js";
 export const HOST_PARAM = "host";
 export const LOCAL_HOST = "local";
 
+/** Where the last explicit host choice is kept (contract 4 window default). */
+export const LAST_HOST_KEY = "picot-last-host";
+
 /** Faces a hello_ack may advertise (contract 1 / D2 action matrix). */
 const FACES = ["native", "navigation", "git", "terminal", "management"];
 
@@ -126,6 +129,43 @@ export function switchHost(
   const go = navigate || ((href) => locationOf(env).assign(href));
   go(url);
   return url;
+}
+
+/**
+ * Cold-start default (contract 4): a window opened at the landing route with
+ * no host param opens the last host the user picked, when that host still
+ * exists. The URL is rewritten in place — no reload — so every later reader
+ * (the socket, the per-host cache keys) agrees with what this window shows.
+ * A stale or unreadable default never blocks startup: any doubt stays local.
+ */
+export async function applyLastHostDefault({
+  env = globalThis.window || globalThis,
+  invoke = tauriInvoke(env),
+} = {}) {
+  if (paramsOf(env).get(HOST_PARAM)) return null;
+  let saved = null;
+  try {
+    saved = env?.localStorage?.getItem(LAST_HOST_KEY)?.trim() || null;
+  } catch {
+    return null;
+  }
+  if (!saved || saved === LOCAL_HOST || typeof invoke !== "function") return null;
+  let hosts = null;
+  try {
+    hosts = await invoke("host_list");
+  } catch {
+    return null;
+  }
+  // A deleted host must not reopen this window on a dead host.
+  if (!Array.isArray(hosts) || !hosts.some((host) => host?.serverId === saved)) return null;
+  try {
+    const url = new URL(locationOf(env).href);
+    url.searchParams.set(HOST_PARAM, saved);
+    (env?.history ?? globalThis.history).replaceState(null, "", url.toString());
+  } catch {
+    return null;
+  }
+  return saved;
 }
 
 function tauriInvoke(env = globalThis.window || globalThis) {

@@ -2,7 +2,14 @@
 // ABOUTME: the prepare→commit→navigate contract with no chat-lifecycle objects,
 // ABOUTME: locale-following copy, and Quick Chat entry visibility.
 import { readFileSync } from "node:fs";
+import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+
+// The shipped host picker markup, not a re-typed fixture: landing wires the
+// same picker the app shell does, so its markup must be present here too.
+const INDEX = new JSDOM(readFileSync("public/index.html", "utf8")).window.document;
+const HOST_PICKER_HTML = INDEX.getElementById("host-picker").outerHTML;
+const HOST_BUTTON_HTML = INDEX.getElementById("host-switcher-btn").outerHTML;
 
 test("landing exposes only Global subagents without workspace identity", () => {
   const source = readFileSync("public/landing.js", "utf8");
@@ -218,6 +225,7 @@ function installDom() {
         <button id="refresh-sessions-btn"></button>
         <div class="session-list" id="session-list"></div>
         <button id="settings-btn"></button>
+        <div class="sidebar-footer">${HOST_PICKER_HTML}${HOST_BUTTON_HTML}</div>
         <button id="toggle-pi-path"></button>
         <span id="pi-path-note"></span>
       </div>
@@ -701,4 +709,39 @@ test("workspace open-in-new-window failure lands in the landing notice", async (
   const notice = document.getElementById("landing-notice");
   expect(notice.classList.contains("hidden")).toBe(false);
   expect(notice.textContent).toContain("new window");
+});
+
+test("landing wires the host picker so a pick leaves the landing on that host", async () => {
+  const log = [];
+  let navigationsAtRelease = null;
+  const calls = trackNavigation();
+  const invoke = vi.fn(async (command) => {
+    log.push(command);
+    if (command === "host_list") return [{ serverId: "r1", label: "desk", status: "online" }];
+    if (command === "host_release") navigationsAtRelease = calls.length;
+    return { ok: true };
+  });
+  globalThis.__TAURI__ = { core: { invoke } };
+  try {
+    await bootLanding();
+    const button = document.getElementById("host-switcher-btn");
+    // B1: a host switch lands on `/` — the landing route — so without this
+    // wiring the picker only exists on a route the switch can never reach.
+    expect(button.classList.contains("hidden")).toBe(false);
+
+    button.click();
+    await vi.waitFor(() => expect(document.querySelectorAll(".host-row")).toHaveLength(2));
+    const row = [...document.querySelectorAll(".host-row")].find((n) => n.dataset.hostId === "r1");
+    row.querySelector(".host-row-main").click();
+
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toContain("host=r1");
+    // flush (no composer draft here) → release → navigate.
+    expect(log).toEqual(["host_list", "host_release"]);
+    expect(navigationsAtRelease).toBe(0);
+    expect(localStorage.getItem("picot-last-host")).toBe("r1");
+  } finally {
+    delete globalThis.__TAURI__;
+    localStorage.removeItem("picot-last-host");
+  }
 });
