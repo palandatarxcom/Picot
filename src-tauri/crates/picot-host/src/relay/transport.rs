@@ -396,7 +396,7 @@ async fn run_control_cycle(
     outcome
 }
 
-async fn bounded_writer(
+pub(crate) async fn bounded_writer(
     mut sink_half: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     mut out_rx: mpsc::Receiver<Message>,
 ) {
@@ -409,7 +409,7 @@ async fn bounded_writer(
 
 /// Enqueue on the bounded outbound queue; `false` means full (or writer gone)
 /// — the caller closes the connection.
-fn try_enqueue(out_tx: &mpsc::Sender<Message>, message: Message) -> bool {
+pub(crate) fn try_enqueue(out_tx: &mpsc::Sender<Message>, message: Message) -> bool {
     out_tx.try_send(message).is_ok()
 }
 
@@ -816,7 +816,7 @@ async fn e2ee_server_handshake(
 /// quartet boundary a plaintext one byte over still fits the wire cap).
 /// `None` is any of: bad base64, failed decryption, oversized or non-UTF-8
 /// plaintext — all connection-closing violations.
-fn decrypt_frame(shared: &[u8; 32], wire: &str) -> Option<String> {
+pub(crate) fn decrypt_frame(shared: &[u8; 32], wire: &str) -> Option<String> {
     let bundle = BASE64_STANDARD.decode(wire).ok()?;
     let plaintext = e2ee::open(shared, &bundle).ok()?;
     if plaintext.len() > WS_PHYSICAL_FRAME_BYTES {

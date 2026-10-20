@@ -181,7 +181,7 @@ use axum::Router;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use picot_host::transport_limits::RELAY_DATA_FRAME_TEXT_BYTES;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Forwarding channels are bounded so a stalled peer backpressures the source
@@ -208,9 +208,13 @@ pub struct MockRelay {
 struct Inner {
     gate_open: Mutex<bool>,
     silent: Mutex<Option<SilentMode>>,
+    /// Park client-role sockets after registration: never reading them means
+    /// no automatic WS pong, so the client's liveness probes go unanswered.
+    client_park: watch::Sender<bool>,
     /// Writer half of the current interactive control socket.
     control: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     control_upgrades: AtomicU32,
+    client_upgrades: AtomicU32,
     next_id: AtomicU32,
     /// connectionId → writer channel of the client-role socket.
     clients: Mutex<HashMap<String, mpsc::Sender<Message>>>,
@@ -227,8 +231,10 @@ impl MockRelay {
         let inner = Arc::new(Inner {
             gate_open: Mutex::new(true),
             silent: Mutex::new(None),
+            client_park: watch::channel(false).0,
             control: Mutex::new(None),
             control_upgrades: AtomicU32::new(0),
+            client_upgrades: AtomicU32::new(0),
             next_id: AtomicU32::new(0),
             clients: Mutex::new(HashMap::new()),
             data_pipes: Mutex::new(HashMap::new()),
@@ -262,6 +268,31 @@ impl MockRelay {
         self.inner.data_dials.lock().unwrap().clone()
     }
 
+    /// Number of client-role sockets dialed (the client transport's redials).
+    pub fn client_upgrades(&self) -> u32 {
+        self.inner.client_upgrades.load(Ordering::SeqCst)
+    }
+
+    /// Live client-role connectionIds, ascending — the ids the remote daemon
+    /// side dials as `role=server&connectionId=`.
+    pub fn client_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.inner.clients.lock().unwrap().keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Dial the remote-daemon side of a live client-role connection — the
+    /// `role=server&connectionId=` socket the real daemon opens on
+    /// `connected`. The two sockets are then spliced by the same code path
+    /// the production pairs use.
+    pub async fn connect_data(&self, connection_id: &str) -> MockClientSocket {
+        let url = format!(
+            "ws://{}/ws?serverId=mock&role=server&v=2&connectionId={connection_id}",
+            self.addr
+        );
+        dial_socket(&url).await
+    }
+
     /// `false`: accept control upgrades, then close them at once.
     pub fn set_gate(&self, open: bool) {
         *self.inner.gate_open.lock().unwrap() = open;
@@ -269,6 +300,11 @@ impl MockRelay {
 
     pub fn set_silent(&self, mode: Option<SilentMode>) {
         *self.inner.silent.lock().unwrap() = mode;
+    }
+
+    /// `true`: existing and new client-role sockets stop being read (no pong).
+    pub fn set_client_park(&self, park: bool) {
+        self.inner.client_park.send_replace(park);
     }
 
     /// Push a raw text frame onto the current control socket.
@@ -292,25 +328,29 @@ impl MockRelay {
     /// test correlates via the daemon-side `open_session` callback.
     pub async fn connect_client(&self) -> MockClientSocket {
         let url = format!("ws://{}/ws?role=client&v=2", self.addr);
-        // Same read cap as the server side: at-limit data frames must reach
-        // the test client's reads.
-        let cap = RELAY_DATA_FRAME_TEXT_BYTES.saturating_mul(2);
-        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-            max_message_size: Some(cap),
-            max_frame_size: Some(cap),
-            ..tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-        };
-        let request = url.into_client_request().expect("client url");
-        let (stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            Some(config),
-            false,
-            None::<tokio_tungstenite::Connector>,
-        )
-        .await
-        .expect("mock relay client dial");
-        MockClientSocket { stream }
+        dial_socket(&url).await
     }
+}
+
+/// Dial a mock-relay socket with the shared read cap: at-limit data frames
+/// must reach the test's reads.
+async fn dial_socket(url: &str) -> MockClientSocket {
+    let cap = RELAY_DATA_FRAME_TEXT_BYTES.saturating_mul(2);
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(cap),
+        max_frame_size: Some(cap),
+        ..tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+    };
+    let request = url.into_client_request().expect("mock relay url");
+    let (stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(config),
+        false,
+        None::<tokio_tungstenite::Connector>,
+    )
+    .await
+    .expect("mock relay dial");
+    MockClientSocket { stream }
 }
 
 /// A client-role socket held by the test. Dropping the write side (close) is
@@ -372,6 +412,25 @@ impl MockClientSocket {
         })
         .await
         .ok()
+    }
+
+    /// Next text frame within `duration`, or `None` when the window elapses
+    /// **or the socket ends** — the "collect what arrives, then stop" shape
+    /// a close-observing test needs (no panic on close).
+    pub async fn next_text_or_close(&mut self, duration: Duration) -> Option<String> {
+        tokio::time::timeout(duration, async {
+            loop {
+                match self.stream.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        return Some(text.to_string())
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return None,
+                }
+            }
+        })
+        .await
+        .unwrap_or(None)
     }
 
     /// Await the socket's end (Close frame, EOF, or error).
@@ -473,6 +532,8 @@ async fn control_socket(inner: Arc<Inner>, socket: WebSocket) {
 }
 
 async fn client_socket(inner: Arc<Inner>, socket: WebSocket) {
+    let mut parked = inner.client_park.subscribe();
+    inner.client_upgrades.fetch_add(1, Ordering::SeqCst);
     let id = format!("c-{}", inner.next_id.fetch_add(1, Ordering::SeqCst) + 1);
     let (tx, rx) = mpsc::channel::<Message>(PIPE_CAPACITY);
     inner.clients.lock().unwrap().insert(id.clone(), tx);
@@ -484,7 +545,13 @@ async fn client_socket(inner: Arc<Inner>, socket: WebSocket) {
     let writer = tokio::spawn(pump(rx, sink));
     // client → daemon: forward through the data pipe (bounded, so a slow
     // daemon-side writer backpressures the client socket).
-    while let Some(Ok(message)) = stream.next().await {
+    loop {
+        // Stop polling before tungstenite can queue an automatic pong.
+        let message = tokio::select! {
+            _ = parked.changed() => continue,
+            message = stream.next(), if !*parked.borrow() => message,
+        };
+        let Some(Ok(message)) = message else { break };
         let pipe = inner.data_pipes.lock().unwrap().get(&id).cloned();
         if let Some(pipe) = pipe {
             let _ = pipe.send(message).await;
