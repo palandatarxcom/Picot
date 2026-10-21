@@ -278,7 +278,12 @@ async fn device_reaches_the_navigation_face_and_never_the_management_face() {
     // Navigation ops pass the class check and reach the control plane (no
     // handler installed here, so the answer is `control_unavailable` — the
     // point is that it is no longer `forbidden_class`).
-    for operation in ["workspace.list", "git_status", "workspace_target_prepare"] {
+    for operation in [
+        "workspace.list",
+        "runtime_instances",
+        "git_status",
+        "workspace_target_prepare",
+    ] {
         let reply = send_frame(
             &mut device,
             json!({

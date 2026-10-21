@@ -734,8 +734,9 @@ test("landing wires the host picker so a pick leaves the landing on that host", 
 
     await vi.waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0]).toContain("host=r1");
-    // flush (no composer draft here) → navigate.
-    expect(log).toEqual(["host_list"]);
+    // One read at setup (the button names the current host without a click)
+    // and one when the picker opens; then flush → navigate.
+    expect(log).toEqual(["host_list", "host_list"]);
     expect(localStorage.getItem("picot-last-host")).toBe("r1");
   } finally {
     delete globalThis.__TAURI__;

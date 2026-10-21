@@ -417,6 +417,9 @@ export function setupHostSwitcher({
   });
 
   render();
+  // Read the list once at startup: without it the button cannot name the
+  // current host until the user opens the picker.
+  void refresh();
 
   return {
     /** Open the picker and read the host list. */

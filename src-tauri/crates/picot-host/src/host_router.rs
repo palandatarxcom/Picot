@@ -139,6 +139,10 @@ pub fn host_navigation_operation(operation: &str) -> bool {
             | "workspace_target_prepare"
             | "workspace_transition_commit"
             | "workspace_transition_cancel"
+            // Read-only host inventory the sidebar renders from: without it a
+            // paired device's workspace list never loads (the client fetches
+            // it alongside workspace.list and the pair fails as a whole).
+            | "runtime_instances"
     ) || operation.starts_with("git_")
 }
 

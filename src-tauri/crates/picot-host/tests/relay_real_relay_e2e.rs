@@ -441,6 +441,11 @@ async fn run(iso: &Path) {
     // ---- item 1: bridge session round trip over the real relay ------------
     let (bridge1, log1, saved1, mut socket1, ack) = paired(&mut admin, &owner, DEVICE_1).await;
     assert_eq!(
+        ack["capabilities"]["native"],
+        serde_json::json!(true),
+        "a paired device must see the host's workspaces: {ack}"
+    );
+    assert_eq!(
         ack["type"], "hello_ack",
         "item 1: the pairing exchange must end in hello_ack: {ack}"
     );
