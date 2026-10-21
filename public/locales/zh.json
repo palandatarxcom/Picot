@@ -497,6 +497,7 @@
     "commandUndeliverableNoRoute": "没有运行中的会话可接收",
     "commandUndeliverableUnreachable": "该会话进程已不可达",
     "messageNotDelivered": "消息未送达（{detail}）。会话可能已关闭 — 请新建聊天或重试。",
+    "messageTooLarge": "消息过大（超过 8 MB 上限），未发送。请减少图片数量或压缩图片后重试。",
     "extensionError": "扩展错误：{error}",
     "failedToSwitchSession": "切换会话失败：{error}",
     "failedToSwitchSessionShort": "切换会话失败",

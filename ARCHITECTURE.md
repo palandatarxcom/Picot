@@ -120,6 +120,16 @@ Picot 是一个 Tauri 桌面应用，为每个工作区派生一个 headless `pi
 | `/v2/mobile/status` | HTTP GET | device token（Bearer） | 配对设备只读状态（v1 仅 liveness） |
 | `/pair.html` | HTTP GET | 无（pairing 前唯一 surface） | 手机配对页 |
 
+### 入站帧验证契约
+
+`transport_limits.rs` 对入站帧按业务类别设逻辑上限（区别于 16 MiB 的 WS 物理帧上限）：
+runtime command 8 MiB、data request 256 KiB、host request 256 KiB。runtime command 上限
+以完整 WS 帧序列化字节为准（`host_router::validate_runtime_request`），超限返回
+`command_too_large`；前端将其映射为「消息过大」提示并原样保留 composer 文本与附件。
+多图 prompt 的图片以 base64 内联在命令里，这是该上限按 MiB 而非 KiB 设定的原因。
+调整上限时必须同步评估：物理帧上限（16 MiB）、内嵌 Pi 的 RPC 帧上限（16 MiB）、
+以及 Pi 自身的图片输入预算（默认单图 4.5 MiB 编码后）。
+
 ### 兼容路由的唯一实现规则
 
 `/api/*` 兼容条目是**冻结集合**：只允许继续服务已在 host 内实现的路由，不再新增 handler。

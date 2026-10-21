@@ -40,6 +40,7 @@ let clearQueueFails = false;
 let commandRegistry = [];
 let swallowClearQueue = false;
 let promptFails = false;
+let promptTooLarge = false;
 let abortFails = false;
 let deferPromptResponse = false;
 let deferredPromptId = null;
@@ -101,6 +102,19 @@ class FakeWebSocket extends EventTarget {
         });
         return;
       }
+      if (command.type === "prompt" && promptTooLarge) {
+        // Mirror the host's oversized-frame rejection: a `type:"error"` frame
+        // whose machine code survives the WS layer into the delivery record.
+        this.reply({
+          type: "error",
+          requestId: envelope.requestId,
+          error: {
+            code: "command_too_large",
+            message: "Runtime command exceeds protocol limit",
+          },
+        });
+        return;
+      }
       if (command.type === "clear_queue" && swallowClearQueue) {
         // Deliberately never answer: exercises the abort cap.
         return;
@@ -158,6 +172,7 @@ beforeEach(async () => {
   commandRegistry = [];
   swallowClearQueue = false;
   promptFails = false;
+  promptTooLarge = false;
   abortFails = false;
   deferPromptResponse = false;
   deferredPromptId = null;
@@ -1091,6 +1106,32 @@ test("a rejected steer leaves the pending image attached", async () => {
 
   expect(commandFrames(ws, "prompt")).toHaveLength(1);
   // The steer never reached pi, so the attachment must still be there to send.
+  expect(pendingPreviews()).toHaveLength(1);
+});
+
+test("an oversized prompt rejection shows the size hint and keeps text + images", async () => {
+  // Regression lock for the command_too_large → messageTooLarge mapping:
+  // composer state must survive exactly like any other rejection, but the
+  // transcript shows the actionable size hint instead of the protocol detail.
+  await import("./app.js?oversized-rejected");
+  const ws = wsInstances.at(-1);
+  await settle();
+  runtimeEvent(ws, { type: "agent_start" });
+  await settle();
+
+  promptTooLarge = true;
+  pasteImage();
+  await settle();
+  typeIntoComposer("three big screenshots");
+  pressEnter();
+  await settle();
+
+  const errorRow = document.querySelector("#messages .error-message");
+  expect(errorRow).not.toBeNull();
+  expect(errorRow.textContent).toContain("Message too large");
+  expect(errorRow.textContent).not.toContain("protocol limit");
+  // Nothing was consumed: text stays, the attachment stays pending.
+  expect(document.getElementById("message-input").value).toContain("three big screenshots");
   expect(pendingPreviews()).toHaveLength(1);
 });
 

@@ -8,7 +8,12 @@ pub const WS_PHYSICAL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const HTTP_DEFAULT_BODY_BYTES: usize = 1024 * 1024;
 #[allow(dead_code)]
 pub const PASTE_BODY_BYTES: usize = 4 * 1024 * 1024;
-pub const RUNTIME_COMMAND_BYTES: usize = 1024 * 1024;
+// 8 MiB: multi-image prompts base64-inline their attachments and commonly
+// serialize to several MiB; the legacy 1 MiB cap rejected legitimate sends
+// ("Runtime command exceeds protocol limit"). Kept below
+// WS_PHYSICAL_FRAME_BYTES so the business gate on untrusted inbound input
+// stays distinct from the physical frame cap.
+pub const RUNTIME_COMMAND_BYTES: usize = 8 * 1024 * 1024;
 pub const DATA_REQUEST_BYTES: usize = 256 * 1024;
 pub const HOST_REQUEST_BYTES: usize = 256 * 1024;
 // Outbound session payloads (responses, snapshots, events) share the physical
@@ -196,6 +201,20 @@ mod tests {
                 .unwrap()
                 > RUNTIME_COMMAND_BYTES
         );
+    }
+
+    #[test]
+    fn multi_image_commands_between_legacy_and_new_limit_pass() {
+        // Regression lock for the 1 MiB -> 8 MiB raise, modeled on the real
+        // composer shape: three resized screenshots inline as base64 image
+        // blocks (~2 MiB each here). The legacy 1 MiB cap rejected this
+        // payload; the raised cap must admit it.
+        let legacy_limit = 1024 * 1024;
+        let image = || json!({"type": "image", "data": "x".repeat(2 * legacy_limit), "mimeType": "image/png"});
+        let value =
+            json!({"type": "prompt", "message": "look", "images": [image(), image(), image()]});
+        assert!(value.to_string().len() > 4 * legacy_limit);
+        assert_eq!(validate(&value, PayloadKind::Command), Ok(()));
     }
 
     #[test]

@@ -497,6 +497,7 @@
     "commandUndeliverableNoRoute": "no running session to receive it",
     "commandUndeliverableUnreachable": "the session process is no longer reachable",
     "messageNotDelivered": "Message not delivered ({detail}). The session may have closed — start a new chat or try again.",
+    "messageTooLarge": "Message too large (over the 8 MB limit) and not sent. Remove or compress some images, then retry.",
     "extensionError": "Extension error: {error}",
     "failedToSwitchSession": "Failed to switch session: {error}",
     "failedToSwitchSessionShort": "Failed to switch session",

@@ -495,6 +495,7 @@
     "commandUndeliverableNoRoute": "no hay sesión activa para recibirlo",
     "commandUndeliverableUnreachable": "el proceso de sesión ya no es accesible",
     "messageNotDelivered": "Mensaje no entregado ({detail}). La sesión puede haber cerrado — inicia un nuevo chat o inténtalo de nuevo.",
+    "messageTooLarge": "Mensaje demasiado grande (supera el límite de 8 MB); no se envió. Quita o comprime algunas imágenes e inténtalo de nuevo.",
     "extensionError": "Error de extensión: {error}",
     "failedToSwitchSession": "Error al cambiar de sesión: {error}",
     "failedToSwitchSessionShort": "Error al cambiar de sesión",

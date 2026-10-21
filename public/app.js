@@ -4135,7 +4135,9 @@ const promptDelivery = createPromptDelivery({
       showTypingIndicator(false);
     }
     messageRenderer.renderError(
-      t("errors.messageNotDelivered", { detail: reason?.message || reason?.code || "" }),
+      reason?.code === "command_too_large"
+        ? t("errors.messageTooLarge")
+        : t("errors.messageNotDelivered", { detail: reason?.message || reason?.code || "" }),
     );
     // A dispatched follow-up item returns to the HEAD of its queue (D6,
     // 2026-09-26 spec): its text belongs to the queue, not the composer, and

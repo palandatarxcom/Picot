@@ -495,6 +495,7 @@
     "commandUndeliverableNoRoute": "受信できるセッションが実行されていません",
     "commandUndeliverableUnreachable": "セッションプロセスに到達できなくなりました",
     "messageNotDelivered": "メッセージが届きませんでした（{detail}）。セッションが終了した可能性があります — 新しいチャットを開始するか再試行してください。",
+    "messageTooLarge": "メッセージが大きすぎるため（8 MB 上限超過）、送信されませんでした。画像の数を減らすか圧縮してから再試行してください。",
     "extensionError": "拡張機能エラー：{error}",
     "failedToSwitchSession": "セッションの切り替えに失敗しました：{error}",
     "failedToSwitchSessionShort": "セッションの切り替えに失敗しました",
