@@ -92,7 +92,13 @@ export function watchCredentialInvalid(target, onInvalid) {
 /** This window's URL for a host: the host param is the whole selection. */
 export function hostUrl(hostId, env = globalThis.window || globalThis) {
   const location = locationOf(env);
-  const url = new URL(location?.href ?? "http://localhost/");
+  let url;
+  try {
+    url = new URL(location?.href ?? "http://localhost/");
+  } catch {
+    // A page whose own href will not parse cannot be re-targeted; keep it.
+    return location?.href ?? "";
+  }
   // A host switch starts at that host's landing page: the current path's
   // workspace/session belongs to the outgoing host.
   url.pathname = "/";

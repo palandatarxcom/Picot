@@ -514,6 +514,9 @@ export class SessionSidebar {
     // badge immediately. Full session lists stay lazy — they load when the
     // workspace expands (setWorkspaceExpanded), never at startup.
     const warm = async () => {
+      // The idle callback can outlive the page (jsdom teardown, a reloaded
+      // window): without a document there is nothing to render into.
+      if (typeof document === "undefined") return;
       const registryRows = this.projects.filter((project) => project.source === "registry");
       await Promise.allSettled(
         registryRows.map((project) => this.ensureWorkspaceSessions(project, { countOnly: true })),
