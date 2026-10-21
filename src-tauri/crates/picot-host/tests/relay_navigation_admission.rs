@@ -281,6 +281,9 @@ async fn device_reaches_the_navigation_face_and_never_the_management_face() {
     for operation in [
         "workspace.list",
         "runtime_instances",
+        "get_app_version",
+        "is_dev",
+        "pi_path_status",
         "git_status",
         "workspace_target_prepare",
     ] {

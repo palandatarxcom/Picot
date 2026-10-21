@@ -143,6 +143,11 @@ pub fn host_navigation_operation(operation: &str) -> bool {
             // paired device's workspace list never loads (the client fetches
             // it alongside workspace.list and the pair fails as a whole).
             | "runtime_instances"
+            // Read-only host metadata the page renders from (version row, dev
+            // badge, Pi path). Nothing here mutates host state.
+            | "get_app_version"
+            | "is_dev"
+            | "pi_path_status"
     ) || operation.starts_with("git_")
 }
 
