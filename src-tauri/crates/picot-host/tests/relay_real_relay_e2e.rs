@@ -29,8 +29,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use picot_host::relay::client_role::{ClientRoleConfig, ClientRoleSeams};
 use picot_host::relay::host_bridge::{
-    start_host_bridge_with_seams, BridgeSeams, Credential, GrantRegistry, HostBridgeHandle,
-    HostBridgeStatus, PairingSaveError, PairingSink,
+    start_host_bridge_with_seams, BridgeSeams, Credential, HostBridgeHandle, HostBridgeStatus,
+    PairingSaveError, PairingSink,
 };
 use picot_host::relay::host_store::DeviceToken;
 use picot_host::relay::pairing::{parse_connection_offer, ConnectionOfferV2};
@@ -41,7 +41,8 @@ type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// The WebView's loopback origin, as its page would present it.
-const ORIGIN: &str = "http://e2e.test";
+/// The app's own page origin: a bridge only serves loopback documents.
+const ORIGIN: &str = "http://127.0.0.1:54321";
 const DEVICE_1: &str = "e2e-device-1";
 /// Whole-test backstop: one pairing over the public relay.
 const BUDGET: Duration = Duration::from_secs(120);
@@ -281,7 +282,6 @@ async fn start_bridge(
             pairing_token: DeviceToken::new(pairing_token),
             device_id: device_id.to_owned(),
         },
-        Arc::new(E2eGrants),
         Some(saved),
         BridgeSeams {
             first_frame_timeout: Duration::from_secs(20),
@@ -358,17 +358,8 @@ fn hello() -> String {
         "protocolVersion": 2,
         "clientType": "desktop",
         "clientId": "e2e-1",
-        "bridgeGrant": "e2e-1",
     })
     .to_string()
-}
-
-/// The one live window this e2e grants: token `e2e-1` on ORIGIN, any host id.
-struct E2eGrants;
-impl GrantRegistry for E2eGrants {
-    fn validate(&self, token: &str, _server: &str, origin: &str) -> Option<String> {
-        (token == "e2e-1" && origin == ORIGIN).then(|| token.to_owned())
-    }
 }
 
 /// The D2 navigation request a paired device sends after `hello_ack`.

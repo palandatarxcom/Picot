@@ -222,26 +222,19 @@ describe("connectHost", () => {
     const invoke = vi.fn(async (command) => {
       if (command === "host_status")
         return { serverId: "r1", status: "online", wsUrl: "ws://127.0.0.1:55123/v2/ws" };
-      if (command === "host_grant") return { grant: "grant-r1" };
       throw new Error(`unexpected command ${command}`);
     });
     const connection = await connectHost({
       env: { location: { href: "http://127.0.0.1:47821/?host=r1" } },
       invoke,
     });
-    // The bridge authenticates a window by its grant, not by the loopback port:
-    // a connection without one must never be opened.
-    expect(invoke.mock.calls).toEqual([
-      ["host_status", { serverId: "r1" }],
-      ["host_grant", { serverId: "r1" }],
-    ]);
+    expect(invoke.mock.calls).toEqual([["host_status", { serverId: "r1" }]]);
     expect(connection).toEqual({
       host: "r1",
       identity: "bridge",
       wsUrl: "ws://127.0.0.1:55123/v2/ws",
       clientOptions: {
         identity: "bridge",
-        grant: "grant-r1",
         capabilitiesFromAck: readCapabilities,
       },
     });
@@ -287,12 +280,10 @@ describe("connectHost", () => {
     expect(replaced).toEqual(["http://127.0.0.1:47821/?workspaceId=w1"]);
   });
 
-  test("a host that hands out no grant falls back instead of connecting unauthenticated", async () => {
+  test("a host that reports no bridge URL falls back instead of dialing the origin", async () => {
     const { env, replaced } = recoveryEnv("http://127.0.0.1:47821/?host=r1");
     const invoke = vi.fn(async (command) => {
-      if (command === "host_status")
-        return { serverId: "r1", status: "online", wsUrl: "ws://127.0.0.1:55123/v2/ws" };
-      if (command === "host_grant") return {};
+      if (command === "host_status") return { serverId: "r1", status: "offline" };
       throw new Error(`unexpected command ${command}`);
     });
     const connection = await connectHost({ env, invoke });

@@ -902,7 +902,6 @@ describe("WebSocketClient remote canonical bootstrap", () => {
   function remoteClient() {
     const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
       identity: "bridge",
-      grant: "grant-1",
     });
     client.canonicalRoute = true;
     client.workspaceId = "ws-1";

@@ -108,10 +108,12 @@ async fn host_client_remove_cancels_late_ack() {
         let transaction = sink(&c).await;
         c.status("w1", ORIGIN, "host").await.unwrap();
         c.remove("host").await.unwrap();
+        // A late ack for a removed host is ignored, not a save failure: the
+        // assertion below is that nothing is resurrected.
         assert!(transaction
             .persist(DeviceToken::new("late-token"))
             .await
-            .is_err());
+            .is_ok());
         assert!(c.store.host("host").is_none());
         assert!(c.core.lock().await.hosts.is_empty());
         c.shutdown().await;
@@ -248,37 +250,64 @@ async fn host_client_pairing_failure_is_reported_and_replaced_by_a_fresh_offer()
 }
 
 #[tokio::test]
-async fn host_client_grants_rotate_and_revoke_with_the_window_lifecycle() {
+async fn cancelling_a_pairing_leaves_nothing_behind_to_deadlock_the_next_one() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (_dir, c) = client();
         begin(&c, KEY).await;
-        sink(&c)
-            .await
-            .persist(DeviceToken::new("saved-device"))
+        let pending = c.add("w1", ORIGIN, &offer(KEY2)).await.unwrap();
+        c.confirm("w1", ORIGIN, pending["questionId"].as_u64().unwrap(), false)
             .await
             .unwrap();
-        let first = c.grant("w1", ORIGIN, "host").await.unwrap();
-        let t1 = first["grant"].as_str().unwrap().to_owned();
-        assert!(!t1.is_empty());
-        assert_eq!(first["windowId"], "w1");
-        assert!(c.grants.validate(&t1, "host", ORIGIN).is_some());
-        // Cross-host and cross-origin reuse of a valid token is refused.
-        assert!(c.grants.validate(&t1, "other-host", ORIGIN).is_none());
-        assert!(c
-            .grants
-            .validate(&t1, "host", "https://evil.test")
-            .is_none());
-        // A second grant rotates the window's token; the old one dies.
-        let second = c.grant("w1", ORIGIN, "host").await.unwrap();
-        let t2 = second["grant"].as_str().unwrap().to_owned();
-        assert_ne!(t1, t2);
-        assert!(c.grants.validate(&t1, "host", ORIGIN).is_none());
-        assert!(c.grants.validate(&t2, "host", ORIGIN).is_some());
-        // Window destroyed: the sync revoke kills the live token first.
-        c.revoke_window_now("w1");
-        assert!(c.grants.validate(&t2, "host", ORIGIN).is_none());
-        c.close_window("w1").await;
-        assert!(c.grants.0.lock().unwrap().get("w1").is_none());
+        {
+            let core = c.core.lock().await;
+            assert!(core.pending.is_none());
+            // A candidate never reaches `host_list`, so nothing may survive a cancel.
+            assert!(core
+                .hosts
+                .values()
+                .all(|runtime| runtime.candidate.is_none()));
+        }
+        // The host is re-pairable straight away: no "pairing in progress" wall.
+        let again = c.add("w1", ORIGIN, &offer(KEY)).await.unwrap();
+        assert_eq!(again["status"], "tofuPending");
+        c.confirm("w1", ORIGIN, again["questionId"].as_u64().unwrap(), true)
+            .await
+            .unwrap();
+        sink(&c)
+            .await
+            .persist(DeviceToken::new("fresh-device"))
+            .await
+            .unwrap();
+        assert!(c.store.host("host").is_some());
+        c.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_superseded_pairing_ack_is_dropped_instead_of_failing_the_new_one() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (_dir, c) = client();
+        begin(&c, KEY).await;
+        let stale = sink(&c).await;
+        begin(&c, KEY).await;
+        // A late ack for the replaced candidate is not a storage failure: reporting
+        // one would paint the newest pairing as `saveFailed`.
+        stale
+            .persist(DeviceToken::new("late-device"))
+            .await
+            .unwrap();
+        assert!(c.store.host("host").is_none());
+        sink(&c)
+            .await
+            .persist(DeviceToken::new("fresh-device"))
+            .await
+            .unwrap();
+        assert_eq!(
+            c.store.host("host").unwrap().device_token.unwrap().expose(),
+            "fresh-device"
+        );
         c.shutdown().await;
     })
     .await

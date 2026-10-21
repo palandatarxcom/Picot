@@ -15,8 +15,7 @@ use picot_host::native_pi_manager::NativePiManager;
 use picot_host::relay::client_role::{ClientRoleConfig, ClientRoleSeams};
 use picot_host::relay::e2ee::DaemonIdentity;
 use picot_host::relay::host_bridge::{
-    start_host_bridge_with_seams, BridgeSeams, Credential, GrantRegistry, HostBridgeHandle,
-    HostBridgeStatus,
+    start_host_bridge_with_seams, BridgeSeams, Credential, HostBridgeHandle, HostBridgeStatus,
 };
 use picot_host::relay::host_store::DeviceToken;
 use picot_host::remote_auth::RemoteAuth;
@@ -72,7 +71,6 @@ async fn bridge(
             peer_public_key_b64: public_key,
         },
         Credential::Device(DeviceToken::new(token)),
-        Arc::new(WindowGrants),
         None,
         BridgeSeams {
             client,
@@ -97,14 +95,7 @@ async fn dial(origin: &str, hello: Value) -> Socket {
     socket
 }
 fn hello() -> Value {
-    json!({"type":"hello","protocolVersion":2,"clientType":"desktop","clientId":"window","bridgeGrant":"window"})
-}
-/// The one live window this suite grants: token `window` on ORIGIN for host `host`.
-struct WindowGrants;
-impl GrantRegistry for WindowGrants {
-    fn validate(&self, token: &str, server: &str, origin: &str) -> Option<String> {
-        (token == "window" && server == "host" && origin == ORIGIN).then(|| token.to_owned())
-    }
+    json!({"type":"hello","protocolVersion":2,"clientType":"desktop","clientId":"window"})
 }
 async fn recv_type(socket: &mut Socket, expected: &str) -> Value {
     loop {

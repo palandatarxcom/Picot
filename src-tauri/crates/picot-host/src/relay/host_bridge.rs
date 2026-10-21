@@ -1,7 +1,7 @@
-// ABOUTME: Per-host loopback WS bridge with window grants and independent relay sessions.
+// ABOUTME: Per-host loopback WS bridge with independent relay sessions per window.
 // ABOUTME: Rewrites hello, sanitizes ack, delegates pairing persistence; last window stops bridge.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,13 +21,6 @@ use super::client_role::{
 use super::host_store::DeviceToken;
 use super::transport::ConnectionState;
 use crate::transport_limits::{OUTBOUND_QUEUE_CAPACITY, WS_PHYSICAL_FRAME_BYTES};
-
-pub trait GrantRegistry: Send + Sync {
-    /// Exact Origin + host + live-window validation; return trusted window identity.
-    /// The per-window secret is the authentication; the Origin check is defense
-    /// in depth (a hostile page on the same machine has no grant to present).
-    fn validate(&self, token: &str, server_id: &str, origin: &str) -> Option<String>;
-}
 
 #[derive(Clone, Debug)]
 pub enum Credential {
@@ -74,20 +67,16 @@ impl Default for BridgeSeams {
     }
 }
 
-struct Windows {
-    refs: HashSet<String>,
-    cancel: HashMap<String, watch::Sender<bool>>,
-}
 struct Auth {
     credential: Credential,
     pairing_busy: bool,
 }
 struct Shared {
     cfg: ClientRoleConfig,
-    grants: Arc<dyn GrantRegistry>,
     pairing: Option<Arc<dyn PairingSink>>,
     auth: Mutex<Auth>,
-    windows: Mutex<Windows>,
+    /// Window references: the bridge lives while at least one window holds it.
+    windows: Mutex<HashSet<String>>,
     slots: Mutex<Vec<Arc<Slot>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutdown: watch::Sender<bool>,
@@ -125,27 +114,15 @@ impl HostBridgeHandle {
         if *self.shared.shutdown.borrow() {
             return false;
         }
-        windows.refs.insert(window_id.to_owned());
+        windows.insert(window_id.to_owned());
         true
     }
     /// Release a window once; unknown/duplicate releases do nothing. Last release
     /// requests shutdown; `stop().await` also joins teardown.
     pub fn release(&self, window_id: &str) {
         let mut windows = self.shared.windows.lock().unwrap();
-        if let Some(cancel) = windows.cancel.remove(window_id) {
-            cancel.send_replace(true);
-        }
-        if windows.refs.remove(window_id) && windows.refs.is_empty() {
+        if windows.remove(window_id) && windows.is_empty() {
             self.shared.shutdown.send_replace(true);
-        }
-    }
-    /// The caller MUST invalidate its GrantRegistry first, THEN call this to
-    /// close the window's live sockets (registry first, then live teardown, so
-    /// no socket can re-authenticate mid-invalidation). This does not release
-    /// the window reference (rotation and release are separate concerns).
-    pub fn invalidate_window(&self, window_id: &str) {
-        if let Some(cancel) = self.shared.windows.lock().unwrap().cancel.remove(window_id) {
-            cancel.send_replace(true);
         }
     }
     /// Cancels upgrades, dial, handshake, callback and all session tasks; joins locally.
@@ -164,23 +141,15 @@ impl HostBridgeHandle {
 pub async fn start_host_bridge(
     cfg: ClientRoleConfig,
     credential: Credential,
-    grants: Arc<dyn GrantRegistry>,
     pairing_sink: Option<Arc<dyn PairingSink>>,
 ) -> std::io::Result<HostBridgeHandle> {
-    start_host_bridge_with_seams(
-        cfg,
-        credential,
-        grants,
-        pairing_sink,
-        BridgeSeams::default(),
-    )
-    .await
+    start_host_bridge_with_seams(cfg, credential, pairing_sink, BridgeSeams::default()).await
 }
 
+/// Starts a bridge; `seams` shortens the budgets only tests can shorten.
 pub async fn start_host_bridge_with_seams(
     cfg: ClientRoleConfig,
     credential: Credential,
-    grants: Arc<dyn GrantRegistry>,
     pairing_sink: Option<Arc<dyn PairingSink>>,
     seams: BridgeSeams,
 ) -> std::io::Result<HostBridgeHandle> {
@@ -190,16 +159,12 @@ pub async fn start_host_bridge_with_seams(
     let (status_tx, status) = watch::channel(HostBridgeStatus::Offline);
     let shared = Arc::new(Shared {
         cfg,
-        grants,
         pairing: pairing_sink,
         auth: Mutex::new(Auth {
             credential,
             pairing_busy: false,
         }),
-        windows: Mutex::new(Windows {
-            refs: HashSet::new(),
-            cancel: HashMap::new(),
-        }),
+        windows: Mutex::new(HashSet::new()),
         slots: Mutex::new(Vec::new()),
         tasks: Mutex::new(Vec::new()),
         shutdown,
@@ -378,6 +343,18 @@ fn attach(
     slot
 }
 
+/// Only the app's own loopback pages may speak to a bridge. With no window
+/// secret left, the handshake Origin is the remaining gate: any page a browser
+/// can load would otherwise present a hello for an already-paired device.
+fn is_app_origin(origin: &str) -> bool {
+    url::Url::parse(origin).is_ok_and(|url| {
+        url.scheme() == "http"
+            && url
+                .host_str()
+                .is_some_and(crate::window_owner::is_loopback_host)
+    })
+}
+
 async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     let first = tokio::time::timeout(shared.seams.first_frame_timeout, socket.next()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
@@ -389,33 +366,9 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     if string_field(&fields, "type").as_deref() != Some("hello") {
         return;
     }
-    // Per-window grant, validated before anything is rewritten or dialed: the
-    // random loopback port is obscurity, not authentication. Missing, forged,
-    // cross-host and cross-window grants close here without injection.
-    // The grant rides the hello body (not Sec-WebSocket-Protocol): the WebView's
-    // WebSocket API cannot pick subprotocols on this client, and a negotiated
-    // subprotocol would also be visible to the relay-side handshake. `rewrite`
-    // strips a client-forged `bridgeGrant` along with the credential fields, so
-    // only this validated value ever authenticates a session.
-    let Some(token) = string_field(&fields, "bridgeGrant") else {
+    if !is_app_origin(&origin) {
         return;
-    };
-    // Serialize validation with invalidate_window so an invalidation cannot miss
-    // an authenticated socket between its registry check and live registration.
-    let mut window_cancel = {
-        let mut windows = shared.windows.lock().unwrap();
-        let Some(window) = shared
-            .grants
-            .validate(&token, &shared.cfg.server_id, &origin)
-        else {
-            return;
-        };
-        windows
-            .cancel
-            .entry(window)
-            .or_insert_with(|| watch::channel(false).0)
-            .subscribe()
-    };
+    }
     let credential = {
         let mut auth = shared.auth.lock().unwrap();
         if matches!(
@@ -578,7 +531,6 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
         _ = session => false,
         _ = lost.changed() => true,
         _ = write => false,
-        _ = window_cancel.changed() => false,
         _ = shutdown.changed() => false,
     };
     if pairing {

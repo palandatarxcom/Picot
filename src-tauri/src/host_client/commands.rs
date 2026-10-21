@@ -1,4 +1,4 @@
-// ABOUTME: Caller-checked Tauri commands for remote host pairing, status and grants.
+// ABOUTME: Caller-checked Tauri commands for remote host pairing and status.
 // ABOUTME: Identity and exact page origin come from injected WebviewWindow, never arguments.
 
 use super::{HostClient, HostClientState};
@@ -64,25 +64,6 @@ pub async fn host_status(
 ) -> Result<Value, String> {
     let (client, id, origin) = caller(&app, &window)?;
     client.status(&id, &origin, &server_id).await
-}
-#[tauri::command]
-pub async fn host_grant(
-    window: tauri::WebviewWindow,
-    app: AppHandle,
-    server_id: String,
-) -> Result<Value, String> {
-    let (client, id, origin) = caller(&app, &window)?;
-    client.grant(&id, &origin, &server_id).await
-}
-
-#[tauri::command]
-pub async fn host_release(window: tauri::WebviewWindow, app: AppHandle) -> Result<Value, String> {
-    // The window calls this synchronously before reload navigation (contract 4):
-    // unload-time cleanup is unreliable, so the explicit release is the main
-    // path and the Destroyed event is the safety net.
-    let (client, id, _) = caller(&app, &window)?;
-    client.close_window(&id).await;
-    Ok(json!({"ok":true}))
 }
 #[tauri::command]
 pub async fn relay_device_list(

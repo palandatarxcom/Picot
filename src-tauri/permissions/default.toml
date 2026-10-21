@@ -70,16 +70,6 @@ description = "Read a remote host's connection status"
 commands.allow = ["host_status"]
 
 [[permission]]
-identifier = "allow-host-grant"
-description = "Mint a host grant bound to the injected calling window"
-commands.allow = ["host_grant"]
-
-[[permission]]
-identifier = "allow-host-release"
-description = "Release the calling window's bridge reference before a host switch"
-commands.allow = ["host_release"]
-
-[[permission]]
 identifier = "allow-relay-device-list"
 description = "Read safe paired-device fields from the local daemon"
 commands.allow = ["relay_device_list"]
@@ -106,8 +96,6 @@ permissions = [
   "allow-host-confirm-tofu",
   "allow-host-remove",
   "allow-host-status",
-  "allow-host-grant",
-  "allow-host-release",
   "allow-relay-device-list",
   "allow-relay-revoke-device",
 ]

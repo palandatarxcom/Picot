@@ -2615,7 +2615,11 @@ fn hello_capabilities(context: &HostClientContext) -> Value {
     let desktop = context.kind == crate::host_router::ClientKind::Desktop;
     let navigation = desktop || context.data_plane_owner().is_some();
     json!({
-        "native": desktop,
+        // `native` describes the HOST (it has native runtimes), not who is
+        // asking: a paired device drives the same workspaces. Reporting it as
+        // desktop-only made the client hide the whole registry (no workspaces
+        // in the sidebar). Management stays desktop-only.
+        "native": navigation,
         "navigation": navigation,
         "git": navigation,
         "terminal": navigation,

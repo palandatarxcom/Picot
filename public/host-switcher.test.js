@@ -199,7 +199,7 @@ describe("setupHostSwitcher", () => {
         };
       return { status: "connected", serverId: "r4" };
     });
-    setup(refs, { invoke });
+    const { navigate } = setup(refs, { invoke });
     await openPicker(refs);
 
     refs.addBtn.click();
@@ -221,16 +221,18 @@ describe("setupHostSwitcher", () => {
 
     expect(invoke).toHaveBeenCalledWith("host_confirm_tofu", { questionId: 4, approved: true });
     expect(refs.tofu.classList.contains("hidden")).toBe(true);
-    expect(refs.notice.textContent).toContain("Connected to r4");
+    // The pairing runs on the host's own page: the confirmed host is never in
+    // `host_list` yet, so the reply has to switch the window to it.
+    expect(navigate.mock.calls.at(-1)[0]).toBe("http://127.0.0.1:4321/?host=r4");
   });
 
-  it("names the added host by its saved label, not a missing status field", async () => {
+  it("says the host is pairing instead of claiming the credential was lost", async () => {
     const invoke = vi.fn(async (command) => {
       if (command === "host_list") return hosts;
       // status_payload carries serverId and status only — no label (F-05).
-      return { status: "connected", serverId: "r1" };
+      return { status: "connected", serverId: "r4" };
     });
-    setup(refs, { invoke });
+    const { navigate } = setup(refs, { invoke });
     await openPicker(refs);
 
     refs.addBtn.click();
@@ -240,8 +242,9 @@ describe("setupHostSwitcher", () => {
     );
     await tick();
 
-    expect(refs.notice.textContent).toBe("Connected to desk.");
-    expect(refs.notice.textContent).not.toContain("undefined");
+    expect(requested).toContain("hostPicker.pairing");
+    expect(requested).not.toContain("hostPicker.saveFailed");
+    expect(navigate.mock.calls.at(-1)[0]).toBe("http://127.0.0.1:4321/?host=r4");
   });
 
   it("keeps the question across close and reopen, and answers it afterwards", async () => {

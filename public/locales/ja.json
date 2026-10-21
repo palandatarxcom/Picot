@@ -613,6 +613,7 @@
     "addPlaceholder": "ホストの接続オファーを貼り付け",
     "addSubmit": "追加",
     "added": "{host} に接続しました。",
+    "pairing": "ペアリングしています...",
     "addFailed": "ホストを追加できません：{reason}",
     "cancelled": "キャンセルしました。",
     "saveFailed": "ペアリングは完了しましたが、認証情報を保存できませんでした。ホストを追加し直してください。",

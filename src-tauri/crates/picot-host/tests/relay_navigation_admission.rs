@@ -235,7 +235,9 @@ async fn capabilities_are_advertised_per_face_and_the_ack_stays_additive() {
     assert_eq!(caps["navigation"], json!(true), "{ack}");
     assert_eq!(caps["git"], json!(true), "{ack}");
     assert_eq!(caps["terminal"], json!(true), "{ack}");
-    assert_eq!(caps["native"], json!(false), "{ack}");
+    // `native` describes the host, not the caller: a paired device drives the
+    // same workspaces, so hiding the registry would empty its sidebar.
+    assert_eq!(caps["native"], json!(true), "{ack}");
     assert_eq!(caps["management"], json!(false), "{ack}");
     // Additive only: dropping the new field leaves exactly the legacy ack.
     let mut legacy = ack.clone();

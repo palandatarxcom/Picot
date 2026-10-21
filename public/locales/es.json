@@ -613,6 +613,7 @@
     "addPlaceholder": "Pega la oferta de conexión del host",
     "addSubmit": "Añadir",
     "added": "Conectado a {host}.",
+    "pairing": "Emparejando...",
     "addFailed": "No se pudo añadir el host: {reason}",
     "cancelled": "Cancelado.",
     "saveFailed": "Emparejado, pero no se pudo guardar la credencial. Añade el host de nuevo.",

@@ -307,16 +307,13 @@ export function setupHostSwitcher({
       return;
     }
     // F-05: the status payload carries no label; `host_list` does. A host that
-    // never reached the list was never saved, whatever the bridge reported.
+    // never reached the list is still pairing: the bridge finishes the exchange
+    // on the host's own page, which is why the reply is followed by a switch.
     const fresh = await refresh();
     const added = fresh.find((host) => host.serverId === reply?.serverId);
-    if (!added) {
-      setNotice(t("hostPicker.saveFailed"));
-      render();
-      return;
-    }
-    setNotice(t("hostPicker.added", { host: labelOf(added) }));
+    setNotice(added ? t("hostPicker.added", { host: labelOf(added) }) : t("hostPicker.pairing"));
     render();
+    await select(reply?.serverId);
   }
 
   async function run(job) {

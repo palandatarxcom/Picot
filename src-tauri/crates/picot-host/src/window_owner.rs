@@ -1005,7 +1005,7 @@ fn url_origin(url: &Url) -> Option<String> {
     Some(format!("http://{host}:{port}"))
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
 

@@ -613,6 +613,7 @@
     "addPlaceholder": "Paste the host's connection offer",
     "addSubmit": "Add",
     "added": "Connected to {host}.",
+    "pairing": "Pairing...",
     "addFailed": "Could not add the host: {reason}",
     "cancelled": "Cancelled.",
     "saveFailed": "Paired, but the credential could not be saved. Add the host again.",

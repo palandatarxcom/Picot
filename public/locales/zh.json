@@ -613,6 +613,7 @@
     "addPlaceholder": "粘贴主机的连接 offer",
     "addSubmit": "添加",
     "added": "已连接 {host}。",
+    "pairing": "正在配对...",
     "addFailed": "无法添加主机：{reason}",
     "cancelled": "已取消。",
     "saveFailed": "已配对，但凭据未能保存。请重新添加该主机。",
