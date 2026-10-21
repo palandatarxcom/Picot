@@ -23,9 +23,8 @@
 //!   question; asking a new one supersedes it, and the superseded question can
 //!   never be approved afterwards (an unanswered question means *no*).
 //!
-//! The decision says nothing about *when* a change lands: that is the staged
-//! transaction in [`crate::relay::host_store`], which commits only after the
-//! remote authenticated this device.
+//! The decision says nothing about *when* a change lands: the host store only
+//! writes the new profile once the remote authenticated this device.
 
 use crate::relay::host_store::StoredHost;
 use crate::relay::pairing::ConnectionOfferV2;

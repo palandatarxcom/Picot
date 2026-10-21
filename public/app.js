@@ -8156,7 +8156,7 @@ const daemonSection = setupDaemonSection({
 
 // Sidebar host picker (relay Phase 2.5 §3.1). The window's host is its URL, so
 // a pick is a whole-window reload: unsent input flushes first (the quit path's
-// own flush) and the window's bridge grant is released before navigating.
+// own flush), and the old page's socket dies with the page.
 setupHostSwitcher({ flush: flushDraftNow });
 
 ({ loadInlineConfigEditor, loadAgentsMdEditor, loadAppendSystemMdEditor } = setupSettingsConfig({

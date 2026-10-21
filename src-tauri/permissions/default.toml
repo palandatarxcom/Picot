@@ -66,23 +66,8 @@ commands.allow = ["host_remove"]
 
 [[permission]]
 identifier = "allow-host-status"
-description = "Read remote host connection and save-recovery status"
+description = "Read a remote host's connection status"
 commands.allow = ["host_status"]
-
-[[permission]]
-identifier = "allow-host-grant"
-description = "Mint a host grant bound to the injected calling window"
-commands.allow = ["host_grant"]
-
-[[permission]]
-identifier = "allow-host-retry-save"
-description = "Retry saving an authenticated in-memory pairing candidate"
-commands.allow = ["host_retry_save"]
-
-[[permission]]
-identifier = "allow-host-release"
-description = "Release the calling window's host references before reload navigation"
-commands.allow = ["host_release"]
 
 [[permission]]
 identifier = "allow-relay-device-list"
@@ -111,9 +96,6 @@ permissions = [
   "allow-host-confirm-tofu",
   "allow-host-remove",
   "allow-host-status",
-  "allow-host-grant",
-  "allow-host-retry-save",
-  "allow-host-release",
   "allow-relay-device-list",
   "allow-relay-revoke-device",
 ]

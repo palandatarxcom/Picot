@@ -56,7 +56,10 @@ pub const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// WS ping cadence: 10s (the pong is what keeps a quiet session alive).
 pub const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(10);
-/// Dial (TCP + WS upgrade) deadline: 10s.
+/// Dial (TCP + WS upgrade) deadline: 10s. A cold dial against the company relay
+/// can exceed this (TLS + the daemon's data-dial handoff measured ~10-15s), so a
+/// timeout is an ordinary retry, not a failure: the bridge keeps the proxy
+/// waiting across attempts instead of closing it.
 pub const CLIENT_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Head start for the remote daemon's data dial before the first `e2ee_hello`.
 pub const CLIENT_PRE_HELLO_DELAY: Duration = Duration::from_millis(250);

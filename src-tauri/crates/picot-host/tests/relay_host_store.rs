@@ -1,6 +1,6 @@
 // ABOUTME: Contract tests for the desktop host-profile store (plan T3, spec §2.6).
 // ABOUTME: Owner-only creation, atomic publish, write failure preserving the old
-// ABOUTME: document, corruption as a single-track blocked state, generation guard.
+// ABOUTME: document, and corruption as a single-track blocked state.
 
 use std::fs;
 use std::path::Path;
@@ -30,9 +30,7 @@ fn open(dir: &Path) -> HostStore {
 }
 
 fn commit_new(store: &HostStore, server_id: &str) {
-    let mut staged = picot_host::relay::host_store::StagedPairing::begin(profile(server_id), None);
-    staged.remote_authenticated(token()).expect("remote auth");
-    staged.commit(store).expect("commit");
+    store.upsert(&profile(server_id), token()).expect("commit");
 }
 
 #[cfg(unix)]
@@ -68,13 +66,7 @@ fn a_missing_file_creates_an_empty_store_with_a_stable_install_id() {
 fn a_committed_host_round_trips_through_a_fresh_load() {
     let temp = tempfile::tempdir().unwrap();
     let store = open(temp.path());
-    let mut staged = picot_host::relay::host_store::StagedPairing::begin(profile("server-a"), None);
-    staged.remote_authenticated(token()).unwrap();
-    let committed = staged.commit(&store).unwrap();
-    assert_eq!(
-        committed.generation, 1,
-        "a new host commits at generation 1"
-    );
+    store.upsert(&profile("server-a"), token()).unwrap();
 
     let reloaded = open(temp.path());
     let hosts = reloaded.hosts();
@@ -84,7 +76,6 @@ fn a_committed_host_round_trips_through_a_fresh_load() {
         hosts[0].device_token.as_ref().map(DeviceToken::expose),
         Some(token().expose())
     );
-    assert_eq!(hosts[0].generation, 1);
     assert_eq!(reloaded.app_device_id(), store.app_device_id());
 }
 
@@ -145,10 +136,8 @@ fn a_failed_write_keeps_the_old_file_and_the_old_profile() {
         assert!(status.success(), "chflags {value} failed");
     };
     flag("uchg");
-    let mut staged = picot_host::relay::host_store::StagedPairing::begin(profile("server-b"), None);
-    staged.remote_authenticated(token()).unwrap();
-    let error = staged
-        .commit(&store)
+    let error = store
+        .upsert(&profile("server-b"), token())
         .expect_err("an immutable directory rejects the write");
     assert!(matches!(error, StoreError::Io { .. }), "got {error:?}");
     flag("nouchg");
@@ -191,62 +180,6 @@ fn corruption_is_a_single_track_blocked_state() {
 }
 
 #[test]
-fn staged_commits_are_generation_guarded() {
-    let temp = tempfile::tempdir().unwrap();
-    let store = open(temp.path());
-    commit_new(&store, "server-a");
-    assert_eq!(store.host("server-a").unwrap().generation, 1);
-
-    let mut wrong =
-        picot_host::relay::host_store::StagedPairing::begin(profile("server-a"), Some(0));
-    wrong.remote_authenticated(token()).unwrap();
-    let error = wrong
-        .commit(&store)
-        .expect_err("a stale generation must lose");
-    assert!(
-        matches!(
-            error,
-            StoreError::GenerationMismatch {
-                expected: Some(0),
-                actual: Some(1),
-                ..
-            }
-        ),
-        "got {error:?}"
-    );
-    assert_eq!(
-        store.host("server-a").unwrap().generation,
-        1,
-        "no side effect"
-    );
-
-    let mut correct =
-        picot_host::relay::host_store::StagedPairing::begin(profile("server-a"), Some(1));
-    correct
-        .remote_authenticated(DeviceToken::new("picot_dev_replacement"))
-        .unwrap();
-    assert_eq!(correct.commit(&store).unwrap().generation, 2);
-
-    let mut duplicate =
-        picot_host::relay::host_store::StagedPairing::begin(profile("server-a"), None);
-    duplicate.remote_authenticated(token()).unwrap();
-    let error = duplicate
-        .commit(&store)
-        .expect_err("an existing host needs its generation");
-    assert!(
-        matches!(
-            error,
-            StoreError::GenerationMismatch {
-                expected: None,
-                actual: Some(2),
-                ..
-            }
-        ),
-        "got {error:?}"
-    );
-}
-
-#[test]
 fn delete_removes_the_host_and_persists() {
     let temp = tempfile::tempdir().unwrap();
     let store = open(temp.path());
@@ -274,7 +207,7 @@ fn debug_output_never_contains_the_token() {
     let rendered = format!("{host:?}");
     assert!(
         !rendered.contains(token().expose()),
-        "a staged host token must not print: {rendered}"
+        "a saved host token must not print: {rendered}"
     );
     assert!(
         rendered.contains("<redacted>"),

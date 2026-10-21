@@ -24,7 +24,7 @@ import { replaceButtonGlyph } from "./icons.js";
 export { LAST_HOST_KEY };
 
 /** Badge states the app reports per host (`host_client` status names). */
-const BADGES = ["connecting", "online", "offline", "credentialInvalid", "saveFailed"];
+const BADGES = ["connecting", "online", "offline", "credentialInvalid"];
 
 function errorMessage(error) {
   return String(error?.message || error || "unknown error");
@@ -276,12 +276,7 @@ export function setupHostSwitcher({
       setOpen(false);
       return;
     }
-    const url = await switchHost(hostId, {
-      env,
-      flush,
-      release: () => invoke("host_release"),
-      navigate,
-    });
+    const url = await switchHost(hostId, { env, flush, navigate });
     if (url === null) {
       setNotice(t("hostPicker.switchBlocked"));
       render();
@@ -311,16 +306,16 @@ export function setupHostSwitcher({
       render();
       return;
     }
-    if (status === "saveFailed") {
-      setNotice(t("hostPicker.saveFailed"));
-      render();
-      void refresh();
-      return;
-    }
-    // F-05: the status payload carries no label; `host_list` does.
+    // F-05: the status payload carries no label; `host_list` does. A host that
+    // never reached the list was never saved, whatever the bridge reported.
     const fresh = await refresh();
     const added = fresh.find((host) => host.serverId === reply?.serverId);
-    setNotice(t("hostPicker.added", { host: labelOf(added ?? { serverId: reply?.serverId }) }));
+    if (!added) {
+      setNotice(t("hostPicker.saveFailed"));
+      render();
+      return;
+    }
+    setNotice(t("hostPicker.added", { host: labelOf(added) }));
     render();
   }
 

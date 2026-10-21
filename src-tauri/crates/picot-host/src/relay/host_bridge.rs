@@ -1,14 +1,13 @@
-// ABOUTME: Per-host loopback WS bridge with window grants and independent relay sessions.
+// ABOUTME: Per-host loopback WS bridge with independent relay sessions.
 // ABOUTME: Rewrites hello, sanitizes ack, delegates pairing persistence; last window stops bridge.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::{routing::get, Router};
 use futures_util::{SinkExt, StreamExt};
@@ -21,18 +20,6 @@ use super::client_role::{
 use super::host_store::DeviceToken;
 use super::transport::ConnectionState;
 use crate::transport_limits::{OUTBOUND_QUEUE_CAPACITY, WS_PHYSICAL_FRAME_BYTES};
-
-/// Debug deliberately omitted: grants are local bearer credentials.
-pub struct WindowGrant {
-    pub token: String,
-    pub window_id: String,
-    pub server_id: String,
-}
-
-pub trait GrantRegistry: Send + Sync {
-    /// Exact Origin + host + live-window validation; return trusted window identity.
-    fn validate(&self, token: &str, server_id: &str, origin: &str) -> Option<String>;
-}
 
 #[derive(Clone, Debug)]
 pub enum Credential {
@@ -49,8 +36,8 @@ pub struct PairingSaveError;
 
 #[async_trait]
 pub trait PairingSink: Send + Sync {
-    /// T7 owns the staged transaction and durable commit. On failure it must retain
-    /// this candidate for retry-save; the bridge blocks further pairing attempts.
+    /// The app owns the durable commit. A failure ends the exchange: the remote
+    /// already counts this device, so the host has to pair again.
     /// Cancellation (host removal/stop) drops this future: no detached writes.
     async fn persist(&self, token: DeviceToken) -> Result<(), PairingSaveError>;
 }
@@ -60,7 +47,6 @@ pub enum HostBridgeStatus {
     Connecting,
     Online,
     Offline,
-    SaveFailed,
     CredentialInvalid,
     PairingFailed,
     Stopped,
@@ -82,7 +68,6 @@ impl Default for BridgeSeams {
 
 struct Windows {
     refs: HashSet<String>,
-    cancel: HashMap<String, watch::Sender<bool>>,
 }
 struct Auth {
     credential: Credential,
@@ -90,7 +75,6 @@ struct Auth {
 }
 struct Shared {
     cfg: ClientRoleConfig,
-    grants: Arc<dyn GrantRegistry>,
     pairing: Option<Arc<dyn PairingSink>>,
     auth: Mutex<Auth>,
     windows: Mutex<Windows>,
@@ -105,8 +89,7 @@ impl Shared {
         self.status.send_if_modified(|current| {
             if matches!(
                 *current,
-                HostBridgeStatus::SaveFailed
-                    | HostBridgeStatus::CredentialInvalid
+                HostBridgeStatus::CredentialInvalid
                     | HostBridgeStatus::PairingFailed
                     | HostBridgeStatus::Stopped
             ) {
@@ -139,18 +122,8 @@ impl HostBridgeHandle {
     /// requests shutdown; `stop().await` also joins teardown.
     pub fn release(&self, window_id: &str) {
         let mut windows = self.shared.windows.lock().unwrap();
-        if let Some(cancel) = windows.cancel.remove(window_id) {
-            cancel.send_replace(true);
-        }
         if windows.refs.remove(window_id) && windows.refs.is_empty() {
             self.shared.shutdown.send_replace(true);
-        }
-    }
-    /// T7 MUST invalidate GrantRegistry first, THEN call this to close live sockets.
-    /// This does not release the window reference (renewal and release are separate).
-    pub fn invalidate_window(&self, window_id: &str) {
-        if let Some(cancel) = self.shared.windows.lock().unwrap().cancel.remove(window_id) {
-            cancel.send_replace(true);
         }
     }
     /// Cancels upgrades, dial, handshake, callback and all session tasks; joins locally.
@@ -169,23 +142,14 @@ impl HostBridgeHandle {
 pub async fn start_host_bridge(
     cfg: ClientRoleConfig,
     credential: Credential,
-    grants: Arc<dyn GrantRegistry>,
     pairing_sink: Option<Arc<dyn PairingSink>>,
 ) -> std::io::Result<HostBridgeHandle> {
-    start_host_bridge_with_seams(
-        cfg,
-        credential,
-        grants,
-        pairing_sink,
-        BridgeSeams::default(),
-    )
-    .await
+    start_host_bridge_with_seams(cfg, credential, pairing_sink, BridgeSeams::default()).await
 }
 
 pub async fn start_host_bridge_with_seams(
     cfg: ClientRoleConfig,
     credential: Credential,
-    grants: Arc<dyn GrantRegistry>,
     pairing_sink: Option<Arc<dyn PairingSink>>,
     seams: BridgeSeams,
 ) -> std::io::Result<HostBridgeHandle> {
@@ -195,7 +159,6 @@ pub async fn start_host_bridge_with_seams(
     let (status_tx, status) = watch::channel(HostBridgeStatus::Offline);
     let shared = Arc::new(Shared {
         cfg,
-        grants,
         pairing: pairing_sink,
         auth: Mutex::new(Auth {
             credential,
@@ -203,7 +166,6 @@ pub async fn start_host_bridge_with_seams(
         }),
         windows: Mutex::new(Windows {
             refs: HashSet::new(),
-            cancel: HashMap::new(),
         }),
         slots: Mutex::new(Vec::new()),
         tasks: Mutex::new(Vec::new()),
@@ -243,16 +205,7 @@ pub async fn start_host_bridge_with_seams(
     })
 }
 
-async fn upgrade(
-    State(shared): State<Arc<Shared>>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let origin = headers
-        .get("origin")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
+async fn upgrade(State(shared): State<Arc<Shared>>, ws: WebSocketUpgrade) -> Response {
     ws.max_message_size(WS_PHYSICAL_FRAME_BYTES)
         .max_frame_size(WS_PHYSICAL_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
@@ -261,7 +214,7 @@ async fn upgrade(
                 return;
             }
             tasks.retain(|task| !task.is_finished());
-            tasks.push(tokio::spawn(proxy(socket, origin, shared.clone())));
+            tasks.push(tokio::spawn(proxy(socket, shared.clone())));
         })
 }
 
@@ -327,9 +280,6 @@ impl ClientRoleSink for Slot {
     async fn on_state(&self, state: ConnectionState) {
         if state == ConnectionState::Offline {
             self.ready.send_modify(|ready| ready.channel = None);
-            if let Some(attachment) = self.attachment.lock().unwrap().as_ref() {
-                attachment.lost.send_replace(true);
-            }
         }
         if let Some(shared) = self.shared.upgrade() {
             shared.set_status(match state {
@@ -386,7 +336,7 @@ fn attach(
     slot
 }
 
-async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
+async fn proxy(mut socket: WebSocket, shared: Arc<Shared>) {
     let first = tokio::time::timeout(shared.seams.first_frame_timeout, socket.next()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
         return;
@@ -397,32 +347,11 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     if string_field(&fields, "type").as_deref() != Some("hello") {
         return;
     }
-    let Some(token) = string_field(&fields, "bridgeGrant") else {
-        return;
-    };
-    // Serialize validation with invalidate_window so an invalidation cannot miss
-    // an authenticated socket between its registry check and live registration.
-    let mut window_cancel = {
-        let mut windows = shared.windows.lock().unwrap();
-        let Some(window) = shared
-            .grants
-            .validate(&token, &shared.cfg.server_id, &origin)
-        else {
-            return;
-        };
-        windows
-            .cancel
-            .entry(window)
-            .or_insert_with(|| watch::channel(false).0)
-            .subscribe()
-    };
     let credential = {
         let mut auth = shared.auth.lock().unwrap();
         if matches!(
             *shared.status.borrow(),
-            HostBridgeStatus::SaveFailed
-                | HostBridgeStatus::CredentialInvalid
-                | HostBridgeStatus::PairingFailed
+            HostBridgeStatus::CredentialInvalid | HostBridgeStatus::PairingFailed
         ) {
             return;
         }
@@ -515,6 +444,10 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
         {
             shared.set_status(HostBridgeStatus::CredentialInvalid);
         }
+        if is_ack {
+            // Authenticated: the only transition that may report `Online`.
+            shared.set_status(HostBridgeStatus::Online);
+        }
         let token = fields.remove("deviceToken");
         if pairing {
             let Some(token) = token
@@ -533,7 +466,9 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
                 .await
                 .is_err()
             {
-                shared.set_status(HostBridgeStatus::SaveFailed);
+                // The pairing itself worked; this device's token just could not be
+                // stored. Terminal: re-pairing is the only way to hold a token.
+                shared.set_status(HostBridgeStatus::PairingFailed);
                 return;
             }
             let mut auth = shared.auth.lock().unwrap();
@@ -565,34 +500,27 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
             }
         }
     };
-    let transport_dropped = tokio::select! {
+    // Wait for whichever end condition fires; the outcome no longer decides
+    // slot lifetime (the session is kept), so the value is discarded.
+    let _ = tokio::select! {
         // A terminal error frame can arrive in the same poll as Offline. Consume
         // the queued explicit rejection before the transport-loss notification.
         biased;
         _ = session => false,
         _ = lost.changed() => true,
         _ = write => false,
-        _ = window_cancel.changed() => false,
         _ = shutdown.changed() => false,
     };
-    if pairing && *shared.status.borrow() != HostBridgeStatus::SaveFailed {
+    if pairing {
         shared.auth.lock().unwrap().pairing_busy = false;
     }
-    // A dropped transport stays alive, backs off and becomes an idle session for
-    // the frontend's next hello. Never replay hello on the fresh relay session.
-    let current = slot.ready.borrow().clone();
-    let keep = transport_dropped
-        && (current.channel.is_none() || generation.is_some_and(|old| old != current.generation));
-    if keep {
-        *slot.attachment.lock().unwrap() = None;
-    } else {
-        slot.stop().await;
-        shared
-            .slots
-            .lock()
-            .unwrap()
-            .retain(|candidate| !Arc::ptr_eq(candidate, &slot));
-    }
+    // Keep the relay session while the bridge lives (contract 4 + F-09): an
+    // idle host must not pay the ~10s re-handshake, and a revoked device is
+    // only observable while its session exists. The slot is detached, not
+    // stopped — the next proxy hello reuses it, and a fresh relay session after
+    // a drop is re-authenticated by that hello (never replayed by us).
+    // Shutdown stops every slot from the bridge task above.
+    *slot.attachment.lock().unwrap() = None;
 }
 
 #[cfg(test)]

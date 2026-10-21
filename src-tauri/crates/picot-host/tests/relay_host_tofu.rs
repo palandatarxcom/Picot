@@ -1,12 +1,6 @@
-// ABOUTME: Contract tests for TOFU decisions and the pairing transaction (plan T3).
-// ABOUTME: Exact matches auto-approve, every key/endpoint/TLS difference asks one
-// ABOUTME: question at a time, and a staged change only lands after remote auth.
+// ABOUTME: Contract tests for TOFU decisions (plan T3): exact matches auto-approve,
+// ABOUTME: every key/endpoint/TLS difference asks one question at a time.
 
-use std::fs;
-
-use picot_host::relay::host_store::{
-    hosts_path, DeviceToken, HostProfile, HostStore, StagedPairing, StagedState, StoreError,
-};
 use picot_host::relay::host_tofu::{
     decide, format_fingerprint, Answer, ConfirmKind, ConfirmationQueue, ConnectionChange,
     TofuDecision,
@@ -41,7 +35,7 @@ fn saved(
     token: Option<&str>,
 ) -> picot_host::relay::host_store::StoredHost {
     picot_host::relay::host_store::StoredHost {
-        profile: HostProfile {
+        profile: picot_host::relay::host_store::HostProfile {
             server_id: server_id.to_string(),
             label: "relay.example.com".to_string(),
             relay: RelayEndpoint {
@@ -51,8 +45,7 @@ fn saved(
             daemon_public_key_b64: key_b64.to_string(),
             added_at: 1_771_000_000,
         },
-        device_token: token.map(DeviceToken::new),
-        generation: 1,
+        device_token: token.map(picot_host::relay::host_store::DeviceToken::new),
     }
 }
 
@@ -234,171 +227,5 @@ fn one_question_at_a_time_supersedes_the_unanswered_one() {
         queue.ask(question(decide(&offer_default(), None))),
         None,
         "nothing was pending to supersede"
-    );
-}
-
-fn open(dir: &std::path::Path) -> HostStore {
-    HostStore::load(hosts_path(dir)).expect("store loads")
-}
-
-fn commit_original(store: &HostStore) {
-    let mut staged = StagedPairing::begin(
-        HostProfile {
-            server_id: "server-a".to_string(),
-            label: "relay.example.com".to_string(),
-            relay: RelayEndpoint {
-                endpoint: "relay.example.com:443".to_string(),
-                use_tls: true,
-            },
-            daemon_public_key_b64: KEY_B64.to_string(),
-            added_at: 1_771_000_000,
-        },
-        None,
-    );
-    staged
-        .remote_authenticated(DeviceToken::new("dev-token-original"))
-        .unwrap();
-    staged.commit(store).unwrap();
-}
-
-fn candidate() -> HostProfile {
-    HostProfile {
-        server_id: "server-a".to_string(),
-        label: "other.example.com".to_string(),
-        relay: RelayEndpoint {
-            endpoint: "other.example.com:8443".to_string(),
-            use_tls: false,
-        },
-        daemon_public_key_b64: KEY_B64.to_string(),
-        added_at: 1_771_000_100,
-    }
-}
-
-#[test]
-fn a_staged_change_needs_the_remote_auth_success_first() {
-    let temp = tempfile::tempdir().unwrap();
-    let store = open(temp.path());
-    commit_original(&store);
-
-    let mut staged = StagedPairing::begin(candidate(), Some(1));
-    assert_eq!(*staged.state(), StagedState::AwaitingRemoteAuth);
-    let error = staged.commit(&store).expect_err("no token, no commit");
-    assert!(
-        matches!(error, StoreError::InvalidStagedState { .. }),
-        "got {error:?}"
-    );
-    assert_eq!(
-        store.host("server-a").unwrap().profile.relay.endpoint,
-        "relay.example.com:443"
-    );
-
-    staged
-        .remote_authenticated(DeviceToken::new("dev-token-new"))
-        .unwrap();
-    assert_eq!(*staged.state(), StagedState::ReadyToCommit);
-    let committed = staged.commit(&store).unwrap();
-    assert_eq!(committed.generation, 2);
-    assert_eq!(*staged.state(), StagedState::Committed { generation: 2 });
-    assert_eq!(store.host("server-a").unwrap().profile, candidate());
-
-    let error = staged
-        .commit(&store)
-        .expect_err("a committed transaction is closed");
-    assert!(
-        matches!(error, StoreError::InvalidStagedState { .. }),
-        "got {error:?}"
-    );
-}
-
-#[test]
-fn cancel_and_a_stale_answer_leave_the_original_alone() {
-    let temp = tempfile::tempdir().unwrap();
-    let store = open(temp.path());
-    commit_original(&store);
-    let before = fs::read_to_string(hosts_path(temp.path())).unwrap();
-
-    let mut staged = StagedPairing::begin(candidate(), Some(1));
-    staged
-        .remote_authenticated(DeviceToken::new("dev-token-new"))
-        .unwrap();
-    staged.cancel();
-    assert_eq!(*staged.state(), StagedState::Abandoned);
-    assert!(staged.token().is_none(), "the candidate token is dropped");
-    let error = staged
-        .commit(&store)
-        .expect_err("a cancelled transaction cannot land");
-    assert!(
-        matches!(error, StoreError::InvalidStagedState { .. }),
-        "got {error:?}"
-    );
-
-    assert_eq!(
-        store.host("server-a").unwrap().profile.relay.endpoint,
-        "relay.example.com:443",
-        "the original profile stays usable"
-    );
-    assert_eq!(
-        fs::read_to_string(hosts_path(temp.path())).unwrap(),
-        before,
-        "a cancel touches nothing on disk"
-    );
-}
-
-/// The "exchange succeeded, save failed" recovery state (spec §5.2 contract 3,
-/// R2-06): the remote token already exists, so only the local write can be
-/// retried. Process death drops the candidate — the device then re-pairs.
-#[test]
-fn a_save_failure_keeps_the_candidate_for_a_retry_save() {
-    let temp = tempfile::tempdir().unwrap();
-    let store_dir = temp.path().join("store");
-    let store = HostStore::load(hosts_path(&store_dir)).unwrap();
-    commit_original(&store);
-
-    // Inject the write failure: the store's directory becomes a regular file, so
-    // the atomic publish cannot even create its temp.
-    fs::remove_dir_all(&store_dir).unwrap();
-    fs::write(&store_dir, b"not a directory").unwrap();
-
-    let mut staged = StagedPairing::begin(candidate(), Some(1));
-    staged
-        .remote_authenticated(DeviceToken::new("dev-token-new"))
-        .unwrap();
-    let error = staged.commit(&store).expect_err("the write must fail");
-    assert!(matches!(error, StoreError::Io { .. }), "got {error:?}");
-    assert!(
-        matches!(staged.state(), StagedState::SaveFailed { .. }),
-        "state: {:?}",
-        staged.state()
-    );
-    assert_eq!(
-        staged.token().unwrap().expose(),
-        "dev-token-new",
-        "the remote token is kept for the retry"
-    );
-    assert_eq!(
-        store.host("server-a").unwrap().profile.relay.endpoint,
-        "relay.example.com:443",
-        "the original profile is still in effect"
-    );
-    assert_eq!(
-        store.host("server-a").unwrap().generation,
-        1,
-        "no generation bump"
-    );
-    assert!(
-        fs::read(&store_dir).is_ok(),
-        "nothing was published while the write failed"
-    );
-
-    // The retry is the same commit call once the filesystem is healthy again.
-    fs::remove_file(&store_dir).unwrap();
-    fs::create_dir(&store_dir).unwrap();
-    let committed = staged.commit(&store).expect("the retry save lands");
-    assert_eq!(committed.generation, 2);
-    assert_eq!(store.host("server-a").unwrap().profile, candidate());
-    assert_eq!(
-        open(&store_dir).host("server-a").unwrap().profile,
-        candidate(),
-        "the retried save is durable"
     );
 }

@@ -1,6 +1,5 @@
 // ABOUTME: Desktop-client host store: profiles + device tokens in one 0600 JSON (plan T3).
-// ABOUTME: Fails closed on corruption, publishes atomically, and lands TOFU changes
-// ABOUTME: only through a generation-guarded staged transaction.
+// ABOUTME: Fails closed on corruption and publishes atomically.
 
 //! # Host store (spec `2026-10-19-relay-phase2-5-desktop-host-client-design` §2.5, §2.6)
 //!
@@ -24,22 +23,8 @@
 //!   act — restore or delete the file — and the UI says so.
 //! - **Write failure** — the previous document survives (temp + `rename`, no
 //!   partial publish), and in-memory state follows only a durable publish.
-//!
-//! ## Staged TOFU transaction
-//!
-//! A changed or new connection is never written directly: [`StagedPairing::begin`]
-//! holds the candidate profile in memory, [`StagedPairing::remote_authenticated`]
-//! records the token the remote minted, and [`StagedPairing::commit`] performs the
-//! generation-checked replace. Cancel, a failed remote authentication, a stale
-//! confirmation response, or a store write failure all leave the saved profile —
-//! and the live relay connection built from it — exactly as they were (§2.3.3).
-//!
-//! **The honest part (§5.2 contract 3, R2-06):** a remote token cannot be rolled
-//! back. When the exchange succeeded but the local write failed, the staged
-//! candidate keeps its token in memory and `commit` may be retried; the remote
-//! already counts this device. If the process dies before that retry succeeds,
-//! the token is gone and the host has to pair again — never claim the old profile
-//! still works. The user-facing copy for that state belongs to the add-host flow.
+//!   A failed pairing write is reported to the caller: the remote token cannot
+//!   be rolled back, so the host has to pair again (never claim it works).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -127,8 +112,6 @@ pub struct StoredHost {
     /// Absent after a revoke (`credentialInvalid`, §2.5) until a re-pair lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_token: Option<DeviceToken>,
-    /// Committed changes so far; the staged-commit guard (R2-09).
-    pub generation: u64,
 }
 
 impl StoredHost {
@@ -143,30 +126,17 @@ impl fmt::Debug for StoredHost {
             .debug_struct("StoredHost")
             .field("profile", &self.profile)
             .field("device_token", &self.device_token)
-            .field("generation", &self.generation)
             .finish()
     }
 }
 
-/// Every way the store or a staged transaction can refuse.
+/// Every way the store can refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     /// The file exists but is not our document. Blocking: never overwritten.
     Corrupt { path: PathBuf, detail: String },
     /// The filesystem refused a read, encode, or publish.
     Io { path: PathBuf, detail: String },
-    /// A staged replace found a different generation than the caller expected.
-    GenerationMismatch {
-        server_id: String,
-        expected: Option<u64>,
-        actual: Option<u64>,
-    },
-    /// The staged transaction is not in a state that allows this step (commit
-    /// before the remote accepted, after cancel, or after a successful commit).
-    InvalidStagedState {
-        server_id: String,
-        state: &'static str,
-    },
 }
 
 impl fmt::Display for StoreError {
@@ -177,19 +147,9 @@ impl fmt::Display for StoreError {
                 "host store {} is corrupt ({detail}); restore or delete it to recover",
                 path.display()
             ),
-            Self::Io { path, detail } => write!(formatter, "host store {} failed: {detail}", path.display()),
-            Self::GenerationMismatch {
-                server_id,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "host {server_id} changed under a staged commit (expected generation {expected:?}, found {actual:?})"
-            ),
-            Self::InvalidStagedState { server_id, state } => write!(
-                formatter,
-                "the staged change for host {server_id} cannot commit while {state}"
-            ),
+            Self::Io { path, detail } => {
+                write!(formatter, "host store {} failed: {detail}", path.display())
+            }
         }
     }
 }
@@ -321,18 +281,16 @@ impl HostStore {
         };
         let mut next = document.clone();
         next.hosts[index].device_token = None;
-        next.hosts[index].generation += 1;
         self.write(&next)?;
         *document = next;
         Ok(())
     }
 
-    /// Generation-checked replace, then publish. `expected` is `None` when the
-    /// host must not exist yet (a first pairing).
-    fn commit_profile(
+    /// Replace or insert one host with the token this device just received, then
+    /// publish. A failed write leaves the saved profile as it was.
+    pub fn upsert(
         &self,
         profile: &HostProfile,
-        expected: Option<u64>,
         token: DeviceToken,
     ) -> Result<StoredHost, StoreError> {
         let mut document = self.lock();
@@ -340,18 +298,9 @@ impl HostStore {
             .hosts
             .iter()
             .position(|host| host.profile.server_id == profile.server_id);
-        let actual = index.map(|index| document.hosts[index].generation);
-        if actual != expected {
-            return Err(StoreError::GenerationMismatch {
-                server_id: profile.server_id.clone(),
-                expected,
-                actual,
-            });
-        }
         let stored = StoredHost {
             profile: profile.clone(),
             device_token: Some(token),
-            generation: actual.unwrap_or(0) + 1,
         };
         let mut next = document.clone();
         match index {
@@ -380,142 +329,5 @@ impl HostStore {
         self.document
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// A TOFU change waiting for the two things it needs: a remote authentication
-/// that minted a token, and a store write that actually landed.
-///
-/// ```text
-/// begin ──▶ AwaitingRemoteAuth ──remote_authenticated──▶ ReadyToCommit
-///                                                          │ commit (ok)           ──▶ Committed
-///                                                          │ commit (write fails)  ──▶ SaveFailed ──commit retry──▶ Committed
-///        └── cancel ──▶ Abandoned (candidate + token dropped; saved profile untouched)
-/// ```
-#[derive(Debug)]
-pub struct StagedPairing {
-    profile: HostProfile,
-    expected_generation: Option<u64>,
-    token: Option<DeviceToken>,
-    state: StagedState,
-}
-
-/// Where a [`StagedPairing`] stands. Pinned by tests: the UI reads it to tell
-/// "pairing failed, nothing saved" from "the remote accepted us but the write
-/// did not, retry" (§5.2 contract 3, R2-06).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StagedState {
-    AwaitingRemoteAuth,
-    ReadyToCommit,
-    /// The remote minted a token but the local write failed. The candidate and
-    /// its token live in memory only: `commit` retries the save, and dropping
-    /// this object (process death) loses the token for good — the host must pair
-    /// again. The remote already knows this device either way.
-    SaveFailed {
-        detail: String,
-    },
-    Committed {
-        generation: u64,
-    },
-    Abandoned,
-}
-
-impl StagedState {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::AwaitingRemoteAuth => "awaitingRemoteAuth",
-            Self::ReadyToCommit => "readyToCommit",
-            Self::SaveFailed { .. } => "saveFailed",
-            Self::Committed { .. } => "committed",
-            Self::Abandoned => "abandoned",
-        }
-    }
-}
-
-impl StagedPairing {
-    /// Start a staged change. `expected_generation` is the saved host's
-    /// generation (or `None` when the host must not exist yet).
-    pub fn begin(profile: HostProfile, expected_generation: Option<u64>) -> Self {
-        Self {
-            profile,
-            expected_generation,
-            token: None,
-            state: StagedState::AwaitingRemoteAuth,
-        }
-    }
-
-    pub fn profile(&self) -> &HostProfile {
-        &self.profile
-    }
-
-    pub fn expected_generation(&self) -> Option<u64> {
-        self.expected_generation
-    }
-
-    pub fn state(&self) -> &StagedState {
-        &self.state
-    }
-
-    pub fn token(&self) -> Option<&DeviceToken> {
-        self.token.as_ref()
-    }
-
-    /// The remote accepted the pairing and returned this device's token. The
-    /// saved profile is still untouched — that is the whole point of staging.
-    pub fn remote_authenticated(&mut self, token: DeviceToken) -> Result<(), StoreError> {
-        match self.state {
-            StagedState::AwaitingRemoteAuth | StagedState::SaveFailed { .. } => {
-                self.token = Some(token);
-                self.state = StagedState::ReadyToCommit;
-                Ok(())
-            }
-            _ => Err(self.invalid_state()),
-        }
-    }
-
-    /// Publish the candidate. Only from [`StagedState::ReadyToCommit`] (and
-    /// [`StagedState::SaveFailed`], where it retries the interrupted save).
-    pub fn commit(&mut self, store: &HostStore) -> Result<StoredHost, StoreError> {
-        match self.state {
-            StagedState::ReadyToCommit | StagedState::SaveFailed { .. } => {}
-            _ => return Err(self.invalid_state()),
-        }
-        let Some(token) = self.token.clone() else {
-            return Err(self.invalid_state());
-        };
-        match store.commit_profile(&self.profile, self.expected_generation, token) {
-            Ok(stored) => {
-                self.state = StagedState::Committed {
-                    generation: stored.generation,
-                };
-                Ok(stored)
-            }
-            Err(error @ StoreError::Io { .. }) => {
-                self.state = StagedState::SaveFailed {
-                    detail: error.to_string(),
-                };
-                Err(error)
-            }
-            // A generation mismatch is somebody else's committed change: this
-            // candidate is simply stale and stays staged until the caller drops it.
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Drop the candidate (cancel, failed remote authentication, stale answer).
-    /// A no-op once committed: the store already holds that change.
-    pub fn cancel(&mut self) {
-        if matches!(self.state, StagedState::Committed { .. }) {
-            return;
-        }
-        self.token = None;
-        self.state = StagedState::Abandoned;
-    }
-
-    fn invalid_state(&self) -> StoreError {
-        StoreError::InvalidStagedState {
-            server_id: self.profile.server_id.clone(),
-            state: self.state.name(),
-        }
     }
 }

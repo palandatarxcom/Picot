@@ -615,7 +615,7 @@
     "added": "Connected to {host}.",
     "addFailed": "Could not add the host: {reason}",
     "cancelled": "Cancelled.",
-    "saveFailed": "Paired, but the credential could not be saved. Pair again after quitting Picot.",
+    "saveFailed": "Paired, but the credential could not be saved. Add the host again.",
     "readFailed": "Could not read the host list: {reason}",
     "switchBlocked": "Could not save your draft, so this window stays on the current host.",
     "tofuTitleNew": "Trust this new host?",
@@ -626,8 +626,7 @@
       "connecting": "Connecting",
       "online": "Online",
       "offline": "Offline",
-      "credentialInvalid": "Needs pairing",
-      "saveFailed": "Not saved"
+      "credentialInvalid": "Needs pairing"
     },
     "change": {
       "daemonKey": "Key: {saved} → {offered}",
@@ -853,7 +852,7 @@
         "open": "Set up",
         "enableTitle": "Enable remote pairing?",
         "enableDescription": "The daemon connects out to the company relay ({endpoint}). The channel is end-to-end encrypted — the relay only ever sees ciphertext. A paired device gets full access to this Picot.",
-        "keepRunningHint": "Quitting Picot stops the daemon, which also drops every remote connection. Keep \u201cKeep agents running after quitting\u201d on to stay reachable.",
+        "keepRunningHint": "Quitting Picot stops the daemon, which also drops every remote connection. Keep “Keep agents running after quitting” on to stay reachable.",
         "notNow": "Not now",
         "enable": "Enable",
         "offerTitle": "Pair a device",

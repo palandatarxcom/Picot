@@ -146,7 +146,7 @@ describe("setupHostSwitcher", () => {
     refs.list.querySelectorAll(".host-row-main")[1].click();
     await tick();
 
-    expect(invoke.mock.calls.map((call) => call[0])).toContain("host_release");
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("host_grant");
     expect(navigate).toHaveBeenCalledTimes(1);
     expect(navigate.mock.calls[0][0]).toBe("http://127.0.0.1:4321/?host=r1");
     expect(refs.dom.window.localStorage.getItem(LAST_HOST_KEY)).toBe("r1");
@@ -182,8 +182,12 @@ describe("setupHostSwitcher", () => {
   });
 
   it("posts the pasted offer, clears the input, and shows the new-host question", async () => {
+    const saved = [
+      ...hosts,
+      { serverId: "r4", label: "r4", status: "online", needsPairing: false },
+    ];
     const invoke = vi.fn(async (command) => {
-      if (command === "host_list") return hosts;
+      if (command === "host_list") return saved;
       if (command === "host_add")
         return {
           status: "tofuPending",
@@ -393,6 +397,7 @@ describe("setupHostSwitcher", () => {
     expect(hostBadge({ status: "credentialInvalid" })).toBe("credentialInvalid");
     expect(hostBadge({ status: "stopped" })).toBe("offline");
     expect(hostBadge({ status: "offline", needsPairing: true })).toBe("credentialInvalid");
+    expect(hostBadge({ status: "saveFailed" })).toBe("offline");
     expect(hostBadge(undefined)).toBe("offline");
   });
 

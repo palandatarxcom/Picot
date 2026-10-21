@@ -151,15 +151,14 @@ describe("credential invalid", () => {
 });
 
 describe("switchHost", () => {
-  test("navigates to the host-parameterized URL after flush and release", async () => {
+  test("navigates to the host-parameterized URL after the flush", async () => {
     const calls = [];
     const url = await switchHost("remote-1", {
       env: { location: { href: "http://127.0.0.1:47821/workspaces/w1" } },
       flush: () => calls.push("flush"),
-      release: () => calls.push("release"),
       navigate: (href) => calls.push(`navigate:${href}`),
     });
-    expect(calls).toEqual(["flush", "release", `navigate:${url}`]);
+    expect(calls).toEqual(["flush", `navigate:${url}`]);
     expect(url).toBe("http://127.0.0.1:47821/?host=remote-1");
   });
 
@@ -171,33 +170,27 @@ describe("switchHost", () => {
 
   test("a failed flush keeps the window on the current host", async () => {
     const navigate = vi.fn();
-    const release = vi.fn();
     expect(
       await switchHost("remote-1", {
         env: { location: { href: "http://127.0.0.1:47821/" } },
         flush: () => {
           throw new Error("draft save failed");
         },
-        release,
         navigate,
       }),
     ).toBeNull();
-    expect(release).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
   });
 
   test("a flush that reports false keeps the window on the current host", async () => {
     const navigate = vi.fn();
-    const release = vi.fn();
     expect(
       await switchHost("remote-1", {
         env: { location: { href: "http://127.0.0.1:47821/" } },
         flush: async () => false,
-        release,
         navigate,
       }),
     ).toBeNull();
-    expect(release).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
   });
 
@@ -209,20 +202,6 @@ describe("switchHost", () => {
       navigate,
     });
     expect(navigate).toHaveBeenCalledWith(url);
-  });
-
-  test("a failing release never blocks the switch", async () => {
-    const calls = [];
-    const url = await switchHost("remote-1", {
-      env: { location: { href: "http://127.0.0.1:47821/" } },
-      flush: () => calls.push("flush"),
-      release: () => {
-        calls.push("release");
-        throw new Error("host_release unavailable");
-      },
-      navigate: (href) => calls.push(`navigate:${href}`),
-    });
-    expect(calls).toEqual(["flush", "release", `navigate:${url}`]);
   });
 });
 
@@ -239,30 +218,22 @@ describe("connectHost", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  test("remote asks host_status and host_grant, then uses the bridge URL", async () => {
+  test("remote asks host_status and uses the bridge URL", async () => {
     const invoke = vi.fn(async (command) => {
       if (command === "host_status")
         return { serverId: "r1", status: "online", wsUrl: "ws://127.0.0.1:55123/v2/ws" };
-      if (command === "host_grant") return { serverId: "r1", grant: "grant-token" };
       throw new Error(`unexpected command ${command}`);
     });
     const connection = await connectHost({
       env: { location: { href: "http://127.0.0.1:47821/?host=r1" } },
       invoke,
     });
-    expect(invoke.mock.calls).toEqual([
-      ["host_status", { serverId: "r1" }],
-      ["host_grant", { serverId: "r1" }],
-    ]);
+    expect(invoke.mock.calls).toEqual([["host_status", { serverId: "r1" }]]);
     expect(connection).toEqual({
       host: "r1",
       identity: "bridge",
       wsUrl: "ws://127.0.0.1:55123/v2/ws",
-      clientOptions: {
-        identity: "bridge",
-        grant: "grant-token",
-        capabilitiesFromAck: readCapabilities,
-      },
+      clientOptions: { identity: "bridge", capabilitiesFromAck: readCapabilities },
     });
   });
 
@@ -304,17 +275,6 @@ describe("connectHost", () => {
     });
     // Self-rescue: reload onto the same URL without the dead host param.
     expect(replaced).toEqual(["http://127.0.0.1:47821/?workspaceId=w1"]);
-  });
-
-  test("remote without a grant never connects unauthenticated: it comes home", async () => {
-    const { env, replaced } = recoveryEnv("http://127.0.0.1:47821/?host=r1");
-    const invoke = vi.fn(async (command) => {
-      if (command === "host_status") return { serverId: "r1", wsUrl: "ws://127.0.0.1:55123/v2/ws" };
-      return { serverId: "r1" };
-    });
-    const connection = await connectHost({ env, invoke });
-    expect(connection.host).toBe(LOCAL_HOST);
-    expect(replaced).toHaveLength(1);
   });
 
   test("the recovery redirect runs once, so it can never loop on itself", async () => {

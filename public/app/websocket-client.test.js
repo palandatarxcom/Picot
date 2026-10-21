@@ -178,18 +178,15 @@ describe("WebSocketClient control commands", () => {
     });
   });
 
-  test("a bridge-identity hello carries the window grant and no desktop capability", () => {
+  test("a bridge-identity hello carries no desktop capability", () => {
     const sent = [];
     globalThis.__PICOT_NATIVE_CAPABILITY__ = "secret-cap";
-    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
-      identity: "bridge",
-      grant: "grant-token",
-    });
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", { identity: "bridge" });
     client.ws = { readyState: WebSocket.OPEN, send: (m) => sent.push(JSON.parse(m)) };
     client._sendClientHello();
     delete globalThis.__PICOT_NATIVE_CAPABILITY__;
 
-    expect(sent[0]).toMatchObject({ type: "hello", bridgeGrant: "grant-token" });
+    expect(sent[0]).toMatchObject({ type: "hello" });
     expect(sent[0].desktopCapability).toBeUndefined();
   });
 

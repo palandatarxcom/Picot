@@ -615,7 +615,7 @@
     "added": "已连接 {host}。",
     "addFailed": "无法添加主机：{reason}",
     "cancelled": "已取消。",
-    "saveFailed": "已配对，但凭据未能保存。退出 Picot 后需要重新配对。",
+    "saveFailed": "已配对，但凭据未能保存。请重新添加该主机。",
     "readFailed": "无法读取主机列表：{reason}",
     "switchBlocked": "草稿未能保存，此窗口仍留在当前主机。",
     "tofuTitleNew": "信任这台新主机？",
@@ -626,8 +626,7 @@
       "connecting": "连接中",
       "online": "在线",
       "offline": "离线",
-      "credentialInvalid": "需重新配对",
-      "saveFailed": "未保存"
+      "credentialInvalid": "需重新配对"
     },
     "change": {
       "daemonKey": "密钥：{saved} → {offered}",

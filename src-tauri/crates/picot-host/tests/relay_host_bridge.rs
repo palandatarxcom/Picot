@@ -1,4 +1,4 @@
-// ABOUTME: Per-host bridge contracts: grants, byte-preserving hello, pairing and lifecycle.
+// ABOUTME: Per-host bridge contracts: byte-preserving hello, pairing and lifecycle.
 // ABOUTME: Real loopback WS against mock relay and in-process daemon; every test has deadline.
 
 #[path = "support/mock_relay.rs"]
@@ -11,12 +11,11 @@ use mock_relay::{MockClientSocket, MockRelay};
 use picot_host::relay::client_role::{ClientRoleConfig, ClientRoleSeams};
 use picot_host::relay::e2ee;
 use picot_host::relay::host_bridge::{
-    start_host_bridge_with_seams, BridgeSeams, Credential, GrantRegistry, HostBridgeHandle,
-    HostBridgeStatus, PairingSaveError, PairingSink,
+    start_host_bridge_with_seams, BridgeSeams, Credential, HostBridgeHandle, HostBridgeStatus,
+    PairingSaveError, PairingSink,
 };
 use picot_host::relay::host_store::DeviceToken;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
@@ -26,19 +25,6 @@ type Socket =
 const ORIGIN: &str = "http://127.0.0.1:54321";
 const BUDGET: Duration = Duration::from_secs(15);
 
-#[derive(Default)]
-struct Grants(Mutex<HashSet<String>>);
-impl GrantRegistry for Grants {
-    fn validate(&self, token: &str, server: &str, origin: &str) -> Option<String> {
-        let bound_host = if token == "other-host" {
-            "different-host"
-        } else {
-            "host"
-        };
-        (server == bound_host && origin == ORIGIN && self.0.lock().unwrap().contains(token))
-            .then(|| token.to_owned())
-    }
-}
 struct Saved {
     tokens: Mutex<Vec<DeviceToken>>,
     fail: bool,
@@ -58,17 +44,10 @@ struct Rig {
     relay: MockRelay,
     secret: crypto_box::SecretKey,
     bridge: HostBridgeHandle,
-    grants: Arc<Grants>,
 }
 async fn rig(credential: Credential, sink: Option<Arc<dyn PairingSink>>) -> Rig {
     let relay = MockRelay::start().await;
     let secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
-    let grants = Arc::new(Grants::default());
-    grants
-        .0
-        .lock()
-        .unwrap()
-        .extend(["w1".into(), "w2".into(), "other-host".into()]);
     let mut client = ClientRoleSeams::default();
     client.timings.pre_hello_delay = Duration::from_millis(20);
     client.timings.hello_resend_after = Duration::from_millis(50);
@@ -81,7 +60,6 @@ async fn rig(credential: Credential, sink: Option<Arc<dyn PairingSink>>) -> Rig 
             peer_public_key_b64: B64.encode(secret.public_key().as_bytes()),
         },
         credential,
-        grants.clone(),
         sink,
         BridgeSeams {
             first_frame_timeout: Duration::from_millis(150),
@@ -94,14 +72,13 @@ async fn rig(credential: Credential, sink: Option<Arc<dyn PairingSink>>) -> Rig 
         relay,
         secret,
         bridge,
-        grants,
     }
 }
 fn device() -> Credential {
     Credential::Device(DeviceToken::new("rust-secret"))
 }
-fn hello(grant: &str) -> String {
-    json!({"type":"hello", "protocolVersion":2, "clientId":grant, "clientType":"desktop", "desktopCapability":"local-secret", "bridgeGrant":grant}).to_string()
+fn hello(client_id: &str) -> String {
+    json!({"type":"hello", "protocolVersion":2, "clientId":client_id, "clientType":"desktop", "desktopCapability":"local-secret", "bridgeGrant":"local-window"}).to_string()
 }
 async fn dial(bridge: &HostBridgeHandle, origin: Option<&str>) -> Socket {
     let mut req = (bridge.origin.replacen("http://", "ws://", 1) + "/v2/ws")
@@ -170,40 +147,6 @@ async fn peer(rig: &Rig, seen: &mut Vec<String>) -> Peer {
 }
 
 #[tokio::test]
-async fn grants_reject_before_any_relay_dial_and_first_frame_deadline_closes() {
-    tokio::time::timeout(BUDGET, async {
-        let r = rig(device(), None).await;
-        r.grants.0.lock().unwrap().remove("w2");
-        for (origin, frame) in [
-            (Some(ORIGIN), "{\"type\":\"hello\"}".into()),
-            (Some(ORIGIN), hello("forged")),
-            (Some(ORIGIN), hello("other-host")),
-            (Some(ORIGIN), hello("w2")),
-            (Some("https://evil.test"), hello("w1")),
-            (None, hello("w1")),
-            (
-                Some(ORIGIN),
-                "{\"type\":\"request\",\"bridgeGrant\":\"w1\"}".into(),
-            ),
-        ] {
-            let mut s = dial(&r.bridge, origin).await;
-            send(&mut s, &frame).await;
-            closed(&mut s).await;
-        }
-        let mut s = dial(&r.bridge, Some(ORIGIN)).await;
-        closed(&mut s).await;
-        assert_eq!(
-            r.relay.client_upgrades(),
-            0,
-            "no secrets injected before grant validation"
-        );
-        r.bridge.stop().await;
-    })
-    .await
-    .expect("grant test deadline");
-}
-
-#[tokio::test]
 async fn hello_preserves_raw_values_and_business_frames_and_two_sessions_are_independent() {
     tokio::time::timeout(BUDGET, async {
         let r = rig(device(), None).await;
@@ -248,7 +191,7 @@ async fn pairing_single_flight_sanitizes_ack_and_failed_save_is_terminal() {
             p.send(r#"{"type":"hello_ack","deviceToken":"minted-secret","capabilities":{"native":true}}"#).await;
             if fail {
                 closed(&mut a).await;
-                assert_eq!(*r.bridge.status.borrow(), HostBridgeStatus::SaveFailed);
+                assert_eq!(*r.bridge.status.borrow(), HostBridgeStatus::PairingFailed);
             } else {
                 let ack = recv(&mut a).await; assert!(!ack.contains("deviceToken")); assert!(!ack.contains("minted-secret"));
                 assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["capabilities"]["native"], true);
@@ -267,7 +210,7 @@ async fn pairing_single_flight_sanitizes_ack_and_failed_save_is_terminal() {
 }
 
 #[tokio::test]
-async fn relay_loss_closes_proxy_redials_without_duplicate_hello_and_reconnects() {
+async fn relay_loss_keeps_proxy_redials_without_duplicate_hello_and_reconnects() {
     tokio::time::timeout(BUDGET, async {
         let r = rig(device(), None).await;
         let mut seen = vec![];
@@ -278,24 +221,19 @@ async fn relay_loss_closes_proxy_redials_without_duplicate_hello_and_reconnects(
         p.send("{\"type\":\"hello_ack\"}").await;
         recv(&mut a).await;
         p.socket.close().await;
-        closed(&mut a).await;
-        let mut q = peer(&r, &mut seen).await;
+        // Transport loss no longer closes the proxy: it waits for the next
+        // session, and the client's next hello rides it.
         assert!(
-            q.socket
-                .maybe_recv_text(Duration::from_millis(100))
+            tokio::time::timeout(Duration::from_millis(200), a.next())
                 .await
-                .is_none(),
-            "redial is pure transport; no replayed app hello"
+                .is_err(),
+            "proxy stays open across a relay drop"
         );
-        let mut b = dial(&r.bridge, Some(ORIGIN)).await;
-        send(&mut b, &hello("w1")).await;
-        assert_eq!(
-            serde_json::from_str::<Value>(&q.recv().await).unwrap()["type"],
-            "hello"
-        );
-        q.send("{\"type\":\"hello_ack\"}").await;
-        assert!(!recv(&mut b).await.contains("deviceToken"));
-        assert_eq!(seen.len(), 2);
+        // The bridge never replays the application hello on the fresh relay
+        // session; the next window's hello is what rides it. The mock relay does
+        // not re-dial a data socket for us, so the reconnect itself is covered by
+        // the real-relay e2e (scripts/smoke-relay-phase25.sh).
+        assert_eq!(seen.len(), 1, "no replayed app hello on the redial");
         r.bridge.stop().await;
     })
     .await
@@ -303,7 +241,7 @@ async fn relay_loss_closes_proxy_redials_without_duplicate_hello_and_reconnects(
 }
 
 #[tokio::test]
-async fn window_refs_are_deduplicated_invalidation_is_scoped_and_last_release_stops() {
+async fn window_refs_are_deduplicated_and_last_release_stops() {
     tokio::time::timeout(BUDGET, async {
         let r = rig(device(), None).await;
         let mut seen = vec![];
@@ -318,9 +256,6 @@ async fn window_refs_are_deduplicated_invalidation_is_scoped_and_last_release_st
         send(&mut b, &hello("w2")).await;
         let mut q = peer(&r, &mut seen).await;
         q.recv().await;
-        r.grants.0.lock().unwrap().remove("w1");
-        r.bridge.invalidate_window("w1");
-        closed(&mut a).await;
         r.bridge.release("w1");
         q.send("{\"type\":\"hello_ack\"}").await;
         assert_eq!(recv(&mut b).await, "{\"type\":\"hello_ack\"}");
@@ -448,11 +383,10 @@ async fn real_daemon_pairing_ack_subscription_request_navigation_and_revoke_are_
         let identity = DaemonIdentity::for_tests();
         let transport = RelayTransport::start(RelayConfig { endpoint: relay.addr().to_string(), use_tls:false, server_id:"host".into() }, identity.clone(), state.host.relay_session_sink());
         while relay.control_upgrades() == 0 { tokio::time::sleep(Duration::from_millis(5)).await; }
-        let grants = Arc::new(Grants::default()); grants.0.lock().unwrap().insert("w1".into());
         let saved = Arc::new(Saved { tokens:Mutex::new(vec![]), fail:false });
         let bridge = start_host_bridge_with_seams(ClientRoleConfig {
             endpoint: relay.addr().to_string(), use_tls:false, server_id:"host".into(), peer_public_key_b64: identity.public_key_b64,
-        }, Credential::Pairing { pairing_token:DeviceToken::new(offer.token), device_id:"bridge-device".into() }, grants, Some(saved.clone()), BridgeSeams::default()).await.unwrap();
+        }, Credential::Pairing { pairing_token:DeviceToken::new(offer.token), device_id:"bridge-device".into() }, Some(saved.clone()), BridgeSeams::default()).await.unwrap();
         let mut a = dial(&bridge, Some(ORIGIN)).await; send(&mut a, &hello("w1")).await;
         let token_free = |text: &str| {
             assert!(!text.contains("deviceToken"), "no credential field reaches WebView");
@@ -470,10 +404,12 @@ async fn real_daemon_pairing_ack_subscription_request_navigation_and_revoke_are_
         let navigation = token_free(&recv(&mut a).await);
         assert_eq!(navigation["type"], "host_response", "{navigation}");
         assert_eq!(navigation["response"]["workspaces"][0]["workspaceId"], ws_id);
-        state.host.revoke_remote_device("bridge-device").unwrap(); closed(&mut a).await;
+        state.host.revoke_remote_device("bridge-device").unwrap();
+        // The revoked session drops; the proxy stays. The next hello is what the
+        // daemon refuses, and that explicit rejection is the terminal status.
         let mut b = dial(&bridge, Some(ORIGIN)).await; send(&mut b, &hello("w1")).await; closed(&mut b).await;
         assert_eq!(*bridge.status.borrow(), HostBridgeStatus::CredentialInvalid);
-        bridge.stop().await; transport.stop().await; responder.abort();
+        bridge.stop().await; closed(&mut a).await; transport.stop().await; responder.abort();
         state.host.stop();
     }).await.expect("daemon round trip deadline");
 }
@@ -528,40 +464,6 @@ async fn stop_drops_inflight_persistence_callback_without_ack_or_late_commit() {
 }
 
 #[tokio::test]
-async fn invalidating_one_window_cancels_its_inflight_handshake_without_stopping_other_refs() {
-    tokio::time::timeout(BUDGET, async {
-        let r = rig(device(), None).await;
-        r.bridge.acquire("w1");
-        r.bridge.acquire("w2");
-        let mut a = dial(&r.bridge, Some(ORIGIN)).await;
-        send(&mut a, &hello("w1")).await;
-        while r.relay.client_upgrades() == 0 {
-            tokio::task::yield_now().await;
-        }
-        r.grants.0.lock().unwrap().remove("w1");
-        r.bridge.invalidate_window("w1");
-        closed(&mut a).await;
-        let attempts = r.relay.client_upgrades();
-        tokio::time::sleep(Duration::from_millis(180)).await;
-        assert_eq!(
-            r.relay.client_upgrades(),
-            attempts,
-            "window invalidation cancels pending transport, not standby redial"
-        );
-        let mut b = dial(&r.bridge, Some(ORIGIN)).await;
-        send(&mut b, &hello("w2")).await;
-        let mut p = peer(&r, &mut vec![]).await;
-        assert_eq!(
-            serde_json::from_str::<Value>(&p.recv().await).unwrap()["clientId"],
-            "w2"
-        );
-        r.bridge.stop().await;
-    })
-    .await
-    .expect("inflight invalidation deadline");
-}
-
-#[tokio::test]
 async fn explicit_auth_rejection_before_transport_close_wins_over_generic_offline() {
     tokio::time::timeout(BUDGET, async {
         for _ in 0..3 {
@@ -611,12 +513,13 @@ async fn pairing_ack_deadline_abandons_the_exchange_and_frees_the_pairing_slot()
         // pairing_busy released: the next window is an ordinary attempt, not "busy".
         let mut b = dial(&r.bridge, Some(ORIGIN)).await;
         send(&mut b, &hello("w2")).await;
-        let mut q = peer(&r, &mut seen).await;
+        // Session is retained across proxy sessions, so the retry rides the SAME
+        // relay session: no second data dial, the hello arrives on this peer.
         assert_eq!(
-            serde_json::from_str::<Value>(&q.recv().await).unwrap()["pairingToken"],
+            serde_json::from_str::<Value>(&p.recv().await).unwrap()["pairingToken"],
             "offer-secret"
         );
-        q.send(r#"{"type":"hello_ack","deviceToken":"minted-secret"}"#)
+        p.send(r#"{"type":"hello_ack","deviceToken":"minted-secret"}"#)
             .await;
         assert!(!recv(&mut b).await.contains("minted-secret"));
         assert_eq!(saved.tokens.lock().unwrap().len(), 1);

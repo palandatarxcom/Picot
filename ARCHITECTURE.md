@@ -219,14 +219,14 @@ relay 数据面绕开 axum 入口的物理帧上限，各上限统一进契约�
 | terminal（`terminal_command`） | 放行 | 新 device 分支，cwd 取 device view 的 workspace 根 |
 | 工作区创建/删除/停止、设置类、admin（`daemon.status`/`stop`/`restart`） | 永拒 | Desktop-only 不变 |
 
-- **grant 链（契约 3）**：随机 loopback 端口不构成认证。bridge grant 由 app 铸造，身份从**注入的 `WebviewWindow`** 推导（复用 caller check，不信客户端自报 window id），绑定 (窗口, host)；随首帧 hello 的 `bridgeGrant` 字段传输（不走 HTTP header），并校验 Origin = 本机页面 origin。无 grant、伪造、异源、跨 host、窗口已关、首帧非 hello 或 15s 超时——一律关连接、不注入凭据。窗口存活期内断线重连由桥续发新 grant；窗口关闭或切 host 即作废该 grant，并**主动关闭该窗口的活 proxy 连接**。
-- **hello_ack 净化（契约 3）**：配对模式下远端 `hello_ack` 携带新铸 deviceToken——桥解析该帧、接管持久化，向 WebView 只转发**剔除 `deviceToken` 后**的 ack；持久化失败则关连接并把配对状态置「保存失败」（不静默丢 token，也不假装成功）。普通模式 ack 不含凭据，原样转发；其余业务帧不解析、双向透传。本机 desktopCapability 绝不出本机，deviceToken 只在 Rust 侧出现（日志走既有 token redaction）。
-- **wire 白名单（§12 已点头）**：既有帧一律不改；新增仅限三项——`workspace.bootstrap` 受限 op（由 HTTP 盘点定名单方法、固定 schema，长度/超时沿 `transport_limits`，**禁止任意 URL 代理**）、hello 的 `bridgeGrant` 字段、`hello_ack.capabilities` 对象（additive，前端据此放行管理面；老客户端忽略）。其余扩展须先改 spec。
-- **HTTP 面处置（契约 2）**：relay 通道只隧道 WS 会话帧，没有 HTTP 承接协议，本地加代理路由也不会让远端 handler 可达——因此**不做通用 HTTP 代理**，前端每个相对 HTTP 调用逐项三选一：映射到既有/新增受限 WS op、远程模式显式禁用、显式保持本机（静态资源）。清盘与逐项处置见 `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-http-inventory.md`，并有一条测试守住新增调用点必须入表。
+- **桥的信任边界（契约 3）**：桥只听 loopback 随机端口，与 Paseo 一致按「同机同用户」信任（与本地 daemon 的 `/v2/ws` 同一口径）：不铸窗口 grant、不校验 Origin；窗口身份只来自**注入的 `WebviewWindow`** 的 caller check（不信客户端自报 window id），桥不持有任何窗口级凭据。首帧非 hello 或 15s 超时——关连接、不注入凭据。
+- **hello_ack 净化（契约 3）**：配对模式下远端 `hello_ack` 携带新铸 deviceToken——桥解析该帧、接管持久化，向 WebView 只转发**剔除 `deviceToken` 后**的 ack；持久化失败则关连接并把配对状态置 `PairingFailed`（重开新 offer 才能再配对，不静默丢 token，也不假装成功）。普通模式 ack 不含凭据，原样转发；其余业务帧不解析、双向透传。本机 desktopCapability 绝不出本机，deviceToken 只在 Rust 侧出现（日志走既有 token redaction）。
+- **wire 白名单（§12 已点头）**：既有帧一律不改；新增仅限两项——`workspace.bootstrap` 受限 op（由 HTTP 盘点定名单方法、固定 schema，长度/超时沿 `transport_limits`，**禁止任意 URL 代理**）、`hello_ack.capabilities` 对象（additive，前端据此放行管理面；老客户端忽略）。其余扩展须先改 spec。
+- **HTTP 面处置（契约 2）**：relay 通道只隧道 WS 会话帧，没有 HTTP 承接协议，本地加代理路由也不会让远端 handler 可达——因此**不做通用 HTTP 代理**，前端每个相对 HTTP 调用逐项三选一：映射到既有/新增受限 WS op、远程模式显式禁用、显式保持本机（静态资源）。清盘与逐项处置见 `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-http-inventory.md`（文档留存，不再有守卫测试）。
 - **切换 = 页面级重载（契约 4）**：host 参数在**窗口 URL** 上，切换即导航 + 整页重载，模块闭包、投影、pending、在途请求随旧页面消亡；草稿与 keyed cache 按 host 命名空间存 localStorage 跨重载保留；切前 flush 复用既有 quit 前 flush 机制。桥**按 host 共享、按窗口引用计数**：同一 host 多窗口共享一个桥，桥上每条 proxy 连接 = 一条独立 relay 会话；最后一个窗口离开才停桥。同 host 双窗口共享同一个 device view。
 - **host_store 威胁边界**：`app_config_dir/picot-hosts.json`（0600，tmp+rename 原子替换，写失败保旧文件）存 HostProfile 与 deviceToken。服务端只存 token hash，这里存的是**明文 bearer token**——泄露后果**重于**服务端库，本机同用户任意进程可读；本期接受，macOS Keychain 留作后续加固。此文件同时是 TOFU 信任基线，**损坏不回退默认值**：保留原文件、阻塞覆盖性保存、UI 要求重新配对或手动恢复。本机删 host 只删本地 profile+token，远端设备记录仍在（撤销是远端 owner 的动作）。
 - **已知行为：设备 git 事件回放到 pairing owner 的窗口**（架构狮 F-08）。设备的 git 操作经 `send_owner_event(owner, …)` 推给配对时记录的 owner，因此本机同一 owner 的窗口会看到设备发起的 git 事件——同一个 principal，不构成越权，但会与本机 git 面板串扰。按 principal 定向属后续优化，本期记为已知行为；若将来出现第二个 device principal 共享 owner 的场景，须改为按连接定向。
-- **失败态语义**：`PairingFailed`（配对本身被拒，token 已消费）与 `CredentialInvalid`（已配对设备被撤销）是两个独立终态：前者停用该次 pairingToken、等新 offer 顶替；后者清本地 token、停桥、清 grant 绑定并落回 `offline`。桥在两层重连中都不重放应用层 hello。
+- **失败态语义**：`PairingFailed`（配对本身被拒，token 已消费）与 `CredentialInvalid`（已配对设备被撤销）是两个独立终态：前者停用该次 pairingToken、等新 offer 顶替；后者清本地 token、停桥并落回 `offline`。桥在两层重连中都不重放应用层 hello。
 
 ## 授权模型
 

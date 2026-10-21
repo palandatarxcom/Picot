@@ -713,12 +713,10 @@ test("workspace open-in-new-window failure lands in the landing notice", async (
 
 test("landing wires the host picker so a pick leaves the landing on that host", async () => {
   const log = [];
-  let navigationsAtRelease = null;
   const calls = trackNavigation();
   const invoke = vi.fn(async (command) => {
     log.push(command);
     if (command === "host_list") return [{ serverId: "r1", label: "desk", status: "online" }];
-    if (command === "host_release") navigationsAtRelease = calls.length;
     return { ok: true };
   });
   globalThis.__TAURI__ = { core: { invoke } };
@@ -736,9 +734,8 @@ test("landing wires the host picker so a pick leaves the landing on that host", 
 
     await vi.waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0]).toContain("host=r1");
-    // flush (no composer draft here) → release → navigate.
-    expect(log).toEqual(["host_list", "host_release"]);
-    expect(navigationsAtRelease).toBe(0);
+    // flush (no composer draft here) → navigate.
+    expect(log).toEqual(["host_list"]);
     expect(localStorage.getItem("picot-last-host")).toBe("r1");
   } finally {
     delete globalThis.__TAURI__;

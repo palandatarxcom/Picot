@@ -615,7 +615,7 @@
     "added": "Conectado a {host}.",
     "addFailed": "No se pudo añadir el host: {reason}",
     "cancelled": "Cancelado.",
-    "saveFailed": "Emparejado, pero no se pudo guardar la credencial. Vuelve a emparejar tras cerrar Picot.",
+    "saveFailed": "Emparejado, pero no se pudo guardar la credencial. Añade el host de nuevo.",
     "readFailed": "No se pudo leer la lista de hosts: {reason}",
     "switchBlocked": "No se pudo guardar el borrador, así que esta ventana sigue en el host actual.",
     "tofuTitleNew": "¿Confiar en este host nuevo?",
@@ -626,8 +626,7 @@
       "connecting": "Conectando",
       "online": "En línea",
       "offline": "Sin conexión",
-      "credentialInvalid": "Requiere emparejar",
-      "saveFailed": "Sin guardar"
+      "credentialInvalid": "Requiere emparejar"
     },
     "change": {
       "daemonKey": "Clave: {saved} → {offered}",

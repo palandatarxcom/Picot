@@ -615,7 +615,7 @@
     "added": "{host} に接続しました。",
     "addFailed": "ホストを追加できません：{reason}",
     "cancelled": "キャンセルしました。",
-    "saveFailed": "ペアリングは完了しましたが、認証情報を保存できませんでした。Picot を終了した後で再ペアリングしてください。",
+    "saveFailed": "ペアリングは完了しましたが、認証情報を保存できませんでした。ホストを追加し直してください。",
     "readFailed": "ホスト一覧を読み込めません：{reason}",
     "switchBlocked": "下書きを保存できなかったため、このウィンドウは現在のホストのままです。",
     "tofuTitleNew": "この新しいホストを信頼しますか？",
@@ -626,8 +626,7 @@
       "connecting": "接続中",
       "online": "オンライン",
       "offline": "オフライン",
-      "credentialInvalid": "再ペアリングが必要",
-      "saveFailed": "未保存"
+      "credentialInvalid": "再ペアリングが必要"
     },
     "change": {
       "daemonKey": "鍵：{saved} → {offered}",
