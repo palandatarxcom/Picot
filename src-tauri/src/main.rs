@@ -35,8 +35,8 @@ use daemon_client::surface_ops::ForwardedSurfaceOps;
 use daemon_client::window_ledger::{route_for_url, LedgerRow, WindowLedger};
 #[cfg(target_os = "macos")]
 use host_client::commands::{
-    host_add, host_confirm_tofu, host_list, host_remove, host_status, relay_device_list,
-    relay_revoke_device,
+    host_add, host_confirm_tofu, host_grant, host_list, host_release, host_remove, host_status,
+    relay_device_list, relay_revoke_device,
 };
 use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::{child_supervision, window_owner};
@@ -3241,6 +3241,8 @@ fn main() {
                 handle_window_destroyed(window);
                 if let Some(state) = window.try_state::<host_client::HostClientState>() {
                     if let Ok(client) = &state.0 {
+                        // Sync registry revoke first (contract 3), async join after.
+                        client.revoke_window_now(window.label());
                         let client = client.clone();
                         let label = window.label().to_owned();
                         tauri::async_runtime::spawn(async move {
@@ -3282,6 +3284,8 @@ fn main() {
             host_confirm_tofu,
             host_remove,
             host_status,
+            host_grant,
+            host_release,
             relay_device_list,
             relay_revoke_device
         ])

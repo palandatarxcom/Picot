@@ -222,18 +222,28 @@ describe("connectHost", () => {
     const invoke = vi.fn(async (command) => {
       if (command === "host_status")
         return { serverId: "r1", status: "online", wsUrl: "ws://127.0.0.1:55123/v2/ws" };
+      if (command === "host_grant") return { grant: "grant-r1" };
       throw new Error(`unexpected command ${command}`);
     });
     const connection = await connectHost({
       env: { location: { href: "http://127.0.0.1:47821/?host=r1" } },
       invoke,
     });
-    expect(invoke.mock.calls).toEqual([["host_status", { serverId: "r1" }]]);
+    // The bridge authenticates a window by its grant, not by the loopback port:
+    // a connection without one must never be opened.
+    expect(invoke.mock.calls).toEqual([
+      ["host_status", { serverId: "r1" }],
+      ["host_grant", { serverId: "r1" }],
+    ]);
     expect(connection).toEqual({
       host: "r1",
       identity: "bridge",
       wsUrl: "ws://127.0.0.1:55123/v2/ws",
-      clientOptions: { identity: "bridge", capabilitiesFromAck: readCapabilities },
+      clientOptions: {
+        identity: "bridge",
+        grant: "grant-r1",
+        capabilitiesFromAck: readCapabilities,
+      },
     });
   });
 
@@ -275,6 +285,24 @@ describe("connectHost", () => {
     });
     // Self-rescue: reload onto the same URL without the dead host param.
     expect(replaced).toEqual(["http://127.0.0.1:47821/?workspaceId=w1"]);
+  });
+
+  test("a host that hands out no grant falls back instead of connecting unauthenticated", async () => {
+    const { env, replaced } = recoveryEnv("http://127.0.0.1:47821/?host=r1");
+    const invoke = vi.fn(async (command) => {
+      if (command === "host_status")
+        return { serverId: "r1", status: "online", wsUrl: "ws://127.0.0.1:55123/v2/ws" };
+      if (command === "host_grant") return {};
+      throw new Error(`unexpected command ${command}`);
+    });
+    const connection = await connectHost({ env, invoke });
+    expect(connection).toEqual({
+      host: LOCAL_HOST,
+      identity: "desktop",
+      wsUrl: "ws://127.0.0.1:47821/v2/ws",
+      clientOptions: { capabilitiesFromAck: readCapabilities },
+    });
+    expect(replaced).toEqual(["http://127.0.0.1:47821/"]);
   });
 
   test("the recovery redirect runs once, so it can never loop on itself", async () => {

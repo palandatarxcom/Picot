@@ -219,7 +219,8 @@ relay 数据面绕开 axum 入口的物理帧上限，各上限统一进契约�
 | terminal（`terminal_command`） | 放行 | 新 device 分支，cwd 取 device view 的 workspace 根 |
 | 工作区创建/删除/停止、设置类、admin（`daemon.status`/`stop`/`restart`） | 永拒 | Desktop-only 不变 |
 
-- **桥的信任边界（契约 3）**：桥只听 loopback 随机端口，与 Paseo 一致按「同机同用户」信任（与本地 daemon 的 `/v2/ws` 同一口径）：不铸窗口 grant、不校验 Origin；窗口身份只来自**注入的 `WebviewWindow`** 的 caller check（不信客户端自报 window id），桥不持有任何窗口级凭据。首帧非 hello 或 15s 超时——关连接、不注入凭据。
+- **桥的信任边界（契约 3）**：随机 loopback 端口是隐蔽性，不是认证——任何本机进程或浏览器页面都能连到它。桥因此要求**每窗口一份 grant**：`host_grant` 只对注入的 `WebviewWindow` 铸凭据（窗口身份不信客户端自报），凭据绑定 `server_id` 与该窗口当时的页面 origin；proxy 在改写或拨号**之前**校验 hello 里的 `bridgeGrant`（精确 Origin + host + 活窗口），缺失、伪造、跨 host、跨窗口、窗口已关闭的一律关连接且**不注入**任何凭据，`rewrite` 同时剥掉客户端伪造的同名/凭据字段。Origin 是纵深防御（浏览器无法伪造），grant 才是认证。窗口切换先 release、窗口销毁先同步吊销再异步清理；`invalidate_window` 先失效后断活连接，避免吊销与重认证交错。这不是「同机同用户即信任」：本地 daemon 的 `/v2/ws` 未认证只能落只读面，桥却是零认证即注入 deviceToken，两者威胁模型不同。首帧非 hello 或 15s 超时同样关连接、不注入凭据。
+  桥与窗口的参考计数不变；proxy 结束时**只有当其 relay 会话尚未 hello 过（或已换成新一代会话）**才保留该会话供重拨复用，否则连会话一起停——daemon 会话只应答一次 hello，保留已 hello 的会话会让 WebView 重连收到 `invalid_frame` 并陷入重连循环。
 - **hello_ack 净化（契约 3）**：配对模式下远端 `hello_ack` 携带新铸 deviceToken——桥解析该帧、接管持久化，向 WebView 只转发**剔除 `deviceToken` 后**的 ack；持久化失败则关连接并把配对状态置 `PairingFailed`（重开新 offer 才能再配对，不静默丢 token，也不假装成功）。普通模式 ack 不含凭据，原样转发；其余业务帧不解析、双向透传。本机 desktopCapability 绝不出本机，deviceToken 只在 Rust 侧出现（日志走既有 token redaction）。
 - **wire 白名单（§12 已点头）**：既有帧一律不改；新增仅限两项——`workspace.bootstrap` 受限 op（由 HTTP 盘点定名单方法、固定 schema，长度/超时沿 `transport_limits`，**禁止任意 URL 代理**）、`hello_ack.capabilities` 对象（additive，前端据此放行管理面；老客户端忽略）。其余扩展须先改 spec。
 - **HTTP 面处置（契约 2）**：relay 通道只隧道 WS 会话帧，没有 HTTP 承接协议，本地加代理路由也不会让远端 handler 可达——因此**不做通用 HTTP 代理**，前端每个相对 HTTP 调用逐项三选一：映射到既有/新增受限 WS op、远程模式显式禁用、显式保持本机（静态资源）。清盘与逐项处置见 `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-http-inventory.md`（文档留存，不再有守卫测试）。

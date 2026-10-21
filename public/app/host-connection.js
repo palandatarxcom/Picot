@@ -112,13 +112,20 @@ export function hostUrl(hostId, env = globalThis.window || globalThis) {
  */
 export async function switchHost(
   hostId,
-  { env = globalThis.window || globalThis, flush, navigate } = {},
+  { env = globalThis.window || globalThis, flush, release, navigate } = {},
 ) {
   try {
     if ((await flush?.()) === false) return null;
   } catch {
     // A draft that could not be saved keeps the window on the current host.
     return null;
+  }
+  // Synchronous IPC: unload cleanup is unreliable, so this call is the main
+  // grant-release path (host_release; window destroy is the safety net).
+  try {
+    void Promise.resolve(release?.()).catch(() => {});
+  } catch {
+    // A release failure must never strand the window on a dead host.
   }
   const url = hostUrl(hostId, env);
   const go = navigate || ((href) => locationOf(env).assign(href));
@@ -211,11 +218,11 @@ function tauriInvoke(env = globalThis.window || globalThis) {
 
 /**
  * Boot an entry module's connection: local hosts resolve without any IPC, a
- * remote host resolves its bridge URL from `host_status`.
+ * remote host resolves its bridge URL and window grant from the app commands.
  * Never falls back to the local socket for a remote host (contract 2).
  *
  * Both entry modules await this at module top level, so it must not throw: a
- * dead remote host (deleted, broken store, stopped bridge, no token) hands the
+ * dead remote host (deleted, broken store, stopped bridge, no grant) hands the
  * window back to the local host instead of blanking the page (F-03).
  */
 export async function connectHost({
@@ -233,11 +240,17 @@ export async function connectHost({
   try {
     if (!invoke) throw new Error("Remote host needs the app shell (Tauri IPC unavailable)");
     const status = await invoke("host_status", { serverId: host });
+    const grant = await invoke("host_grant", { serverId: host });
+    if (!grant?.grant) throw new Error("Host grant is unavailable");
     const connection = {
       host,
       identity: "bridge",
       wsUrl: resolveWsUrlForHost({ wsUrl: status?.wsUrl, bridgeOrigin: status?.bridgeOrigin }, env),
-      clientOptions: { identity: "bridge", capabilitiesFromAck: readCapabilities },
+      clientOptions: {
+        identity: "bridge",
+        grant: grant.grant,
+        capabilitiesFromAck: readCapabilities,
+      },
     };
     try {
       env?.sessionStorage?.removeItem(recoveryMark(host));

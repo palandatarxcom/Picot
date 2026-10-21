@@ -30,12 +30,13 @@ export function resolveWebSocketUrl(env = globalThis.window || globalThis) {
 }
 
 export class WebSocketClient extends EventTarget {
-  constructor(url, { identity = "desktop", capabilitiesFromAck } = {}) {
+  constructor(url, { identity = "desktop", grant = null, capabilitiesFromAck } = {}) {
     super();
     this.url = url;
     // "bridge" is a window behind the app-owned loopback bridge (remote host):
-    // its hello never carries the desktop capability.
+    // its hello carries the window grant and never the desktop capability.
     this.identity = identity;
+    this.bridgeGrant = grant;
     this._capabilitiesFromAck = capabilitiesFromAck || (() => ({ native: true, class: "native" }));
     this.ws = null;
     this.reconnectAttempts = 0;
@@ -341,6 +342,7 @@ export class WebSocketClient extends EventTarget {
       clientId: this.clientId || `desktop-${globalThis.crypto?.randomUUID?.() || Date.now()}`,
     };
     if (this.identity === "desktop") hello.desktopCapability = capability;
+    else if (this.bridgeGrant) hello.bridgeGrant = this.bridgeGrant;
     try {
       this.ws.send(JSON.stringify(hello));
     } catch (err) {

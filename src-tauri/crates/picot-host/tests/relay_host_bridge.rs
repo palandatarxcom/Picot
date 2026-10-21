@@ -11,11 +11,12 @@ use mock_relay::{MockClientSocket, MockRelay};
 use picot_host::relay::client_role::{ClientRoleConfig, ClientRoleSeams};
 use picot_host::relay::e2ee;
 use picot_host::relay::host_bridge::{
-    start_host_bridge_with_seams, BridgeSeams, Credential, HostBridgeHandle, HostBridgeStatus,
-    PairingSaveError, PairingSink,
+    start_host_bridge_with_seams, BridgeSeams, Credential, GrantRegistry, HostBridgeHandle,
+    HostBridgeStatus, PairingSaveError, PairingSink,
 };
 use picot_host::relay::host_store::DeviceToken;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
@@ -25,6 +26,19 @@ type Socket =
 const ORIGIN: &str = "http://127.0.0.1:54321";
 const BUDGET: Duration = Duration::from_secs(15);
 
+#[derive(Default)]
+struct Grants(Mutex<HashSet<String>>);
+impl GrantRegistry for Grants {
+    fn validate(&self, token: &str, server: &str, origin: &str) -> Option<String> {
+        let bound_host = if token == "other-host" {
+            "different-host"
+        } else {
+            "host"
+        };
+        (server == bound_host && origin == ORIGIN && self.0.lock().unwrap().contains(token))
+            .then(|| token.to_owned())
+    }
+}
 struct Saved {
     tokens: Mutex<Vec<DeviceToken>>,
     fail: bool,
@@ -44,10 +58,18 @@ struct Rig {
     relay: MockRelay,
     secret: crypto_box::SecretKey,
     bridge: HostBridgeHandle,
+    grants: Arc<Grants>,
 }
 async fn rig(credential: Credential, sink: Option<Arc<dyn PairingSink>>) -> Rig {
     let relay = MockRelay::start().await;
     let secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+    let grants = Arc::new(Grants::default());
+    grants.0.lock().unwrap().extend([
+        "w1".into(),
+        "w2".into(),
+        "other-host".into(),
+        "local-window".into(),
+    ]);
     let mut client = ClientRoleSeams::default();
     client.timings.pre_hello_delay = Duration::from_millis(20);
     client.timings.hello_resend_after = Duration::from_millis(50);
@@ -60,6 +82,7 @@ async fn rig(credential: Credential, sink: Option<Arc<dyn PairingSink>>) -> Rig 
             peer_public_key_b64: B64.encode(secret.public_key().as_bytes()),
         },
         credential,
+        grants.clone(),
         sink,
         BridgeSeams {
             first_frame_timeout: Duration::from_millis(150),
@@ -72,13 +95,20 @@ async fn rig(credential: Credential, sink: Option<Arc<dyn PairingSink>>) -> Rig 
         relay,
         secret,
         bridge,
+        grants,
     }
 }
 fn device() -> Credential {
     Credential::Device(DeviceToken::new("rust-secret"))
 }
+/// Grant registry for the real-daemon tests: one live window `w1` on ORIGIN.
+fn real_grants() -> Arc<Grants> {
+    let grants = Arc::new(Grants::default());
+    grants.0.lock().unwrap().insert("w1".into());
+    grants
+}
 fn hello(client_id: &str) -> String {
-    json!({"type":"hello", "protocolVersion":2, "clientId":client_id, "clientType":"desktop", "desktopCapability":"local-secret", "bridgeGrant":"local-window"}).to_string()
+    json!({"type":"hello", "protocolVersion":2, "clientId":client_id, "clientType":"desktop", "desktopCapability":"local-secret", "bridgeGrant":client_id}).to_string()
 }
 async fn dial(bridge: &HostBridgeHandle, origin: Option<&str>) -> Socket {
     let mut req = (bridge.origin.replacen("http://", "ws://", 1) + "/v2/ws")
@@ -256,6 +286,11 @@ async fn window_refs_are_deduplicated_and_last_release_stops() {
         send(&mut b, &hello("w2")).await;
         let mut q = peer(&r, &mut seen).await;
         q.recv().await;
+        // The old grant is dead the moment the window leaves: registry first,
+        // then live sockets, and a released window's grant never reconnects.
+        r.grants.0.lock().unwrap().remove("w1");
+        r.bridge.invalidate_window("w1");
+        closed(&mut a).await;
         r.bridge.release("w1");
         q.send("{\"type\":\"hello_ack\"}").await;
         assert_eq!(recv(&mut b).await, "{\"type\":\"hello_ack\"}");
@@ -386,7 +421,7 @@ async fn real_daemon_pairing_ack_subscription_request_navigation_and_revoke_are_
         let saved = Arc::new(Saved { tokens:Mutex::new(vec![]), fail:false });
         let bridge = start_host_bridge_with_seams(ClientRoleConfig {
             endpoint: relay.addr().to_string(), use_tls:false, server_id:"host".into(), peer_public_key_b64: identity.public_key_b64,
-        }, Credential::Pairing { pairing_token:DeviceToken::new(offer.token), device_id:"bridge-device".into() }, Some(saved.clone()), BridgeSeams::default()).await.unwrap();
+        }, Credential::Pairing { pairing_token:DeviceToken::new(offer.token), device_id:"bridge-device".into() }, real_grants(), Some(saved.clone()), BridgeSeams::default()).await.unwrap();
         let mut a = dial(&bridge, Some(ORIGIN)).await; send(&mut a, &hello("w1")).await;
         let token_free = |text: &str| {
             assert!(!text.contains("deviceToken"), "no credential field reaches WebView");
@@ -511,15 +546,19 @@ async fn pairing_ack_deadline_abandons_the_exchange_and_frees_the_pairing_slot()
             "ack wait is bounded by first_frame_timeout"
         );
         // pairing_busy released: the next window is an ordinary attempt, not "busy".
+        // The ended proxy's relay session died with it (F-02: a daemon session
+        // answers one hello), so the retry rides a FRESH session — a second
+        // dial whose new peer receives the pairing hello. This mock-relay peer
+        // acks whatever hello it sees; the real refusal of a second hello on a
+        // live session is covered by proxy_reconnect_after_webview_drop below.
         let mut b = dial(&r.bridge, Some(ORIGIN)).await;
         send(&mut b, &hello("w2")).await;
-        // Session is retained across proxy sessions, so the retry rides the SAME
-        // relay session: no second data dial, the hello arrives on this peer.
+        let mut q = peer(&r, &mut seen).await;
         assert_eq!(
-            serde_json::from_str::<Value>(&p.recv().await).unwrap()["pairingToken"],
+            serde_json::from_str::<Value>(&q.recv().await).unwrap()["pairingToken"],
             "offer-secret"
         );
-        p.send(r#"{"type":"hello_ack","deviceToken":"minted-secret"}"#)
+        q.send(r#"{"type":"hello_ack","deviceToken":"minted-secret"}"#)
             .await;
         assert!(!recv(&mut b).await.contains("minted-secret"));
         assert_eq!(saved.tokens.lock().unwrap().len(), 1);
@@ -575,4 +614,231 @@ async fn pairing_rejection_is_terminal_and_never_replays_the_spent_token() {
     })
     .await
     .expect("terminal pairing rejection test deadline");
+}
+
+#[tokio::test]
+async fn grants_reject_before_any_relay_dial_and_first_frame_deadline_closes() {
+    tokio::time::timeout(BUDGET, async {
+        let r = rig(device(), None).await;
+        for (origin, frame) in [
+            (Some(ORIGIN), "{\"type\":\"hello\"}".into()),
+            (Some(ORIGIN), hello("forged")),
+            (Some(ORIGIN), hello("other-host")),
+            (Some(ORIGIN), hello("w3")),
+            (Some("https://evil.test"), hello("w1")),
+            (None, hello("w1")),
+            (
+                Some(ORIGIN),
+                "{\"type\":\"request\",\"bridgeGrant\":\"w1\"}".into(),
+            ),
+        ] {
+            let mut s = dial(&r.bridge, origin).await;
+            send(&mut s, &frame).await;
+            closed(&mut s).await;
+        }
+        let mut s = dial(&r.bridge, Some(ORIGIN)).await;
+        closed(&mut s).await;
+        assert_eq!(
+            r.relay.client_upgrades(),
+            0,
+            "no secrets injected before grant validation"
+        );
+        r.bridge.stop().await;
+    })
+    .await
+    .expect("grant test deadline");
+}
+
+#[tokio::test]
+async fn invalidating_one_window_cancels_its_inflight_handshake_without_stopping_other_refs() {
+    tokio::time::timeout(BUDGET, async {
+        let r = rig(device(), None).await;
+        r.bridge.acquire("w1");
+        r.bridge.acquire("w2");
+        let mut a = dial(&r.bridge, Some(ORIGIN)).await;
+        send(&mut a, &hello("w1")).await;
+        while r.relay.client_upgrades() == 0 {
+            tokio::task::yield_now().await;
+        }
+        r.grants.0.lock().unwrap().remove("w1");
+        r.bridge.invalidate_window("w1");
+        closed(&mut a).await;
+        let attempts = r.relay.client_upgrades();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(
+            r.relay.client_upgrades(),
+            attempts,
+            "window invalidation cancels pending transport, not standby redial"
+        );
+        let mut b = dial(&r.bridge, Some(ORIGIN)).await;
+        send(&mut b, &hello("w2")).await;
+        let mut p = peer(&r, &mut vec![]).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&p.recv().await).unwrap()["clientId"],
+            "w2"
+        );
+        r.bridge.stop().await;
+    })
+    .await
+    .expect("inflight invalidation deadline");
+}
+
+#[tokio::test]
+async fn proxy_reconnect_after_webview_drop_gets_a_fresh_hello_and_snapshot() {
+    // F-02 against real host session semantics: `run_session` answers exactly
+    // one hello, so a proxy that reconnects onto a kept-alive relay session
+    // draws an invalid_frame error instead of the fresh snapshot the frontend
+    // needs. The mock-relay peers above cannot see this (they hand-ack every
+    // hello); only a real daemon session can refuse the second one.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let temp = tempfile::tempdir().unwrap();
+        let static_dir = temp.path().join("static");
+        std::fs::create_dir_all(&static_dir).unwrap();
+        std::fs::write(static_dir.join("index.html"), "Picot").unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let state = Arc::new(
+            DaemonState::start(
+                DaemonConfig {
+                    data_dir: temp.path().join("data"),
+                    config_dir: temp.path().join("config"),
+                    static_dir,
+                    bundle_identifier: "com.palandata.picot.test".into(),
+                },
+                Arc::new(NoSurface),
+            )
+            .await
+            .unwrap(),
+        );
+        state.install_control_handler();
+        let ws_id = state
+            .metadata
+            .lock()
+            .unwrap()
+            .add_workspace(&workspace)
+            .unwrap()
+            .0
+            .workspace_id;
+        let (owner, _) = state
+            .owner_registry
+            .create_owner_with_workspace(
+                "bridge-window".into(),
+                workspace,
+                0,
+                ORIGIN.into(),
+                Some(ws_id.clone()),
+                TemporaryKind::DefaultStartup,
+            )
+            .unwrap();
+        let target = RuntimeTarget::with_owner(
+            ws_id.clone(),
+            "session",
+            "instance",
+            owner.as_str(),
+            0,
+        );
+        let mut fake = state.runtimes.register_in_memory(target).unwrap();
+        let responder = tokio::spawn(async move {
+            while let Some(request) = fake.read_request().await {
+                fake.write_frame(
+                    json!({"id":request["id"], "type":"response", "success":true, "data":{"sessionId":"session"}}),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let offer = state
+            .auth
+            .lock()
+            .unwrap()
+            .create_pairing(now, Some(owner.as_str()));
+        let relay = MockRelay::start().await;
+        let identity = DaemonIdentity::for_tests();
+        let transport = RelayTransport::start(
+            RelayConfig {
+                endpoint: relay.addr().to_string(),
+                use_tls: false,
+                server_id: "host".into(),
+            },
+            identity.clone(),
+            state.host.relay_session_sink(),
+        );
+        while relay.control_upgrades() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let saved = Arc::new(Saved {
+            tokens: Mutex::new(vec![]),
+            fail: false,
+        });
+        let bridge = start_host_bridge_with_seams(
+            ClientRoleConfig {
+                endpoint: relay.addr().to_string(),
+                use_tls: false,
+                server_id: "host".into(),
+                peer_public_key_b64: identity.public_key_b64,
+            },
+            Credential::Pairing {
+                pairing_token: DeviceToken::new(offer.token),
+                device_id: "bridge-device".into(),
+            },
+            real_grants(),
+            Some(saved.clone()),
+            BridgeSeams::default(),
+        )
+        .await
+        .unwrap();
+        let wire_target = json!({"workspaceId":ws_id, "sessionId":"session", "instanceId":"instance"});
+        let mut a = dial(&bridge, Some(ORIGIN)).await;
+        send(&mut a, &hello("w1")).await;
+        let ack: Value = serde_json::from_str(&recv(&mut a).await).unwrap();
+        assert_eq!(ack["type"], "hello_ack");
+        assert_eq!(saved.tokens.lock().unwrap().len(), 1);
+        assert_eq!(relay.client_ids().len(), 1, "one live bridge relay session");
+        let old_session = relay.client_ids();
+        send(
+            &mut a,
+            &json!({"type":"runtime_subscribe","requestId":"sub","target":wire_target}).to_string(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&recv(&mut a).await).unwrap()["type"],
+            "runtime_subscribed"
+        );
+        // The WebView drops (reload/crash/WS blip) while the bridge<->relay
+        // socket stays perfectly healthy.
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut b = dial(&bridge, Some(ORIGIN)).await;
+        send(&mut b, &hello("w1")).await;
+        let ack: Value = serde_json::from_str(&recv(&mut b).await).unwrap();
+        assert_eq!(
+            ack["type"], "hello_ack",
+            "reconnect must ride a fresh session, not an already-helloed one: {ack}"
+        );
+        send(
+            &mut b,
+            &json!({"type":"runtime_subscribe","requestId":"sub2","target":wire_target}).to_string(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&recv(&mut b).await).unwrap()["type"],
+            "runtime_subscribed",
+            "the fresh session restores the snapshot subscription"
+        );
+        assert!(
+            !relay.client_ids().iter().any(|id| old_session.contains(id)),
+            "the ended proxy's relay session must not outlive it"
+        );
+        bridge.stop().await;
+        transport.stop().await;
+        responder.abort();
+        state.host.stop();
+    })
+    .await
+    .expect("reconnect deadline");
 }

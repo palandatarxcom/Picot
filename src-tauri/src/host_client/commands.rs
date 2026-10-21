@@ -1,8 +1,9 @@
-// ABOUTME: Caller-checked Tauri commands for remote host pairing and status.
-// ABOUTME: Window identity comes from the injected WebviewWindow, never arguments.
+// ABOUTME: Caller-checked Tauri commands for remote host pairing, status and grants.
+// ABOUTME: Identity and exact page origin come from injected WebviewWindow, never arguments.
 
 use super::{HostClient, HostClientState};
 use crate::daemon_client::commands::caller_link;
+use picot_host::window_owner::navigation_origin;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
@@ -10,18 +11,20 @@ use tauri::{AppHandle, Manager};
 fn caller(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
-) -> Result<(Arc<HostClient>, String), String> {
+) -> Result<(Arc<HostClient>, String, String), String> {
     caller_link(app, window)?;
+    let url = window.url().map_err(|_| "Caller has no document URL")?;
+    let origin = navigation_origin(&url).ok_or("Caller has no loopback origin")?;
     let state = app
         .try_state::<HostClientState>()
         .ok_or("Host client unavailable")?;
     let client = state.0.as_ref().map_err(Clone::clone)?.clone();
-    Ok((client, window.label().to_string()))
+    Ok((client, window.label().to_string(), origin))
 }
 
 #[tauri::command]
 pub async fn host_list(window: tauri::WebviewWindow, app: AppHandle) -> Result<Value, String> {
-    let (client, _) = caller(&app, &window)?;
+    let (client, _, _) = caller(&app, &window)?;
     client.list().await
 }
 #[tauri::command]
@@ -30,8 +33,8 @@ pub async fn host_add(
     app: AppHandle,
     offer_url: String,
 ) -> Result<Value, String> {
-    let (client, id) = caller(&app, &window)?;
-    client.add(&id, &offer_url).await
+    let (client, id, origin) = caller(&app, &window)?;
+    client.add(&id, &origin, &offer_url).await
 }
 #[tauri::command]
 pub async fn host_confirm_tofu(
@@ -40,8 +43,8 @@ pub async fn host_confirm_tofu(
     question_id: u64,
     approved: bool,
 ) -> Result<Value, String> {
-    let (client, id) = caller(&app, &window)?;
-    client.confirm(&id, question_id, approved).await
+    let (client, id, origin) = caller(&app, &window)?;
+    client.confirm(&id, &origin, question_id, approved).await
 }
 #[tauri::command]
 pub async fn host_remove(
@@ -49,7 +52,7 @@ pub async fn host_remove(
     app: AppHandle,
     server_id: String,
 ) -> Result<Value, String> {
-    let (client, _) = caller(&app, &window)?;
+    let (client, _, _) = caller(&app, &window)?;
     client.remove(&server_id).await?;
     Ok(json!({"ok":true, "remoteDeviceRetained":true}))
 }
@@ -59,8 +62,27 @@ pub async fn host_status(
     app: AppHandle,
     server_id: String,
 ) -> Result<Value, String> {
-    let (client, id) = caller(&app, &window)?;
-    client.status(&id, &server_id).await
+    let (client, id, origin) = caller(&app, &window)?;
+    client.status(&id, &origin, &server_id).await
+}
+#[tauri::command]
+pub async fn host_grant(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    server_id: String,
+) -> Result<Value, String> {
+    let (client, id, origin) = caller(&app, &window)?;
+    client.grant(&id, &origin, &server_id).await
+}
+
+#[tauri::command]
+pub async fn host_release(window: tauri::WebviewWindow, app: AppHandle) -> Result<Value, String> {
+    // The window calls this synchronously before reload navigation (contract 4):
+    // unload-time cleanup is unreliable, so the explicit release is the main
+    // path and the Destroyed event is the safety net.
+    let (client, id, _) = caller(&app, &window)?;
+    client.close_window(&id).await;
+    Ok(json!({"ok":true}))
 }
 #[tauri::command]
 pub async fn relay_device_list(

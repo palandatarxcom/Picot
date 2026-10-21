@@ -24,6 +24,7 @@ fn offer(key: &str) -> String {
     )
     .unwrap()
 }
+const ORIGIN: &str = "http://127.0.0.1:54321";
 const KEY: &str = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=";
 const KEY2: &str = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=";
 fn client() -> (tempfile::TempDir, Arc<HostClient>) {
@@ -32,10 +33,10 @@ fn client() -> (tempfile::TempDir, Arc<HostClient>) {
     (dir, client)
 }
 async fn begin(client: &Arc<HostClient>, key: &str) -> Value {
-    let pending = client.add("w1", &offer(key)).await.unwrap();
+    let pending = client.add("w1", ORIGIN, &offer(key)).await.unwrap();
     assert_eq!(pending["status"], "tofuPending");
     client
-        .confirm("w1", pending["questionId"].as_u64().unwrap(), true)
+        .confirm("w1", ORIGIN, pending["questionId"].as_u64().unwrap(), true)
         .await
         .unwrap()
 }
@@ -61,17 +62,17 @@ async fn host_client_tofu_stages_and_redacts_every_response() {
             .unwrap();
         let saved = c.store.host("host").unwrap();
         assert_eq!(saved.profile.daemon_public_key_b64, KEY);
-        let auto = c.add("w1", &offer(KEY)).await.unwrap();
+        let auto = c.add("w1", ORIGIN, &offer(KEY)).await.unwrap();
         assert_ne!(auto["status"], "tofuPending");
-        let changed = c.add("w1", &offer(KEY2)).await.unwrap();
+        let changed = c.add("w1", ORIGIN, &offer(KEY2)).await.unwrap();
         let stale = changed["questionId"].as_u64().unwrap();
-        let latest = c.add("w1", &offer(KEY2)).await.unwrap();
-        assert!(c.confirm("w1", stale, true).await.is_err());
+        let latest = c.add("w1", ORIGIN, &offer(KEY2)).await.unwrap();
+        assert!(c.confirm("w1", ORIGIN, stale, true).await.is_err());
         assert!(c
-            .confirm("w2", latest["questionId"].as_u64().unwrap(), true)
+            .confirm("w2", ORIGIN, latest["questionId"].as_u64().unwrap(), true)
             .await
             .is_err());
-        c.confirm("w1", latest["questionId"].as_u64().unwrap(), false)
+        c.confirm("w1", ORIGIN, latest["questionId"].as_u64().unwrap(), false)
             .await
             .unwrap();
         assert_eq!(c.store.host("host").unwrap(), saved);
@@ -81,7 +82,7 @@ async fn host_client_tofu_stages_and_redacts_every_response() {
             changed,
             latest,
             c.list().await.unwrap(),
-            c.status("w0", "host").await.unwrap(),
+            c.status("w0", ORIGIN, "host").await.unwrap(),
         ] {
             let text = response.to_string();
             for secret in [
@@ -105,7 +106,7 @@ async fn host_client_remove_cancels_late_ack() {
         let (_dir, c) = client();
         begin(&c, KEY).await;
         let transaction = sink(&c).await;
-        c.status("w1", "host").await.unwrap();
+        c.status("w1", ORIGIN, "host").await.unwrap();
         c.remove("host").await.unwrap();
         assert!(transaction
             .persist(DeviceToken::new("late-token"))
@@ -114,7 +115,7 @@ async fn host_client_remove_cancels_late_ack() {
         assert!(c.store.host("host").is_none());
         assert!(c.core.lock().await.hosts.is_empty());
         c.shutdown().await;
-        assert!(c.add("w1", &offer(KEY)).await.is_err());
+        assert!(c.add("w1", ORIGIN, &offer(KEY)).await.is_err());
     })
     .await
     .unwrap();
@@ -130,8 +131,8 @@ async fn host_client_release_stops_the_last_ref_but_keeps_the_other_window() {
             .persist(DeviceToken::new("saved-device"))
             .await
             .unwrap();
-        c.status("w1", "host").await.unwrap();
-        c.status("w2", "host").await.unwrap();
+        c.status("w1", ORIGIN, "host").await.unwrap();
+        c.status("w2", ORIGIN, "host").await.unwrap();
         let mut stopped = c.core.lock().await.hosts["host"]
             .active
             .as_ref()
@@ -171,8 +172,8 @@ async fn host_client_credential_invalid_clears_token_and_stops_the_host_bridge()
             .persist(DeviceToken::new("private-device"))
             .await
             .unwrap();
-        c.status("w1", "host").await.unwrap();
-        c.status("w2", "host").await.unwrap();
+        c.status("w1", ORIGIN, "host").await.unwrap();
+        c.status("w2", ORIGIN, "host").await.unwrap();
         let mut stopped = {
             let core = c.core.lock().await;
             let bridge = core.hosts["host"].active.as_ref().unwrap();
@@ -194,7 +195,7 @@ async fn host_client_credential_invalid_clears_token_and_stops_the_host_bridge()
         assert!(c.core.lock().await.hosts["host"].active.is_none());
         // No dead bridge is reused: the window is told to pair again.
         assert_eq!(
-            c.status("w1", "host").await.unwrap_err(),
+            c.status("w1", ORIGIN, "host").await.unwrap_err(),
             "Host credential invalid; a fresh pairing offer is required"
         );
         c.shutdown().await;
@@ -217,12 +218,15 @@ async fn host_client_pairing_failure_is_reported_and_replaced_by_a_fresh_offer()
                 .force_status_for_tests(HostBridgeStatus::PairingFailed);
             (candidate.bridge.handle.status.clone(), candidate.id.clone())
         };
-        assert_eq!(c.status("w0", "host").await.unwrap()["status"], "offline");
+        assert_eq!(
+            c.status("w0", ORIGIN, "host").await.unwrap()["status"],
+            "offline"
+        );
         assert!(c.store.host("host").is_none());
         // A refused offer does not block the next one behind "pairing in progress".
-        let pending = c.add("w1", &offer(KEY2)).await.unwrap();
+        let pending = c.add("w1", ORIGIN, &offer(KEY2)).await.unwrap();
         assert_eq!(pending["status"], "tofuPending");
-        c.confirm("w1", pending["questionId"].as_u64().unwrap(), true)
+        c.confirm("w1", ORIGIN, pending["questionId"].as_u64().unwrap(), true)
             .await
             .unwrap();
         while *stopped.borrow_and_update() != HostBridgeStatus::Stopped {
@@ -237,6 +241,44 @@ async fn host_client_pairing_failure_is_reported_and_replaced_by_a_fresh_offer()
         );
         drop(core);
         assert!(c.store.host("host").is_none());
+        c.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn host_client_grants_rotate_and_revoke_with_the_window_lifecycle() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (_dir, c) = client();
+        begin(&c, KEY).await;
+        sink(&c)
+            .await
+            .persist(DeviceToken::new("saved-device"))
+            .await
+            .unwrap();
+        let first = c.grant("w1", ORIGIN, "host").await.unwrap();
+        let t1 = first["grant"].as_str().unwrap().to_owned();
+        assert!(!t1.is_empty());
+        assert_eq!(first["windowId"], "w1");
+        assert!(c.grants.validate(&t1, "host", ORIGIN).is_some());
+        // Cross-host and cross-origin reuse of a valid token is refused.
+        assert!(c.grants.validate(&t1, "other-host", ORIGIN).is_none());
+        assert!(c
+            .grants
+            .validate(&t1, "host", "https://evil.test")
+            .is_none());
+        // A second grant rotates the window's token; the old one dies.
+        let second = c.grant("w1", ORIGIN, "host").await.unwrap();
+        let t2 = second["grant"].as_str().unwrap().to_owned();
+        assert_ne!(t1, t2);
+        assert!(c.grants.validate(&t1, "host", ORIGIN).is_none());
+        assert!(c.grants.validate(&t2, "host", ORIGIN).is_some());
+        // Window destroyed: the sync revoke kills the live token first.
+        c.revoke_window_now("w1");
+        assert!(c.grants.validate(&t2, "host", ORIGIN).is_none());
+        c.close_window("w1").await;
+        assert!(c.grants.0.lock().unwrap().get("w1").is_none());
         c.shutdown().await;
     })
     .await

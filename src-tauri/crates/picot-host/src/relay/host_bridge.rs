@@ -1,13 +1,14 @@
-// ABOUTME: Per-host loopback WS bridge with independent relay sessions.
+// ABOUTME: Per-host loopback WS bridge with window grants and independent relay sessions.
 // ABOUTME: Rewrites hello, sanitizes ack, delegates pairing persistence; last window stops bridge.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::{routing::get, Router};
 use futures_util::{SinkExt, StreamExt};
@@ -20,6 +21,13 @@ use super::client_role::{
 use super::host_store::DeviceToken;
 use super::transport::ConnectionState;
 use crate::transport_limits::{OUTBOUND_QUEUE_CAPACITY, WS_PHYSICAL_FRAME_BYTES};
+
+pub trait GrantRegistry: Send + Sync {
+    /// Exact Origin + host + live-window validation; return trusted window identity.
+    /// The per-window secret is the authentication; the Origin check is defense
+    /// in depth (a hostile page on the same machine has no grant to present).
+    fn validate(&self, token: &str, server_id: &str, origin: &str) -> Option<String>;
+}
 
 #[derive(Clone, Debug)]
 pub enum Credential {
@@ -68,6 +76,7 @@ impl Default for BridgeSeams {
 
 struct Windows {
     refs: HashSet<String>,
+    cancel: HashMap<String, watch::Sender<bool>>,
 }
 struct Auth {
     credential: Credential,
@@ -75,6 +84,7 @@ struct Auth {
 }
 struct Shared {
     cfg: ClientRoleConfig,
+    grants: Arc<dyn GrantRegistry>,
     pairing: Option<Arc<dyn PairingSink>>,
     auth: Mutex<Auth>,
     windows: Mutex<Windows>,
@@ -122,8 +132,20 @@ impl HostBridgeHandle {
     /// requests shutdown; `stop().await` also joins teardown.
     pub fn release(&self, window_id: &str) {
         let mut windows = self.shared.windows.lock().unwrap();
+        if let Some(cancel) = windows.cancel.remove(window_id) {
+            cancel.send_replace(true);
+        }
         if windows.refs.remove(window_id) && windows.refs.is_empty() {
             self.shared.shutdown.send_replace(true);
+        }
+    }
+    /// The caller MUST invalidate its GrantRegistry first, THEN call this to
+    /// close the window's live sockets (registry first, then live teardown, so
+    /// no socket can re-authenticate mid-invalidation). This does not release
+    /// the window reference (rotation and release are separate concerns).
+    pub fn invalidate_window(&self, window_id: &str) {
+        if let Some(cancel) = self.shared.windows.lock().unwrap().cancel.remove(window_id) {
+            cancel.send_replace(true);
         }
     }
     /// Cancels upgrades, dial, handshake, callback and all session tasks; joins locally.
@@ -142,14 +164,23 @@ impl HostBridgeHandle {
 pub async fn start_host_bridge(
     cfg: ClientRoleConfig,
     credential: Credential,
+    grants: Arc<dyn GrantRegistry>,
     pairing_sink: Option<Arc<dyn PairingSink>>,
 ) -> std::io::Result<HostBridgeHandle> {
-    start_host_bridge_with_seams(cfg, credential, pairing_sink, BridgeSeams::default()).await
+    start_host_bridge_with_seams(
+        cfg,
+        credential,
+        grants,
+        pairing_sink,
+        BridgeSeams::default(),
+    )
+    .await
 }
 
 pub async fn start_host_bridge_with_seams(
     cfg: ClientRoleConfig,
     credential: Credential,
+    grants: Arc<dyn GrantRegistry>,
     pairing_sink: Option<Arc<dyn PairingSink>>,
     seams: BridgeSeams,
 ) -> std::io::Result<HostBridgeHandle> {
@@ -159,6 +190,7 @@ pub async fn start_host_bridge_with_seams(
     let (status_tx, status) = watch::channel(HostBridgeStatus::Offline);
     let shared = Arc::new(Shared {
         cfg,
+        grants,
         pairing: pairing_sink,
         auth: Mutex::new(Auth {
             credential,
@@ -166,6 +198,7 @@ pub async fn start_host_bridge_with_seams(
         }),
         windows: Mutex::new(Windows {
             refs: HashSet::new(),
+            cancel: HashMap::new(),
         }),
         slots: Mutex::new(Vec::new()),
         tasks: Mutex::new(Vec::new()),
@@ -205,7 +238,16 @@ pub async fn start_host_bridge_with_seams(
     })
 }
 
-async fn upgrade(State(shared): State<Arc<Shared>>, ws: WebSocketUpgrade) -> Response {
+async fn upgrade(
+    State(shared): State<Arc<Shared>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let origin = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
     ws.max_message_size(WS_PHYSICAL_FRAME_BYTES)
         .max_frame_size(WS_PHYSICAL_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
@@ -214,7 +256,7 @@ async fn upgrade(State(shared): State<Arc<Shared>>, ws: WebSocketUpgrade) -> Res
                 return;
             }
             tasks.retain(|task| !task.is_finished());
-            tasks.push(tokio::spawn(proxy(socket, shared.clone())));
+            tasks.push(tokio::spawn(proxy(socket, origin, shared.clone())));
         })
 }
 
@@ -336,7 +378,7 @@ fn attach(
     slot
 }
 
-async fn proxy(mut socket: WebSocket, shared: Arc<Shared>) {
+async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     let first = tokio::time::timeout(shared.seams.first_frame_timeout, socket.next()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
         return;
@@ -347,6 +389,33 @@ async fn proxy(mut socket: WebSocket, shared: Arc<Shared>) {
     if string_field(&fields, "type").as_deref() != Some("hello") {
         return;
     }
+    // Per-window grant, validated before anything is rewritten or dialed: the
+    // random loopback port is obscurity, not authentication. Missing, forged,
+    // cross-host and cross-window grants close here without injection.
+    // The grant rides the hello body (not Sec-WebSocket-Protocol): the WebView's
+    // WebSocket API cannot pick subprotocols on this client, and a negotiated
+    // subprotocol would also be visible to the relay-side handshake. `rewrite`
+    // strips a client-forged `bridgeGrant` along with the credential fields, so
+    // only this validated value ever authenticates a session.
+    let Some(token) = string_field(&fields, "bridgeGrant") else {
+        return;
+    };
+    // Serialize validation with invalidate_window so an invalidation cannot miss
+    // an authenticated socket between its registry check and live registration.
+    let mut window_cancel = {
+        let mut windows = shared.windows.lock().unwrap();
+        let Some(window) = shared
+            .grants
+            .validate(&token, &shared.cfg.server_id, &origin)
+        else {
+            return;
+        };
+        windows
+            .cancel
+            .entry(window)
+            .or_insert_with(|| watch::channel(false).0)
+            .subscribe()
+    };
     let credential = {
         let mut auth = shared.auth.lock().unwrap();
         if matches!(
@@ -500,27 +569,42 @@ async fn proxy(mut socket: WebSocket, shared: Arc<Shared>) {
             }
         }
     };
-    // Wait for whichever end condition fires; the outcome no longer decides
-    // slot lifetime (the session is kept), so the value is discarded.
-    let _ = tokio::select! {
+    // Wait for whichever end condition fires; only a transport loss keeps the
+    // slot alive (see the keep decision below).
+    let transport_dropped = tokio::select! {
         // A terminal error frame can arrive in the same poll as Offline. Consume
         // the queued explicit rejection before the transport-loss notification.
         biased;
         _ = session => false,
         _ = lost.changed() => true,
         _ = write => false,
+        _ = window_cancel.changed() => false,
         _ = shutdown.changed() => false,
     };
     if pairing {
         shared.auth.lock().unwrap().pairing_busy = false;
     }
-    // Keep the relay session while the bridge lives (contract 4 + F-09): an
-    // idle host must not pay the ~10s re-handshake, and a revoked device is
-    // only observable while its session exists. The slot is detached, not
-    // stopped — the next proxy hello reuses it, and a fresh relay session after
-    // a drop is re-authenticated by that hello (never replayed by us).
+    // A daemon session answers exactly one hello (F-02): a proxy that reconnects
+    // onto a kept-alive session draws invalid_frame instead of the fresh hello_ack
+    // and snapshot the frontend needs. So an ended proxy takes its relay session
+    // with it. Only a transport drop keeps the slot, and only while its next
+    // session is fresh (never helloed) — the still-attached proxy's hello rides
+    // that session when the redial completes. Revoke visibility is unchanged:
+    // the next hello re-checks the DB on whatever new session carries it.
     // Shutdown stops every slot from the bridge task above.
-    *slot.attachment.lock().unwrap() = None;
+    let current = slot.ready.borrow().clone();
+    let keep = transport_dropped
+        && (current.channel.is_none() || generation.is_some_and(|old| old != current.generation));
+    if keep {
+        *slot.attachment.lock().unwrap() = None;
+    } else {
+        slot.stop().await;
+        shared
+            .slots
+            .lock()
+            .unwrap()
+            .retain(|candidate| !Arc::ptr_eq(candidate, &slot));
+    }
 }
 
 #[cfg(test)]

@@ -1,18 +1,18 @@
-// ABOUTME: App-owned relay hosts, pairing and bridge lifecycle.
+// ABOUTME: App-owned relay hosts, window grants, pairing and bridge lifecycle.
 // ABOUTME: Commands authenticate injected windows; device credentials stay in Rust.
 
 pub mod commands;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use picot_host::relay::client_role::ClientRoleConfig;
 use picot_host::relay::host_bridge::{
-    start_host_bridge, Credential, HostBridgeHandle, HostBridgeStatus, PairingSaveError,
-    PairingSink,
+    start_host_bridge, Credential, GrantRegistry, HostBridgeHandle, HostBridgeStatus,
+    PairingSaveError, PairingSink,
 };
 use picot_host::relay::host_store::{DeviceToken, HostProfile, HostStore};
 use picot_host::relay::host_tofu::{
@@ -22,6 +22,27 @@ use picot_host::relay::pairing::{parse_connection_offer, ConnectionOfferV2};
 use serde_json::{json, Value};
 
 pub struct HostClientState(pub Result<Arc<HostClient>, String>);
+
+struct Binding {
+    token: String,
+    server_id: String,
+    origin: String,
+}
+/// Grants are local bearer credentials: a token only authenticates while its
+/// window is live on the exact same page origin and target host.
+#[derive(Default)]
+struct Grants(Mutex<HashMap<String, Binding>>);
+impl GrantRegistry for Grants {
+    fn validate(&self, token: &str, server_id: &str, origin: &str) -> Option<String> {
+        self.0.lock().unwrap().iter().find_map(|(window, binding)| {
+            (!token.is_empty()
+                && binding.token == token
+                && binding.server_id == server_id
+                && binding.origin == origin)
+                .then(|| window.clone())
+        })
+    }
+}
 
 struct Bridge {
     handle: HostBridgeHandle,
@@ -60,6 +81,7 @@ struct Core {
 
 pub struct HostClient {
     store: HostStore,
+    grants: Arc<Grants>,
     // Serializes commands with ack commits: removal cancels before join/delete,
     // and a late callback cannot resurrect a deleted host (even after re-add).
     core: tokio::sync::Mutex<Core>,
@@ -72,6 +94,7 @@ impl HostClient {
         })?;
         Ok(Arc::new(Self {
             store,
+            grants: Arc::default(),
             core: tokio::sync::Mutex::new(Core::default()),
         }))
     }
@@ -88,7 +111,12 @@ impl HostClient {
         }).collect()))
     }
 
-    pub async fn add(self: &Arc<Self>, window: &str, url: &str) -> Result<Value, String> {
+    pub async fn add(
+        self: &Arc<Self>,
+        window: &str,
+        origin: &str,
+        url: &str,
+    ) -> Result<Value, String> {
         // Parser errors may quote caller bytes; no raw offer/error reaches logs or IPC.
         let offer =
             parse_connection_offer(url).map_err(|_| "Invalid connection offer".to_string())?;
@@ -98,7 +126,7 @@ impl HostClient {
         let saved = self.store.host(&offer.server_id);
         match host_tofu::decide(&offer, saved.as_ref()) {
             TofuDecision::AutoApprove => {
-                self.connect_saved(&mut core, window, &offer.server_id)
+                self.connect_saved(&mut core, window, origin, &offer.server_id)
                     .await?;
                 Ok(status_payload(&core, &offer.server_id))
             }
@@ -138,6 +166,7 @@ impl HostClient {
     pub async fn confirm(
         self: &Arc<Self>,
         window: &str,
+        origin: &str,
         question_id: u64,
         approved: bool,
     ) -> Result<Value, String> {
@@ -207,7 +236,7 @@ impl HostClient {
             .await?;
         bridge.acquire(window)?;
         // Start/acquire before publishing URL; old profile and bridge stay intact.
-        self.switch_window(&mut core, window, &offer.server_id)
+        self.switch_window(&mut core, window, origin, &offer.server_id)
             .await;
         core.hosts
             .entry(offer.server_id.clone())
@@ -223,15 +252,51 @@ impl HostClient {
     /// Report a host's status and hand the calling window its bridge URL. This is
     /// the window's one entry point: it starts the host's bridge and takes the
     /// window's reference on it, exactly as the connection it is about to open.
-    pub async fn status(self: &Arc<Self>, window: &str, server_id: &str) -> Result<Value, String> {
+    pub async fn status(
+        self: &Arc<Self>,
+        window: &str,
+        origin: &str,
+        server_id: &str,
+    ) -> Result<Value, String> {
         let mut core = self.core.lock().await;
         running(&core)?;
         self.refresh_invalid(&mut core).await?;
         if !core.hosts.contains_key(server_id) && self.store.host(server_id).is_none() {
             return Err("Unknown host".into());
         }
-        self.connect_saved(&mut core, window, server_id).await?;
+        self.connect_saved(&mut core, window, origin, server_id)
+            .await?;
         Ok(status_payload(&core, server_id))
+    }
+
+    /// Mint this window's grant for `server_id` (rotating any previous one) and
+    /// hand back the bridge URL plus the grant. One hello-grant per window.
+    pub async fn grant(
+        self: &Arc<Self>,
+        window: &str,
+        origin: &str,
+        server_id: &str,
+    ) -> Result<Value, String> {
+        let mut core = self.core.lock().await;
+        running(&core)?;
+        self.refresh_invalid(&mut core).await?;
+        self.connect_saved(&mut core, window, origin, server_id)
+            .await?;
+        // Rotation first removes the registry binding, then closes sockets.
+        self.invalidate(&core, window);
+        let token = uuid::Uuid::new_v4().to_string();
+        self.grants.0.lock().unwrap().insert(
+            window.into(),
+            Binding {
+                token: token.clone(),
+                server_id: server_id.into(),
+                origin: origin.into(),
+            },
+        );
+        let mut reply = status_payload(&core, server_id);
+        reply["grant"] = json!(token);
+        reply["windowId"] = json!(window);
+        Ok(reply)
     }
 
     pub async fn remove(&self, server_id: &str) -> Result<(), String> {
@@ -245,6 +310,7 @@ impl HostClient {
         }
         if let Some(runtime) = core.hosts.remove(server_id) {
             // Dropped before any await: a stale callback fails the id lookup.
+            self.invalidate_host(server_id, &runtime);
             stop_runtime(runtime).await;
         }
         self.store
@@ -265,10 +331,20 @@ impl HostClient {
         self.release_window(&mut core, window, None).await;
     }
 
+    /// Destroyed-path sync half (contract 3): revoke the window's grant
+    /// immediately so the bridge rejects new connections before the async
+    /// cleanup (`close_window`) joins. The registry is the only sync state.
+    pub fn revoke_window_now(&self, window: &str) {
+        if let Some(binding) = self.grants.0.lock().unwrap().get_mut(window) {
+            binding.token.clear();
+        }
+    }
+
     pub async fn shutdown(&self) {
         let mut core = self.core.lock().await;
         core.stopped = true;
         cancel_question(&mut core);
+        self.grants.0.lock().unwrap().clear();
         for (_, runtime) in core.hosts.drain() {
             stop_runtime(runtime).await;
         }
@@ -288,6 +364,7 @@ impl HostClient {
                 peer_public_key_b64: profile.daemon_public_key_b64.clone(),
             },
             credential,
+            self.grants.clone(),
             sink,
         )
         .await
@@ -302,6 +379,7 @@ impl HostClient {
         &self,
         core: &mut Core,
         window: &str,
+        origin: &str,
         server_id: &str,
     ) -> Result<(), String> {
         let runtime = core.hosts.entry(server_id.into()).or_default();
@@ -322,17 +400,69 @@ impl HostClient {
             .or(runtime.active.as_mut())
             .unwrap();
         bridge.acquire(window)?;
-        self.switch_window(core, window, server_id).await;
+        self.switch_window(core, window, origin, server_id).await;
         Ok(())
     }
 
     /// A window serves one host at a time: connecting it to `server_id` releases
     /// its reference on every other host's bridge.
-    async fn switch_window(&self, core: &mut Core, window: &str, server_id: &str) {
-        self.release_window(core, window, Some(server_id)).await;
+    async fn switch_window(&self, core: &mut Core, window: &str, origin: &str, server_id: &str) {
+        let changed = self
+            .grants
+            .0
+            .lock()
+            .unwrap()
+            .get(window)
+            .is_some_and(|binding| binding.server_id != server_id || binding.origin != origin);
+        if changed {
+            self.release_window(core, window, Some(server_id)).await;
+        }
+        // A ref exists before `grant`; retain a tokenless binding for switches.
+        self.grants
+            .0
+            .lock()
+            .unwrap()
+            .entry(window.into())
+            .and_modify(|binding| {
+                binding.server_id = server_id.into();
+                binding.origin = origin.into();
+            })
+            .or_insert_with(|| Binding {
+                token: String::new(),
+                server_id: server_id.into(),
+                origin: origin.into(),
+            });
+    }
+
+    /// Clear the window's live token and close its sockets on every bridge.
+    fn invalidate(&self, core: &Core, window: &str) {
+        if let Some(binding) = self.grants.0.lock().unwrap().get_mut(window) {
+            binding.token.clear();
+        }
+        for runtime in core.hosts.values() {
+            for bridge in bridges(runtime) {
+                bridge.handle.invalidate_window(window);
+            }
+        }
+    }
+
+    fn invalidate_host(&self, server_id: &str, runtime: &HostRuntime) {
+        self.grants
+            .0
+            .lock()
+            .unwrap()
+            .retain(|_, binding| binding.server_id != server_id);
+        for bridge in bridges(runtime) {
+            for window in &bridge.windows {
+                bridge.handle.invalidate_window(window);
+                bridge.handle.release(window);
+            }
+        }
     }
 
     async fn release_window(&self, core: &mut Core, window: &str, keep_host: Option<&str>) {
+        self.invalidate(core, window);
+        self.grants.0.lock().unwrap().remove(window);
         for (server_id, runtime) in &mut core.hosts {
             if keep_host == Some(server_id.as_str()) {
                 continue;
@@ -369,6 +499,11 @@ impl HostClient {
                 self.store
                     .clear_token(server_id)
                     .map_err(|_| "Could not clear invalid host credential")?;
+                self.grants
+                    .0
+                    .lock()
+                    .unwrap()
+                    .retain(|_, binding| binding.server_id != *server_id);
                 // F-07: a dead bridge must not keep publishing its wsUrl (every
                 // reconnect would be closed) nor hold window references. Taking
                 // it here also makes the reported status settle on `offline`.
@@ -424,6 +559,15 @@ impl PairingSink for PairingTransaction {
         }
         Ok(())
     }
+}
+
+fn bridges(runtime: &HostRuntime) -> impl Iterator<Item = &Bridge> {
+    runtime
+        .candidate
+        .as_ref()
+        .map(|candidate| &candidate.bridge)
+        .into_iter()
+        .chain(runtime.active.as_ref())
 }
 
 async fn stop_runtime(runtime: HostRuntime) {
