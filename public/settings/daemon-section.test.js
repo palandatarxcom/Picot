@@ -444,7 +444,11 @@ describe("running agents list", () => {
     await page.activate();
     const rows = agentRows();
     expect(rows).toHaveLength(3);
-    expect(document.querySelector(".pkg-manager-group-header").textContent).toBe("/Users/x/proj");
+    // The heading keeps the last two segments so a deep path still fits the
+    // narrow master column, and the full path moves to the tooltip.
+    const header = document.querySelector(".pkg-manager-group-header");
+    expect(header.textContent).toBe("…/x/proj");
+    expect(header.title).toBe("/Users/x/proj");
     expect(rows[0].textContent).toContain("s1");
     expect(rows[0].querySelector(".daemon-agent-state").textContent).toBe(
       EN.settings.daemon.agentState.working,

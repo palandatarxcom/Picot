@@ -97,7 +97,7 @@ describe("setupDeviceManage", () => {
     expect(rows[1].textContent).toContain("Owner unknown");
     expect(rows[1].textContent).not.toContain("null");
     expect(refs.empty.classList.contains("hidden")).toBe(true);
-    expect(refs.confirm.classList.contains("hidden")).toBe(true);
+    expect(refs.confirm.hidden).toBe(true);
   });
 
   it("shows the empty state when no device is paired", async () => {
@@ -116,7 +116,7 @@ describe("setupDeviceManage", () => {
     await view.refresh();
     refs.list.querySelectorAll("[data-revoke-id]")[0].click();
 
-    expect(refs.confirm.classList.contains("hidden")).toBe(false);
+    expect(refs.confirm.hidden).toBe(false);
     expect(refs.confirmText.textContent).toContain("phone-1");
     expect(refs.confirmText.textContent).toContain("loses access right away");
 
@@ -127,7 +127,7 @@ describe("setupDeviceManage", () => {
     // Truth after the action comes from the daemon, never from the click.
     expect(ipc.list).toHaveBeenCalledTimes(2);
     expect(refs.notice.textContent).toContain("Revoked phone-1");
-    expect(refs.confirm.classList.contains("hidden")).toBe(true);
+    expect(refs.confirm.hidden).toBe(true);
   });
 
   it("reports a failed read without showing a stale list", async () => {
@@ -155,7 +155,7 @@ describe("setupDeviceManage", () => {
     view.leave();
     await view.refresh();
 
-    expect(refs.confirm.classList.contains("hidden")).toBe(true);
+    expect(refs.confirm.hidden).toBe(true);
   });
 
   it("asks only for translatable keys, all of which exist", async () => {

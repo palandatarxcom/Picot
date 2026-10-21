@@ -166,7 +166,6 @@ describe("settings page split", () => {
     );
     expect(tabs).toEqual([
       "general",
-      "daemon",
       "appearance",
       "models",
       "extensions",
@@ -177,6 +176,9 @@ describe("settings page split", () => {
       // configuration and usage entries.
       "environment",
       "configuration",
+      // The daemon is infrastructure for advanced work, so it sits with the
+      // advanced entries rather than ahead of the everyday feature tabs.
+      "daemon",
       "usage",
     ]);
 

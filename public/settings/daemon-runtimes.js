@@ -4,6 +4,19 @@
 export const runtimeKey = (agent) =>
   JSON.stringify([agent?.workspaceId, agent?.sessionId, agent?.instanceId]);
 
+/**
+ * A workspace heading has to stay recognisable inside one narrow column, so a
+ * deep absolute path keeps its last two segments and ellipsises the rest. The
+ * full path stays available as the heading's tooltip.
+ */
+export function workspaceLabel(path) {
+  const text = typeof path === "string" ? path.trim() : "";
+  if (!text) return "";
+  const segments = text.split("/").filter(Boolean);
+  if (!text.startsWith("/") || segments.length <= 2) return text;
+  return `…/${segments.slice(-2).join("/")}`;
+}
+
 export function setupDaemonRuntimes({
   root,
   t,
@@ -101,7 +114,10 @@ export function setupDaemonRuntimes({
         heading.className = "pkg-manager-group-header";
         heading.style.whiteSpace = "normal";
         heading.style.overflowWrap = "anywhere";
-        heading.textContent = workspaceAgents[0].cwd || workspaceAgents[0].workspaceId || "—";
+        const workspace = workspaceAgents[0];
+        const fullPath = workspace.cwd || workspace.workspaceId || "";
+        heading.textContent = workspaceLabel(fullPath) || "—";
+        heading.title = fullPath;
         nodes.push(heading);
         for (const agent of workspaceAgents) {
           const key = runtimeKey(agent);

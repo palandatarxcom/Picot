@@ -121,7 +121,10 @@ export function setupDeviceManage({
       }),
     );
     empty.classList.toggle("hidden", rows.length > 0);
-    confirmRow.classList.toggle("hidden", target === null);
+    // The markup hides this card with the `hidden` attribute, and the stylesheet
+    // pins `.daemon-confirm[hidden] { display: none }`, so toggling a class
+    // never revealed it. Drive the property the stylesheet actually reads.
+    confirmRow.hidden = target === null;
     confirmText.textContent = target
       ? t("settings.daemon.devices.revokeConfirm", { device: target })
       : "";
