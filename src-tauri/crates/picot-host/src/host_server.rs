@@ -3000,8 +3000,16 @@ fn authorize_target(
     // re-reads its own persisted view (contract 1) — both compare against the
     // live runtime's workspace and spawn generation, so a device may touch only
     // the runtime its view names.
+    // The workspace must match for every principal. The *generation* is the
+    // desktop window-rebind guard (a window may be re-pointed at another
+    // runtime); a paired device has no window to rebind, and its persisted
+    // view legitimately lags the runtime it is looking at (the sidebar lists
+    // sessions from workspaces the device never committed to). Pinning devices
+    // to a generation rejected ordinary session opens.
+    let same_generation = matches!(context.kind, crate::host_router::ClientKind::Desktop);
     authority_scope(state, context).is_some_and(|binding| {
-        binding.workspace_id == live.workspace_id && binding.generation == live.workspace_generation
+        binding.workspace_id == live.workspace_id
+            && (!same_generation || binding.generation == live.workspace_generation)
     })
 }
 
@@ -3282,7 +3290,7 @@ async fn dispatch(
                     .runtimes
                     .target_for_session_id(&requested_target.session_id);
                 log::warn!(
-                    "[runtime-admission] rejected: session={} workspace={} instance={} authenticated_owner={} live={}",
+                    "[runtime-admission] rejected: session={} workspace={} instance={} authenticated_owner={} {} live={}",
                     requested_target.session_id,
                     requested_target.workspace_id,
                     requested_target.instance_id,
@@ -3290,6 +3298,13 @@ async fn dispatch(
                         .and_then(|ctx| ctx.owner_id.as_ref())
                         .map(|owner| owner.as_str())
                         .unwrap_or("<none>"),
+                    context
+                        .and_then(|ctx| authority_scope(state, ctx))
+                        .map(|scope| format!(
+                            "view=workspace:{} generation:{}",
+                            scope.workspace_id, scope.generation
+                        ))
+                        .unwrap_or_else(|| "view=<none>".to_string()),
                     resolved
                         .map(|target| format!(
                             "session={} workspace={} instance={} owner={}",

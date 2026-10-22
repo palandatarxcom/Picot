@@ -543,7 +543,7 @@ async fn device_view_and_window_binding_are_orthogonal() {
 /// superseded generation is rejected explicitly (error frame, never a silent
 /// drop).
 #[tokio::test]
-async fn two_devices_and_a_local_window_stay_independent_and_stale_generation_is_explicit() {
+async fn two_devices_and_a_local_window_stay_independent_and_generation_is_not_a_device_guard() {
     let temp = temp_dir("multi");
     let metadata = open_store(&temp);
     let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
@@ -639,9 +639,9 @@ async fn two_devices_and_a_local_window_stay_independent_and_stale_generation_is
     .await;
     assert_eq!(desktop_reply["type"], "runtime_response", "{desktop_reply}");
 
-    // A superseded generation is refused explicitly: device A's view moves on
-    // (generation 1), so its request against the generation-0 runtime is
-    // answered with an error frame naming the request, not dropped.
+    // A device's view generation is not a rebind guard: moving it does not
+    // revoke the runtime the device is looking at (Paseo parity — only a
+    // desktop window can be re-pointed). The request still succeeds.
     auth.lock()
         .unwrap()
         .store_device_view(
@@ -659,7 +659,7 @@ async fn two_devices_and_a_local_window_stay_independent_and_stale_generation_is
         wire_target("ws-one", "session-one", "instance-one"),
     )
     .await;
-    assert_eq!(stale["error"]["code"], "unauthorized_target", "{stale}");
+    assert_eq!(stale["type"], "runtime_response", "{stale}");
     assert_eq!(stale["requestId"], "a-stale", "{stale}");
 
     // Device B is unaffected by device A's generation move.

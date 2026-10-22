@@ -2801,6 +2801,26 @@ async fn dispatch_device_navigation(
             }
             Ok(Value::Null)
         }
+        // Read-only host facts the page renders from. They are not owner- or
+        // workspace-scoped, so a paired device reads them exactly like the
+        // desktop does — without them the remote page cannot show its version
+        // row, dev badge, Pi path, or the sidebar's live-runtime dots.
+        "get_app_version" => Ok(Value::from(env!("CARGO_PKG_VERSION"))),
+        "is_dev" => Ok(Value::from(cfg!(debug_assertions))),
+        "runtime_instances" => {
+            let session_root = dirs::home_dir().map(|home| home.join(".pi/agent/sessions"));
+            Ok(serde_json::json!({
+                "instances": runtime_instance_summaries(
+                    &state.runtimes,
+                    &state.metadata,
+                    session_root.as_deref(),
+                )
+            }))
+        }
+        "pi_path_status" => Ok(serde_json::json!({
+            "managed": false,
+            "source": "system",
+        })),
         other => Err(format!("remote navigation does not support {other}")),
     }
 }
