@@ -447,8 +447,9 @@ async fn workspace_bootstrap_is_a_fixed_schema_op() {
         "{extra}"
     );
 
-    // A workspace outside the device view is refused by the binding, not by
-    // the op (the op never widens the view).
+    // A device rides its owner's data plane (option A), so bootstrap is no
+    // longer pinned to the device view: an id with no live runtime fails at
+    // resolution instead of at admission.
     let outside = send_frame(
         &mut device,
         json!({
@@ -458,7 +459,7 @@ async fn workspace_bootstrap_is_a_fixed_schema_op() {
         }),
     )
     .await;
-    assert_eq!(outside["error"]["code"], "unauthorized_target", "{outside}");
+    assert_eq!(outside["error"]["code"], "runtime_not_found", "{outside}");
 
     // A session with no live runtime: the HTTP handler's `runtime_not_found`.
     let missing = send_frame(

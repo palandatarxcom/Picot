@@ -301,10 +301,10 @@ async fn detached_window_leaves_the_device_data_plane_authorized() {
     assert_eq!(data["requestId"], "data-1", "{data}");
     assert_ne!(data["error"]["code"], "unauthorized_target", "{data}");
 
-    // A workspace outside the device view stays refused — the view is a
-    // binding, not a blanket grant.
+    // A workspace the host does not know is still refused — the device rides
+    // its owner's data plane, not an arbitrary id the client invents.
     let other = workspace_info(&mut device, "data-2", "ws-other").await;
-    assert_eq!(other["error"]["code"], "unauthorized_target", "{other}");
+    assert_eq!(other["error"]["code"], "workspace_not_found", "{other}");
 
     // Routing-layer direct check (`host_router.rs:346-370`), asserted over the
     // real frame path rather than through `admits()`: the management plane is
@@ -617,7 +617,11 @@ async fn two_devices_and_a_local_window_stay_independent_and_generation_is_not_a
         wire_target("ws-two", "session-two", "instance-two"),
     )
     .await;
-    assert_eq!(a_cross["error"]["code"], "unauthorized_target", "{a_cross}");
+    // Two devices of the SAME pairing owner share that owner's data plane
+    // (Paseo parity): cross-workspace access is allowed, and "independence"
+    // means each keeps its own session/subscription state, not that the
+    // workspace list is partitioned per device.
+    assert_eq!(a_cross["type"], "runtime_response", "{a_cross}");
     assert_eq!(a_cross["requestId"], "a-cross", "{a_cross}");
     let b_cross = runtime_request(
         &mut device_b,
@@ -625,7 +629,7 @@ async fn two_devices_and_a_local_window_stay_independent_and_generation_is_not_a
         wire_target("ws-one", "session-one", "instance-one"),
     )
     .await;
-    assert_eq!(b_cross["error"]["code"], "unauthorized_target", "{b_cross}");
+    assert_eq!(b_cross["type"], "runtime_response", "{b_cross}");
     assert_eq!(b_cross["requestId"], "b-cross", "{b_cross}");
 
     // The local window keeps its own (desktop) resolution path throughout.

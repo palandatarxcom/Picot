@@ -3006,10 +3006,16 @@ fn authorize_target(
     // view legitimately lags the runtime it is looking at (the sidebar lists
     // sessions from workspaces the device never committed to). Pinning devices
     // to a generation rejected ordinary session opens.
-    let same_generation = matches!(context.kind, crate::host_router::ClientKind::Desktop);
+    // A paired device rides its owner's whole data plane (Paseo parity): the
+    // sidebar lists every registered workspace, so gating each open on the
+    // device view's single workspace rejected ordinary session opens. Owner
+    // equality above is the binding. The desktop keeps the registration +
+    // generation guard, where a window really is re-pointed at another runtime.
+    if matches!(context.kind, crate::host_router::ClientKind::Remote) {
+        return true;
+    }
     authority_scope(state, context).is_some_and(|binding| {
-        binding.workspace_id == live.workspace_id
-            && (!same_generation || binding.generation == live.workspace_generation)
+        binding.workspace_id == live.workspace_id && binding.generation == live.workspace_generation
     })
 }
 
@@ -3087,9 +3093,8 @@ fn operation_scope(
             "not_registered",
             "Paired owner has no registered workspace".into(),
         ))?;
-        if binding.workspace_id != workspace_id {
-            return Err(("stale_generation", "Workspace is not authorized".into()));
-        }
+        // The device is scoped to the workspace it is actually operating on
+        // (its owner's data plane), not to the one its view happens to name.
         return Ok(crate::operation_registry::OperationScope::new(
             binding.owner.as_str(),
             workspace_id,
@@ -4098,9 +4103,11 @@ async fn dispatch(
                             && ctx.workspace_id.as_deref()
                                 == frame.get("workspaceId").and_then(Value::as_str)
                     }
-                    _ => remote_device_binding(state, ctx).is_some_and(|binding| {
-                        Some(binding.workspace_id.as_str())
-                            == frame.get("workspaceId").and_then(Value::as_str)
+                    // A device's data plane is its owner's: any workspace the
+                    // client names is in scope once the owner matches. The
+                    // binding still proves the device is attached to this host.
+                    _ => remote_device_binding(state, ctx).is_some_and(|_| {
+                        frame.get("workspaceId").and_then(Value::as_str).is_some()
                     }),
                 }
             });
