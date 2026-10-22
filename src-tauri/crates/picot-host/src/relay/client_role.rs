@@ -250,7 +250,17 @@ async fn run_session(
         _ = shutdown.changed() => return SessionOutcome::Stopped,
         stream = dial => match stream {
             Ok(stream) => stream,
-            Err(()) => return SessionOutcome::Dropped { reached_online: false },
+            Err(()) => {
+                // Silent by design before: a bridge that cannot dial looked
+                // exactly like a bridge that was refused.
+                log::warn!(
+                    "relay client dial failed: endpoint={} server={} (tls={})",
+                    config.endpoint,
+                    config.server_id,
+                    config.use_tls
+                );
+                return SessionOutcome::Dropped { reached_online: false };
+            }
         },
     };
 
@@ -259,7 +269,13 @@ async fn run_session(
         _ = shutdown.changed() => return SessionOutcome::Stopped,
         outcome = handshake => match outcome {
             Ok(shared_key) => shared_key,
-            Err(_) => return SessionOutcome::Dropped { reached_online: false },
+            Err(error) => {
+                log::warn!(
+                    "relay e2ee handshake failed: server={} reason={error}",
+                    config.server_id
+                );
+                return SessionOutcome::Dropped { reached_online: false };
+            }
         },
     };
 
