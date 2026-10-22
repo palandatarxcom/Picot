@@ -1,5 +1,5 @@
 // ABOUTME: Emits PICOT_BUILD_ID, the host build identity shared by every crate member.
-// ABOUTME: git describe --always --dirty with a compile-timestamp fallback when git is unavailable.
+// ABOUTME: git describe --tags --always --dirty, with a compile-timestamp fallback when git is unavailable.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -40,7 +40,11 @@ fn build_id() -> String {
 
 fn git_describe() -> Option<String> {
     let output = Command::new("git")
-        .args(["describe", "--always", "--dirty"])
+        // `--tags` matters: release tags are lightweight (`git tag "$TAG"` in
+        // scripts/release.sh), and a plain describe only counts annotated tags,
+        // which anchored every build id to an old v0.3.6.1 while the app itself
+        // reported 0.5.x.
+        .args(["describe", "--tags", "--always", "--dirty"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()?;
