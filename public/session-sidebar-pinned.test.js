@@ -94,7 +94,7 @@ function localeStub() {
 function makeTransport({ rows = DB_ROWS, removed = [] } = {}) {
   return {
     available: true,
-    capabilities: { native: true },
+    capabilities: { native: true, management: true },
     listWorkspaces: vi.fn(async () => ({ workspaces: rows, removed })),
     addWorkspace: vi.fn(async () => ({ added: true })),
     removeWorkspace: vi.fn(async () => ({ removed: true })),

@@ -58,7 +58,7 @@ function makeTransport({ rows = REGISTRY_ROWS, instances = [] } = {}) {
   const state = { instances: [...instances] };
   const transport = {
     available: true,
-    capabilities: { native: true },
+    capabilities: { native: true, management: true },
     listWorkspaces: vi.fn(async () => ({ workspaces: rows, removed: [] })),
     runtimeInstances: vi.fn(async () => ({ instances: state.instances })),
     removeWorkspace: vi.fn(async () => ({ removed: true })),

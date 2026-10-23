@@ -17,7 +17,9 @@ globalThis.document = dom.window.document;
 function makeRegistryTransport(rows, responses = {}) {
   return {
     available: true,
-    capabilities: { native: true },
+    // Desktop parity: the local host advertises both faces. A paired remote
+    // page reaches the navigation face only — see the management-gate test.
+    capabilities: { native: true, management: true },
     listWorkspaces: vi.fn(async () => ({
       workspaces: rows,
       removed: responses.removed ?? [],
@@ -434,6 +436,25 @@ describe("add / remove / pin registry flows", () => {
     await sidebar.addProjectViaPicker();
 
     expect(onRegisterWorkspace).toHaveBeenCalledWith("/work/alpha");
+  });
+
+  test("a remote page lists workspaces but cannot mutate the registry", async () => {
+    const { sidebar, transport } = await makeSidebar({ rows: REGISTRY_ROWS });
+    // hello_ack on a paired-device bridge: navigation face only (D2).
+    transport.capabilities = { native: true, management: false };
+
+    await sidebar.loadSessions();
+    expect(sidebar.projects).toHaveLength(REGISTRY_ROWS.length);
+
+    const notices = [];
+    sidebar.onSessionNotice = (message) => notices.push(message);
+    await sidebar.addProjectViaPicker();
+    expect(transport.pickFolder).not.toHaveBeenCalled();
+    expect(transport.addWorkspace).not.toHaveBeenCalled();
+    expect(notices.at(-1)).toMatch(/desktop/i);
+
+    await sidebar.removeFromList(sidebar.projects[0]);
+    expect(transport.removeWorkspace).not.toHaveBeenCalled();
   });
 
   test("removeFromList only deletes the DB row and keeps expansion clean", async () => {

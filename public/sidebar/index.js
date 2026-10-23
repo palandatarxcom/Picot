@@ -445,6 +445,14 @@ export class SessionSidebar {
     );
   }
 
+  // Listing a host's registry rides the navigation face; changing it rides the
+  // management face, which a paired remote page never has (D2). Using the list
+  // gate for the mutations offered a dead "add project" / "remove" on a remote
+  // host page: the op came back `forbidden_class` and nothing explained why.
+  canManageRegistry() {
+    return this.isRegistryAvailable() && Boolean(this.transport?.capabilities?.management);
+  }
+
   async loadRegistryProjects(seq) {
     const [listResult, instances] = await Promise.all([
       this.transport.listWorkspaces(),
@@ -1101,7 +1109,7 @@ export class SessionSidebar {
     const registryRow = workspace?.source === "registry";
     const isPinned = Boolean(registryRow && workspace.pinned);
     const items = [
-      ...(registryRow && this.isRegistryAvailable()
+      ...(registryRow && this.canManageRegistry()
         ? [
             {
               iconKind: "pin",
@@ -1146,7 +1154,7 @@ export class SessionSidebar {
       // its session files — unlike the destructive batch delete below. The
       // current workspace itself is never removable: its window cannot be
       // closed, so un-registering it would strand a live row permanently.
-      ...(registryRow && this.isRegistryAvailable()
+      ...(registryRow && this.canManageRegistry()
         ? [
             {
               iconKind: "x",
@@ -1213,7 +1221,7 @@ export class SessionSidebar {
    * Refresh reloads server-side ordering (pinned DESC, last_opened DESC).
    */
   async toggleWorkspacePin(workspace, currentlyPinned) {
-    if (workspace?.source !== "registry" || !this.isRegistryAvailable()) return;
+    if (workspace?.source !== "registry" || !this.canManageRegistry()) return;
     try {
       await this.transport.setWorkspacePinned(workspace.registryId, !currentlyPinned);
     } catch (error) {
@@ -1365,7 +1373,7 @@ export class SessionSidebar {
 
   /** Remove a registry row only; directories and session files untouched. */
   async removeFromList(workspace) {
-    if (workspace?.source !== "registry" || !this.isRegistryAvailable()) return;
+    if (workspace?.source !== "registry" || !this.canManageRegistry()) return;
     // The current workspace's window cannot be closed; refuse the
     // un-registration rather than stranding a live row the user cannot
     // dismiss (mirrors the delete-disabled protections on sessions).
@@ -1399,7 +1407,7 @@ export class SessionSidebar {
 
   /** Toolbar entry: pick a folder via broker, register it, expand the row. */
   async addProjectViaPicker() {
-    if (!this.isRegistryAvailable()) {
+    if (!this.canManageRegistry()) {
       this.onSessionNotice?.(t("sidebar.addProjectDesktopOnly"));
       return;
     }
