@@ -358,15 +358,19 @@ fn is_app_origin(origin: &str) -> bool {
 async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     let first = tokio::time::timeout(shared.seams.first_frame_timeout, socket.next()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
+        log::warn!("bridge: no hello frame within the first-frame deadline");
         return;
     };
     let Ok(fields) = serde_json::from_str::<Fields>(&text) else {
+        log::warn!("bridge: first frame is not a JSON object");
         return;
     };
     if string_field(&fields, "type").as_deref() != Some("hello") {
+        log::warn!("bridge: first frame is not hello");
         return;
     }
     if !is_app_origin(&origin) {
+        log::warn!("bridge: rejected origin {origin}");
         return;
     }
     let credential = {
@@ -375,11 +379,20 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
             *shared.status.borrow(),
             HostBridgeStatus::CredentialInvalid | HostBridgeStatus::PairingFailed
         ) {
+            log::warn!(
+                "bridge: refusing a session in terminal state {:?}",
+                *shared.status.borrow()
+            );
             return;
         }
         if matches!(auth.credential, Credential::Pairing { .. }) {
             // Reject, never queue: one host-level exchange and one app hello.
             if auth.pairing_busy || shared.pairing.is_none() {
+                log::warn!(
+                    "bridge: pairing rejected busy={} sink={}",
+                    auth.pairing_busy,
+                    shared.pairing.is_some()
+                );
                 return;
             }
             auth.pairing_busy = true;

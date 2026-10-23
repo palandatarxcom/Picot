@@ -332,6 +332,20 @@ impl HostClient {
         server_id: &str,
     ) -> Result<(), String> {
         let runtime = core.hosts.entry(server_id.into()).or_default();
+        // A stopped bridge keeps its origin, but nothing listens there: reusing
+        // it produced a dead wsUrl, a failed page load and the local-recovery
+        // bounce loop. Drop it and start a fresh one.
+        let stopped = |bridge: &Bridge| *bridge.handle.status.borrow() == HostBridgeStatus::Stopped;
+        if runtime.active.as_ref().is_some_and(stopped) {
+            runtime.active = None;
+        }
+        if runtime
+            .candidate
+            .as_ref()
+            .is_some_and(|c| stopped(&c.bridge))
+        {
+            runtime.candidate = None;
+        }
         if runtime.candidate.is_none() && runtime.active.is_none() {
             let saved = self.store.host(server_id).ok_or("Unknown host")?;
             let token = saved
