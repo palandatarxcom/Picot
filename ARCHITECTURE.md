@@ -218,6 +218,7 @@ relay 数据面绕开 axum 入口的物理帧上限，各上限统一进契约�
 > **本节是目标设计，不是现行事实。** 口径来自 spec `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-desktop-host-client-design.md`（修订 2）与 plan Draft 3；实现落在 `daemon-phase1` 分支，T11 验收通过时本节才翻转为现行事实。在此之前代码里没有这些模块与帧字段，本节读作约束，不是描述。
 
 - **归属**：远程 host 的 E2EE 通道与 per-host loopback 桥都在 **app 进程**（Tauri 壳）内，不进本机 daemon——客户端会话生死跟 UI 走，本机 daemon 仍只服务本机工作区。新增 `picot-host::relay::{client_role, host_bridge, host_store, host_tofu}` 与 `src-tauri/src/host_client/`；前端帧协议零改动，连接管理层把 wsUrl 从页面 origin 切到该 host 的桥 origin（端口统一 `/v2/ws`）。本机 daemon 停止时远程 host 不可用（UI 本身由本机静态资源承载），不做无本机 daemon 的纯远程模式。
+- **数据面边界（2026-10-23，Dr. Lin 拍板 A）**：已配对设备的数据面是**整台主机**——可读写任意已注册 workspace 的会话与文件，不按窗口 owner 的当前绑定收窄。runtime 面仍硬校验 `live.owner_id == 配对 owner`（token 铸造时盖章，来自服务端而非 wire）。单用户 daemon 下不存在跨人越权，牺牲的是窗口/设备级隔离；若将来多用户或多租户，必须重新引入 workspace 归属校验。
 - **device view（契约 1）**：每个已配对设备在 daemon 侧持有独立视图状态（当前 workspace + 会话绑定 + generation，存 `relay.device_view.<deviceId>`），与窗口 owner registry **完全正交**；远程导航只操作 device view，绝不触碰窗口 owner 的绑定、navigation permit 与 `focusedExisting` 语义。视图随设备存活，不随宿主窗口 detach 消亡（D1）；daemon 重启后设备免重新配对、按磁盘会话重开——恢复的是会话，不是运行中的 turn。
 - **D2 动作矩阵**：按真实 handler 逐项分支，不是只改 `admits()` 分类——路由层直查点（`host_router.rs` 直查、`host_server.rs` HostControl gate）同属改动面。
 

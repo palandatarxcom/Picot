@@ -1262,7 +1262,7 @@ export class SessionSidebar {
     return Boolean(
       workspace?.source === "registry" &&
         workspace.registryId &&
-        this.isRegistryAvailable() &&
+        this.canManageRegistry() &&
         typeof this.transport?.stopWorkspace === "function" &&
         this.workspaceRunningInstances(workspace).length > 0,
     );

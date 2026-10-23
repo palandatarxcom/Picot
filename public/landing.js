@@ -7,7 +7,7 @@
 // terminal, model picker, and their owner-bootstrap handlers. No Git refresh
 // or model-catalog request may run at landing generation 0.
 
-import { connectHost, watchCredentialInvalid } from "./app/host-connection.js";
+import { connectHost, HOST_PARAM, watchCredentialInvalid } from "./app/host-connection.js";
 import { installHostOriginFetch } from "./app/host-origin.js";
 import { initTransport } from "./app/transport.js";
 import { createAppUpdater } from "./app/updater.js";
@@ -201,8 +201,8 @@ function navigateInWindow(url) {
     parsed.searchParams.delete(FOCUS_WORKSPACE_PARAM);
     // Keep the window's host: a target origin from the daemon does not carry it,
     // and dropping it sent the page back to the local host.
-    const hostParam = currentUrl.searchParams.get("host");
-    if (hostParam) parsed.searchParams.set("host", hostParam);
+    const hostParam = currentUrl.searchParams.get(HOST_PARAM);
+    if (hostParam) parsed.searchParams.set(HOST_PARAM, hostParam);
     targetUrl = parsed;
   } catch {
     console.error("[landing] rejected invalid target");
