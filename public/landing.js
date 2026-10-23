@@ -199,6 +199,10 @@ function navigateInWindow(url) {
       return;
     }
     parsed.searchParams.delete(FOCUS_WORKSPACE_PARAM);
+    // Keep the window's host: a target origin from the daemon does not carry it,
+    // and dropping it sent the page back to the local host.
+    const hostParam = currentUrl.searchParams.get("host");
+    if (hostParam) parsed.searchParams.set("host", hostParam);
     targetUrl = parsed;
   } catch {
     console.error("[landing] rejected invalid target");

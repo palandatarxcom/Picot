@@ -7,7 +7,7 @@
 
 import { createComposerDraftStore } from "./app/composer-draft-store.js";
 import { resolveComposerSessionIdentity } from "./app/composer-session-identity.js";
-import { connectHost, watchCredentialInvalid } from "./app/host-connection.js";
+import { connectHost, HOST_PARAM, watchCredentialInvalid } from "./app/host-connection.js";
 import { installHostOriginFetch } from "./app/host-origin.js";
 import { createPromptDelivery } from "./app/prompt-delivery.js";
 import { createSessionStoppedBanner } from "./app/session-stopped-banner.js";
@@ -259,6 +259,11 @@ const navigateInWindow = (url, metadata = {}) => {
         ? { path: requestedFocusId.slice("workspace:".length) }
         : null);
     targetUrl = withFocusParam(metadata.targetCwd, focusProject, parsed);
+    // The host lives on this window's URL, not in the daemon's target origin:
+    // dropping it here bounced a remote page back to the local host on every
+    // session open.
+    const hostParam = currentUrl.searchParams.get(HOST_PARAM);
+    if (hostParam) targetUrl.searchParams.set(HOST_PARAM, hostParam);
     if (mobileClientMode) targetUrl.searchParams.set("mobile", "1");
   } catch {
     console.error("[navigation] rejected invalid target");
