@@ -3886,7 +3886,6 @@ dependencies = [
  "log",
  "objc2-foundation",
  "picot-host",
- "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

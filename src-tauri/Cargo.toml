@@ -1,8 +1,8 @@
 [package]
 name = "picot"
 version = "0.5.0"
-description = "Pi Agent Desktop - session manager for pi coding agent"
-authors = ["Pi Desktop"]
+description = "Pi Agent Desktop - a desktop harness tool for pi coding agent"
+authors = ["Palan DataRx"]
 edition = "2021"
 
 # Phase 1 (T1): this package is the Tauri app shell (windows, menus, dialogs,
@@ -19,11 +19,6 @@ path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-
-[features]
-# P8 deletion preparation: compile out legacy modules to prove zero
-# dependency before physical file deletion. Not for production use.
-p8-delete-legacy = []
 
 [dependencies]
 picot-host = { path = "crates/picot-host" }
@@ -48,7 +43,6 @@ async-trait = "0.1"
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSUserDefaults"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
-rand = "0.8"
 tempfile = "3"
 # The app-side daemon client (plan Task 4): the admin channel is one loopback
 # WS, and the confirmed-exit waiter signals by pid.
