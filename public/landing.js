@@ -198,12 +198,20 @@ function navigateInWindow(url) {
       console.error("[landing] rejected cross-origin target");
       return;
     }
+    // A remote-host window never changes origin: the daemon's targetOrigin
+    // names a route on its OWN loopback origin — a different machine's port
+    // that shares this 127.0.0.1 hostname, so the guard above cannot see it.
+    // Keep only the route and rebase it onto this page's origin.
+    const hostParam = currentUrl.searchParams.get(HOST_PARAM);
+    const route =
+      hostParam && parsed.origin !== currentUrl.origin
+        ? new URL(parsed.pathname + parsed.search + parsed.hash, currentUrl.href)
+        : parsed;
     parsed.searchParams.delete(FOCUS_WORKSPACE_PARAM);
     // Keep the window's host: a target origin from the daemon does not carry it,
     // and dropping it sent the page back to the local host.
-    const hostParam = currentUrl.searchParams.get(HOST_PARAM);
-    if (hostParam) parsed.searchParams.set(HOST_PARAM, hostParam);
-    targetUrl = parsed;
+    if (hostParam) route.searchParams.set(HOST_PARAM, hostParam);
+    targetUrl = route;
   } catch {
     console.error("[landing] rejected invalid target");
     return;

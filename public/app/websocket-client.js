@@ -265,6 +265,13 @@ export class WebSocketClient extends EventTarget {
         : await this._bootstrapHttpTarget(fetchImpl);
     if (!target) return null;
     this.setRoutingContext(target);
+    // The hello_ack auto-subscribe (line ~754) raced this bootstrap with a
+    // placeholder instanceId (the canonical URL route carries none), so its
+    // snapshot hit `unauthorized_target` on hosts that validate the full
+    // triple. Re-target the runtime channel with the resolved instanceId so
+    // the snapshot (and the mirror_sync it triggers) actually lands.
+    this._subscribeCanonicalTarget();
+    this._requestCanonicalSnapshot();
     return target;
   }
 

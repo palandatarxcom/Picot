@@ -2374,9 +2374,22 @@ pub(crate) async fn run_session<S, E>(
                 match host_event {
                     Ok(event)
                         if client_context.as_ref().is_some_and(|context| {
-                            context.kind == crate::host_router::ClientKind::Desktop
+                            // Owner events (git_status, git_diff, git_command_failed)
+                            // reach both principals: a desktop owner by its window
+                            // binding, a paired device by its pairing owner. The
+                            // Desktop-only gate starved the remote Git panel — the
+                            // daemon emits git results as owner events, and the
+                            // device's relay session silently dropped every one.
+                            matches!(
+                                context.kind,
+                                crate::host_router::ClientKind::Desktop
+                                    | crate::host_router::ClientKind::Remote
+                            )
                                 && event.owner.as_ref().is_none_or(|owner| {
-                                    context.owner_id.as_ref() == Some(owner)
+                                    // Desktop: owner_id; Remote: pairing owner via
+                                    // data_plane_owner. Either way, only the
+                                    // owner's own events are delivered.
+                                    context.data_plane_owner() == Some(owner.as_str())
                                 })
                         }) => {
                             if outgoing_tx.send(outbound_message(event.value, PayloadKind::Event)).is_err() {

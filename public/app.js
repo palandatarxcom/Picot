@@ -244,6 +244,16 @@ const navigateInWindow = (url, metadata = {}) => {
       console.error("[navigation] rejected cross-origin target");
       return;
     }
+    // A remote-host window never changes origin: the daemon's targetOrigin
+    // names a route on its OWN loopback origin — a different machine's port
+    // that shares this 127.0.0.1 hostname, so the guard above cannot see it.
+    // Keep only the route and rebase it onto this page's origin; the host
+    // param below keeps the window on its remote host.
+    const hostParam = currentUrl.searchParams.get(HOST_PARAM);
+    const route =
+      hostParam && parsed.origin !== currentUrl.origin
+        ? new URL(parsed.pathname + parsed.search + parsed.hash, currentUrl.href)
+        : parsed;
     const requestedFocusId = currentUrl.searchParams.get(FOCUS_WORKSPACE_PARAM);
     // During navigation to a freshly spawned native runtime, the current
     // focus project has not been re-resolved yet on page load. Fall back to
@@ -258,11 +268,10 @@ const navigateInWindow = (url, metadata = {}) => {
       (requestedFocusId?.startsWith("workspace:")
         ? { path: requestedFocusId.slice("workspace:".length) }
         : null);
-    targetUrl = withFocusParam(metadata.targetCwd, focusProject, parsed);
+    targetUrl = withFocusParam(metadata.targetCwd, focusProject, route);
     // The host lives on this window's URL, not in the daemon's target origin:
     // dropping it here bounced a remote page back to the local host on every
     // session open.
-    const hostParam = currentUrl.searchParams.get(HOST_PARAM);
     if (hostParam) targetUrl.searchParams.set(HOST_PARAM, hostParam);
     if (mobileClientMode) targetUrl.searchParams.set("mobile", "1");
   } catch {
@@ -702,7 +711,12 @@ if (wsClient.canonicalRoute) {
   // still render (from disk history) instead of failing module evaluation and
   // leaving a blank tab (PM finding C10①).
   try {
-    await wsClient.loadCanonicalTarget();
+    const bootTarget = await wsClient.loadCanonicalTarget();
+    // Stash the bootstrap generation for the async IIFE below: gitClient is
+    // declared later in this module, so it cannot be referenced here.
+    if (typeof bootTarget?.workspaceGeneration === "number") {
+      globalThis.__picotBootWorkspaceGeneration = bootTarget.workspaceGeneration;
+    }
   } catch (error) {
     console.warn("[App] no runtime for this deep link; rendering without one:", error);
   }
@@ -711,6 +725,44 @@ if (wsClient.canonicalRoute) {
   const canonicalTarget = wsClient.getRuntimeTarget();
   if (canonicalTarget?.workspaceId && canonicalTarget?.sessionId) {
     void fetchDiskHistory(canonicalTarget);
+
+    // Workspace-scoped panels (file tree, git status) previously waited for
+    // the runtime snapshot's mirror_sync to supply the workspace file path.
+    // On a remote host the snapshot may race with (or never reach) the
+    // sidebar's async workspace-list load, leaving both panels empty. Resolve
+    // the path directly from workspace.list — the same data op the sidebar
+    // uses — and initialize the panels without depending on the runtime
+    // event chain.
+    void (async () => {
+      try {
+        const list = await transport._control("workspace.list", {});
+        // Now past the first await — the module has finished loading, so
+        // gitClient (declared at the GitClient construction site) is no
+        // longer in the temporal dead zone. The desktop flow learns the
+        // workspace generation from the owner_bootstrap event; a remote/bridge
+        // connection never receives that event, so set it from the bootstrap
+        // target here to unlock the git command gate.
+        const bootGeneration = globalThis.__picotBootWorkspaceGeneration;
+        if (typeof bootGeneration === "number") {
+          gitClient.setWorkspaceGeneration(bootGeneration);
+          delete globalThis.__picotBootWorkspaceGeneration;
+        }
+        const match = (list?.workspaces || []).find(
+          (w) => w.workspaceId === canonicalTarget.workspaceId,
+        );
+        const workspacePath = match?.canonicalPath || "";
+        if (!workspacePath) return;
+        foregroundWorkspacePath = workspacePath;
+        updateWorkspaceIndicator(workspacePath);
+        if (workspacePath !== fileBrowserWorkspacePath) {
+          await refreshFileBrowserForWorkspace(workspacePath, { force: true });
+        }
+        void gitPanel.refresh();
+      } catch {
+        // The sidebar's own workspace.list load (already in flight) will
+        // populate the panels through its own path if this probe loses.
+      }
+    })();
   }
 }
 // `?mobile=1` is a browser client even if it reaches the desktop broker, so it
