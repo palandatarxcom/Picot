@@ -311,6 +311,10 @@ body.landing-mode #landing {
    ═══════════════════════════════════════════════════════ */
 
 .sidebar {
+  /* Default width for first run (before the resizer reads localStorage);
+     the sidebar footer grew — host picker, settings, extension updates,
+     app updates — and a narrow default truncates those rows. */
+  --sidebar-width: 280px;
   width: var(--sidebar-width);
   min-width: var(--sidebar-width);
   background: var(--sidebar-bg-mobile);
@@ -6648,6 +6652,9 @@ body.hide-thinking .thinking-block {
   border: none;
   color: var(--text-primary);
   font-size: var(--font-size-lg);
+  /* Match the File/Editor monospace face (Fira Code Nerd) so code-heavy
+     prompts align with the editor and terminal the user reads them in. */
+  font-family: var(--editor-font-family);
   outline: none;
   resize: none;
   max-height: 160px;
