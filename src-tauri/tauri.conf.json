@@ -36,7 +36,9 @@
     "resources": {
       "../public": "public",
       "../extensions/dist/picot-bridge.mjs": "extensions/picot-bridge.mjs",
-      "./resources/pi": "pi"
+      "./resources/pi": "pi",
+      "../scripts/cleanup-picot-daemon.sh": "cleanup-picot-daemon.sh",
+      "../scripts/cleanup-picot-daemon.command": "cleanup-picot-daemon.command"
     }
   },
   "plugins": {

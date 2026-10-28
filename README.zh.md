@@ -45,6 +45,20 @@ irm https://raw.githubusercontent.com/palandatarxcom/Picot/main/scripts/install.
 
 **无需单独安装 `pi` CLI** — Picot 内置了自己的 pi 运行时。
 
+### 强制结束后残留的 daemon
+
+Picot 的宿主跑在独立进程 `picot-daemon` 里，且按设计从 app 的进程组分离开——所以
+强杀 Picot 之后，daemon（连同它的 agent）仍在运行；下次启动 app 会自动接管或替换它。
+如果需要手工停掉，用发行包里附带的清理脚本：
+
+- macOS：双击 `Picot.app/Contents/Resources/cleanup-picot-daemon.command`；想先看它
+  会做什么，用 `bash …/cleanup-picot-daemon.sh --dry-run`。
+- Windows：运行与 `Picot.exe` 同级的 `cleanup-picot-daemon.bat`。
+
+脚本会先确认 instance 文件里记录的 pid 仍然属于 `picot-daemon` 才动手（pid 被复用时
+直接拒绝），会要求确认，只在 daemon 确实退出后删除 instance 与 lock 文件，并保留
+`picot-daemon.log`。
+
 ### macOS 未签名提示
 
 Picot 目前发布的 macOS 版本未经 Apple 开发者 ID 签名/公证，系统可能弹出：

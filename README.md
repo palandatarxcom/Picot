@@ -57,6 +57,20 @@ Or [download from GitHub Releases](https://github.com/palandatarxcom/Picot/relea
 
 You **do not** need to install the `pi` CLI separately — Picot bundles its own pi runtime.
 
+### Daemon left running after a force-quit
+
+Picot runs its host in a detached `picot-daemon`, so killing the Picot app leaves the
+daemon (and its agents) running on purpose; the app adopts or replaces it on the next
+launch. To stop it by hand, use the cleanup helper shipped with the app:
+
+- macOS: double-click `Picot.app/Contents/Resources/cleanup-picot-daemon.command`, or
+  run `bash …/cleanup-picot-daemon.sh --dry-run` to see what it would do first.
+- Windows: run `cleanup-picot-daemon.bat`, next to `Picot.exe`.
+
+The helper proves the recorded pid still belongs to `picot-daemon` before signalling
+it, asks for confirmation, deletes only a dead daemon's instance and lock files, and
+keeps `picot-daemon.log`.
+
 ---
 
 ## Quick Start

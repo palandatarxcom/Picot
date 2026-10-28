@@ -379,6 +379,12 @@ build_windows() {
 	PATH="$HOME/.cargo/bin:$PATH" tauri build --target "$target" --no-bundle
 	local release_dir="src-tauri/target/$target/release"
 
+	# The daemon cleanup helper is a plain script, so it travels beside the exe
+	# instead of through Tauri's resource map (Windows builds ship no daemon
+	# sidecar yet, but the helper must still be in the zip for when they do).
+	cp "$PROJECT_ROOT/scripts/cleanup-picot-daemon.ps1" "$release_dir/"
+	cp "$PROJECT_ROOT/scripts/cleanup-picot-daemon.bat" "$release_dir/"
+
 	# Verify the Windows pi binary made it into the build output. Tauri
 	# copies src-tauri/resources/pi/ into the target's resource dir during
 	# the build. If the file is a Mach-O (or anything other than a Windows
@@ -405,6 +411,8 @@ build_windows() {
 		pi \
 		extensions \
 		public \
+		cleanup-picot-daemon.bat \
+		cleanup-picot-daemon.ps1 \
 		-x '*.DS_Store' \
 		-x '**/.DS_Store')
 
