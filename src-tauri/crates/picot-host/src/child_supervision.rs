@@ -45,7 +45,42 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn pid_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    /// `STILL_ACTIVE`: the exit code a running process reports.
+    const STILL_ACTIVE: u32 = 259;
+
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Access denied means the pid exists but is not ours to inspect;
+            // every other failure means it is gone.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+/// Targets with neither Unix signals nor the Win32 process API cannot host a
+/// daemon, so there is no liveness answer to give. Windows used to fall into
+/// this arm, which made every recorded daemon look dead and sent the app off
+/// to spawn a duplicate that then lost the instance lock.
+/// Targets with neither Unix signals nor the Win32 process API cannot host a
+/// daemon, so there is no liveness answer to give; both supported platforms
+/// have a real implementation above. A catch-all `false` here would let a
+/// recorded daemon look dead, which sends the app off to spawn a duplicate
+/// that then loses the instance lock.
+#[cfg(not(any(unix, windows)))]
 pub fn pid_is_alive(_pid: u32) -> bool {
     false
 }
