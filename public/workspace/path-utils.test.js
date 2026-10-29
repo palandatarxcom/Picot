@@ -21,6 +21,16 @@ test("normalizes UNC paths without losing the share root", () => {
   expect(basenameLocalPath("\\\\server\\share\\repo\\file.ts")).toBe("file.ts");
 });
 
+test("strips the Windows verbatim prefix before normalizing", () => {
+  expect(normalizeLocalPath("\\\\?\\D:\\work\\repo")).toBe("D:/work/repo");
+  expect(normalizeLocalPath("\\\\?\\C:\\Users\\Lin\\repo\\..\\picot")).toBe("C:/Users/Lin/picot");
+  expect(normalizeLocalPath("\\\\?\\D:\\")).toBe("D:/");
+});
+
+test("maps the verbatim UNC prefix back to the share root", () => {
+  expect(normalizeLocalPath("\\\\?\\UNC\\server\\share\\repo")).toBe("//server/share/repo");
+});
+
 test("formats relative paths with a leading slash for sidebar display", () => {
   expect(displayLocalPath("Users/Lin/project")).toBe("/Users/Lin/project");
   expect(displayLocalPath("/Users/Lin/project")).toBe("/Users/Lin/project");

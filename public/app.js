@@ -1226,7 +1226,7 @@ function refreshGitBranch() {
 }
 
 function updateWorkspaceIndicator(path = "") {
-  const normalizedPath = typeof path === "string" ? path.trim() : "";
+  const normalizedPath = typeof path === "string" ? normalizeLocalPath(path.trim()) : "";
   if (!normalizedPath) {
     workspaceIndicatorEl.classList.add("hidden");
     workspaceIndicatorEl.textContent = "";

@@ -2865,12 +2865,14 @@ pub async fn run_restart(app: &AppHandle) -> Result<RestartReport, String> {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-// Native menus belong in the macOS system menu bar (same as upstream). The
-// Edit submenu's key equivalents are load-bearing for WKWebView text input:
-// without a native menu the responder chain eats key auto-repeat events, so
-// holding a key in the terminal (xterm.js) types exactly one character.
-// Windows/Linux draw in-window menus instead, so the builder stays menu-less
-// there exactly as upstream does.
+// Native menus: macOS shows them in the system menu bar (same as upstream);
+// Windows shows the same builder's menu as an in-window menu bar — the app
+// has no in-window File menu of its own, so without it New Window has no
+// entry point at all. The Edit submenu's key equivalents are load-bearing
+// for WKWebView text input on macOS: without a native menu the responder
+// chain eats key auto-repeat events, so holding a key in the terminal
+// (xterm.js) types exactly one character. Linux stays menu-less exactly as
+// upstream does.
 const MENU_NEW_SESSION_ID: &str = "picot-new-session";
 const MENU_NEW_WINDOW_ID: &str = "picot-new-window";
 const MENU_ADD_PROJECT_ID: &str = "picot-add-project";
@@ -2982,7 +2984,7 @@ fn update_new_session_menu_state(app: &AppHandle) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let new_window = MenuItem::with_id(
         app,
@@ -2993,6 +2995,7 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         true,
         Some("CmdOrCtrl+N"),
     )?;
+    #[cfg(target_os = "macos")]
     let new_session = MenuItem::with_id(
         app,
         MENU_NEW_SESSION_ID,
@@ -3000,6 +3003,18 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         // Startup default: disabled — the first window is the landing.
         new_session_menu_enabled(None),
         Some("CmdOrCtrl+T"),
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let new_session = MenuItem::with_id(
+        app,
+        MENU_NEW_SESSION_ID,
+        "New Session",
+        // Startup default: disabled — the first window is the landing.
+        new_session_menu_enabled(None),
+        // No accelerator: the webview handles Ctrl+T itself (native menu
+        // accelerators are intercepted before the webview sees keys), so
+        // binding it here would double-dispatch new session.
+        None::<&str>,
     )?;
     let add_project = MenuItem::with_id(
         app,
@@ -3046,7 +3061,17 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &PredefinedMenuItem::close_window(app, None)?,
         ],
     )?;
+    #[cfg(target_os = "macos")]
     let help = Submenu::with_items(app, "Help", true, &[])?;
+    #[cfg(not(target_os = "macos"))]
+    let help = Submenu::with_items(
+        app,
+        "Help",
+        true,
+        // About works on every desktop platform.
+        &[&PredefinedMenuItem::about(app, None, None)?],
+    )?;
+    #[cfg(target_os = "macos")]
     let app_menu = Submenu::with_items(
         app,
         app.package_info().name.clone(),
@@ -3062,13 +3087,17 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &PredefinedMenuItem::quit(app, None)?,
         ],
     )?;
+    #[cfg(target_os = "macos")]
     let view = Submenu::with_items(
         app,
         "View",
         true,
         &[&PredefinedMenuItem::fullscreen(app, None)?],
     )?;
-    Menu::with_items(app, &[&app_menu, &file, &edit, &view, &window, &help])
+    #[cfg(target_os = "macos")]
+    return Menu::with_items(app, &[&app_menu, &file, &edit, &view, &window, &help]);
+    #[cfg(not(target_os = "macos"))]
+    return Menu::with_items(app, &[&file, &edit, &window, &help]);
 }
 
 // With a native menu bar installed, macOS wires WKWebView's text-input
@@ -3143,7 +3172,7 @@ fn main() {
     disable_press_and_hold_accents();
 
     let builder = tauri::Builder::default();
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let builder = builder.menu(build_app_menu).on_menu_event(|app, event| {
         match event.id().as_ref() {
             MENU_NEW_WINDOW_ID => {
@@ -3172,9 +3201,17 @@ fn main() {
                     .and_then(|owner| mirror.owner_has_workspace(&owner))
                     .unwrap_or(false);
                 if bound {
-                    let _ = window.eval(
-                        "document.dispatchEvent(new KeyboardEvent('keydown', {key: 't', metaKey: true, bubbles: true, cancelable: true}))",
-                    );
+                    // The webview keydown handler checks metaKey || ctrlKey;
+                    // Windows needs Ctrl so the synthesized event matches the
+                    // key a user would actually press there.
+                    let modifier = if cfg!(target_os = "macos") {
+                        "metaKey"
+                    } else {
+                        "ctrlKey"
+                    };
+                    let _ = window.eval(format!(
+                        "document.dispatchEvent(new KeyboardEvent('keydown', {{key: 't', {modifier}: true, bubbles: true, cancelable: true}}))",
+                    ));
                 }
             }
             MENU_ADD_PROJECT_ID => {
@@ -3815,6 +3852,34 @@ mod multi_window_menu_tests {
         assert!(
             !arm.contains("key: 'n'"),
             "the old ⌘N synthesis must be gone: {arm}"
+        );
+    }
+
+    #[test]
+    fn windows_get_the_native_menu_and_event_wiring() {
+        let source = include_str!("main.rs");
+        let before_menu_fn =
+            section_between(source, "const MENU_ADD_PROJECT_ID", "fn build_app_menu");
+        assert!(
+            before_menu_fn.contains("#[cfg(any(target_os = \"macos\", target_os = \"windows\"))]"),
+            "build_app_menu must compile for Windows too:\n{before_menu_fn}"
+        );
+        let wiring = section_between(
+            source,
+            "let builder = tauri::Builder::default();",
+            ".plugin(tauri_plugin_dialog::init())",
+        );
+        assert!(
+            wiring.contains("#[cfg(any(target_os = \"macos\", target_os = \"windows\"))]"),
+            "the menu and event wiring must not be macOS-only:\n{wiring}"
+        );
+        assert!(
+            wiring.contains("ctrlKey"),
+            "the New Session synthesis must send Ctrl outside macOS:\n{wiring}"
+        );
+        assert!(
+            wiring.contains("open_new_landing_window"),
+            "the New Window arm stays Rust-side on every menu platform:\n{wiring}"
         );
     }
 

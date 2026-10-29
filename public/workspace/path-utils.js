@@ -39,8 +39,16 @@ function joinRoot(root, parts) {
 
 export function normalizeLocalPath(value) {
   if (typeof value !== "string") return "";
-  const { root, parts } = normalizedParts(value.trim());
+  const { root, parts } = normalizedParts(stripWindowsVerbatimPrefix(value.trim()));
   return joinRoot(root, parts);
+}
+
+// Windows verbatim paths (`\\?\C:\...`, from Rust `canonicalize`) must lose
+// their prefix before root parsing, mirroring pi_launch::strip_verbatim_prefix.
+function stripWindowsVerbatimPrefix(value) {
+  if (value.startsWith("\\\\?\\UNC\\")) return `\\\\${value.slice(8)}`;
+  if (value.startsWith("\\\\?\\")) return value.slice(4);
+  return value;
 }
 
 /** Format a local path for sidebar display without changing its filesystem meaning. */

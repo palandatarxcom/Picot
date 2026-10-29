@@ -3,6 +3,7 @@
 
 import { onLocaleChange, t } from "../i18n.js";
 import { createIcon } from "../icons.js";
+import { normalizeLocalPath } from "../workspace/path-utils.js";
 import { renderGroupStatusControl } from "./skills-group-status-control.js";
 
 /**
@@ -364,6 +365,7 @@ export function setupPackageSkillsTab({ container, rpcCommand, showSuccess, show
    * @param {PackageSkillCandidate} candidate
    */
   function renderCandidate(card, candidate) {
+    const canonicalPath = normalizeLocalPath(candidate.canonicalPath);
     return el("div", { class: "skills-skill-row", dataset: { candidate: candidate.name } }, [
       el("div", { class: "skills-skill-info" }, [
         el("div", { class: "skills-skill-name", text: candidate.name }),
@@ -372,9 +374,9 @@ export function setupPackageSkillsTab({ container, rpcCommand, showSuccess, show
           el("code", {
             class: "package-skills-candidate-relative",
             text: candidate.relativePath,
-            title: candidate.canonicalPath,
+            title: canonicalPath,
             aria: {
-              label: `${t("settings.packageSkills.canonicalPath")}: ${candidate.canonicalPath}`,
+              label: `${t("settings.packageSkills.canonicalPath")}: ${canonicalPath}`,
             },
           }),
         ]),
