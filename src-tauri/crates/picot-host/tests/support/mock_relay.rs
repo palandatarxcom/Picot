@@ -256,6 +256,15 @@ struct Inner {
     /// Park client-role sockets after registration: never reading them means
     /// no automatic WS pong, so the client's liveness probes go unanswered.
     client_park: watch::Sender<bool>,
+    /// Hold new client-role sockets before their `connected` notify: the
+    /// daemon never dials a data pipe, so client frames are dropped exactly as
+    /// the relay drops them before the data dial (the early-hello window).
+    attach_gate: watch::Sender<bool>,
+    /// Client frames with no attached data pipe (dropped) or forwarded to one.
+    dropped_client_frames: AtomicU32,
+    forwarded_client_frames: AtomicU32,
+    /// Plaintext `e2ee_hello` frames the mock forwarded to a daemon sink.
+    e2ee_hellos: AtomicU32,
     /// Writer half of the current interactive control socket.
     control: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     control_upgrades: AtomicU32,
@@ -283,6 +292,10 @@ impl MockRelay {
             gate_open: Mutex::new(true),
             silent: Mutex::new(None),
             client_park: watch::channel(false).0,
+            attach_gate: watch::channel(true).0,
+            dropped_client_frames: AtomicU32::new(0),
+            forwarded_client_frames: AtomicU32::new(0),
+            e2ee_hellos: AtomicU32::new(0),
             control: Mutex::new(None),
             control_upgrades: AtomicU32::new(0),
             client_upgrades: AtomicU32::new(0),
@@ -363,6 +376,27 @@ impl MockRelay {
     /// `true`: existing and new client-role sockets stop being read (no pong).
     pub fn set_client_park(&self, park: bool) {
         self.inner.client_park.send_replace(park);
+    }
+    /// `false`: a new client-role socket waits for `true` before the daemon is
+    /// told it exists, so its data pipe stays unattached and client frames are
+    /// dropped — the relay's pre-data-dial behavior, held open by the test.
+    pub fn set_attach_hold(&self, hold: bool) {
+        self.inner.attach_gate.send_replace(!hold);
+    }
+
+    /// Client frames dropped because no data pipe was attached yet.
+    pub fn dropped_client_frames(&self) -> u32 {
+        self.inner.dropped_client_frames.load(Ordering::SeqCst)
+    }
+
+    /// Client frames handed to an attached data pipe.
+    pub fn forwarded_client_frames(&self) -> u32 {
+        self.inner.forwarded_client_frames.load(Ordering::SeqCst)
+    }
+
+    /// Plaintext `e2ee_hello` frames forwarded to a daemon data socket.
+    pub fn e2ee_hellos(&self) -> u32 {
+        self.inner.e2ee_hellos.load(Ordering::SeqCst)
     }
 
     /// Push a raw text frame onto the current control socket.
@@ -621,8 +655,19 @@ async fn client_socket(inner: Arc<Inner>, socket: WebSocket) {
         };
         let Some(Ok(message)) = message else { break };
         let pipe = inner.data_pipes.lock().unwrap().get(&id).cloned();
-        if let Some(pipe) = pipe {
-            let _ = pipe.send(message).await;
+        match pipe {
+            Some(pipe) => {
+                if matches!(&message, Message::Text(text) if text.as_str().contains("\"e2ee_hello\""))
+                {
+                    inner.e2ee_hellos.fetch_add(1, Ordering::SeqCst);
+                }
+                inner.forwarded_client_frames.fetch_add(1, Ordering::SeqCst);
+                let _ = pipe.send(message).await;
+            }
+            // No daemon data socket yet: the relay drops the frame.
+            None => {
+                inner.dropped_client_frames.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
     // Client gone: sever the daemon side and report disconnected.
@@ -646,6 +691,16 @@ async fn data_socket(inner: Arc<Inner>, connection_id: String, socket: WebSocket
         let _ = sink.send(Message::Close(None)).await;
         return;
     };
+    // Held: the dial happened but the pipe stays unattached, so every client
+    // frame is dropped — the relay's pre-attachment loss, held open by the
+    // test instead of lasting a few milliseconds.
+    let mut attach = inner.attach_gate.subscribe();
+    if !*attach.borrow() {
+        tokio::select! {
+            _ = stopped.wait_for(|stop| *stop) => return,
+            _ = attach.wait_for(|open| *open) => {}
+        }
+    }
     let (tx, rx) = mpsc::channel::<Message>(PIPE_CAPACITY);
     inner
         .data_pipes

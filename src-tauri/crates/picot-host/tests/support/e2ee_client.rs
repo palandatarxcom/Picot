@@ -64,12 +64,14 @@ pub fn seal_text(shared: &[u8; 32], text: &str) -> String {
 }
 
 /// Send one encrypted frame.
+#[allow(dead_code)] // shared support: per-target subset usage
 pub async fn send_sealed(socket: &mut MockClientSocket, shared: &[u8; 32], text: &str) {
     socket.send_text(&seal_text(shared, text)).await;
 }
 
 /// Receive the next daemon frame and open it; panics on bad base64, failed
 /// decryption, or non-UTF-8 plaintext (all are daemon contract violations).
+#[allow(dead_code)] // shared support: per-target subset usage
 pub async fn recv_opened(socket: &mut MockClientSocket, shared: &[u8; 32]) -> String {
     let wire = socket.recv_text().await;
     open_wire(shared, &wire)

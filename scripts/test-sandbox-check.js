@@ -72,6 +72,35 @@ try {
       ),
     );
   }
+  // Rust needs its own roots, so it gets its own entry: one sandbox session
+  // whose HOME stays disposable, whose Cargo target/cache live inside that
+  // root, and whose cargo is a handed-off installed executable. The launcher
+  // refuses to be entered twice and refuses to run without kernel isolation.
+  const launcher = resolve("scripts/rust-test-sandbox.sh");
+  const runLauncher = (args, extraEnv = {}) =>
+    spawnSync("/bin/bash", [launcher, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, ...extraEnv },
+    });
+  const selfCheck = runLauncher(["--self-check"]);
+  assert.equal(selfCheck.status, 0, selfCheck.stderr || selfCheck.stdout);
+  for (const field of ["root=", "home=", "pi-agent=", "cargo-target=", "cargo-home=", "cargo="]) {
+    assert.ok(selfCheck.stderr.includes(field), `self-check reports ${field}: ${selfCheck.stderr}`);
+  }
+  assert.match(selfCheck.stderr, /session isolation verified/);
+  const nested = runLauncher(["--self-check"], { PICOT_TEST_SANDBOX_ROOT: fixture });
+  assert.notEqual(nested.status, 0);
+  assert.match(nested.stderr, /nested/);
+  const missing = runLauncher(["--"]);
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /missing command/);
+  const usage = runLauncher(["cargo", "test"]);
+  assert.notEqual(usage.status, 0);
+  assert.match(usage.stderr, /usage/);
+  const unisolated = runLauncher(["--session", "true"]);
+  assert.notEqual(unisolated.status, 0);
+  assert.match(unisolated.stderr, /session marker|kernel isolation/);
+  console.log("PASS: Rust launcher isolates Cargo roots and refuses nested/unsafe use.");
   console.log(
     "PASS: isolated roots; direct, delete, rename, chmod, symlink and child writes denied.",
   );
