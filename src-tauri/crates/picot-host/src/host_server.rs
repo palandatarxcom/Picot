@@ -2164,7 +2164,10 @@ pub(crate) async fn run_session<S, E>(
                         .lock()
                         .ok()
                         .and_then(|slot| slot.clone());
-                    let outcome = match (manager, client_context.as_ref()) {
+                    // Errors carry the approved rejection code when the failure
+                    // is an admission decision; dispatch failures stay legacy.
+                    let outcome: Result<Value, (Option<&'static str>, String)> =
+                        match (manager, client_context.as_ref()) {
                         // D2 device branch (contract 1): a paired device drives
                         // a terminal rooted at its own view's workspace — never
                         // the pairing window's registry binding, which may be a
@@ -2172,22 +2175,33 @@ pub(crate) async fn run_session<S, E>(
                         (Some(manager), Some(context))
                             if context.kind != crate::host_router::ClientKind::Desktop =>
                         {
-                            let root = context
-                                .device
-                                .as_ref()
-                                .and_then(|device| device_view_for(&state, &device.device_id))
-                                .and_then(|view| {
-                                    state.data.workspace_root(&view.workspace_id).ok()
-                                });
-                            match (context.data_plane_owner(), root) {
-                                (Some(owner), Some(root)) => manager.dispatch(
-                                    &crate::window_owner::OwnerId::from_string(owner.to_owned()),
-                                    &root,
-                                    &frame.get("payload").cloned().unwrap_or(Value::Null),
-                                ),
-                                _ => Err(
-                                    "terminal commands require a registered workspace".to_string(),
-                                ),
+                            // Authentication first (unchanged), then the
+                            // approved binding admission of plan §3.
+                            match context.data_plane_owner() {
+                                None => Err((
+                                    None,
+                                    "terminal commands require a paired device".to_string(),
+                                )),
+                                Some(_) => match admit_device_terminal(&state, context, &frame) {
+                                    Ok(admission) => {
+                                        let payload =
+                                            frame.get("payload").cloned().unwrap_or(Value::Null);
+                                        state
+                                            .runtimes
+                                            .with_live_terminal_target(&admission.target, || {
+                                                manager.dispatch(
+                                                    &admission.owner,
+                                                    &admission.root,
+                                                    &payload,
+                                                )
+                                            })
+                                            .map_err(|error| {
+                                                (Some("terminal_runtime_unavailable"), error)
+                                            })
+                                            .and_then(|inner| inner.map_err(|error| (None, error)))
+                                    }
+                                    Err((code, error)) => Err((Some(code), error)),
+                                },
                             }
                         }
                         (Some(manager), Some(context))
@@ -2216,14 +2230,21 @@ pub(crate) async fn run_session<S, E>(
                                 Some(root) => {
                                     let payload =
                                         frame.get("payload").cloned().unwrap_or(Value::Null);
-                                    manager.dispatch(owner, &root, &payload)
+                                    manager
+                                        .dispatch(owner, &root, &payload)
+                                        .map_err(|error| (None, error))
                                 }
-                                None => Err(
-                                    "terminal commands require a registered workspace".to_string(),
-                                ),
+                                None => Err((
+                                    None,
+                                    "terminal commands require a registered workspace"
+                                        .to_string(),
+                                )),
                             }
                         }
-                        _ => Err("terminal transport requires a desktop owner".to_string()),
+                        _ => Err((
+                            None,
+                            "terminal transport requires a desktop owner".to_string(),
+                        )),
                     };
                     let outgoing = match outcome {
                         Ok(mut value) => {
@@ -2235,11 +2256,17 @@ pub(crate) async fn run_session<S, E>(
                             }
                             value
                         }
-                        Err(error) => json!({
-                            "type": "terminal_command_failed",
-                            "requestId": request_id,
-                            "error": error,
-                        }),
+                        Err((code, error)) => {
+                            let mut failed = json!({
+                                "type": "terminal_command_failed",
+                                "requestId": request_id,
+                                "error": error,
+                            });
+                            if let Some(code) = code {
+                                failed["code"] = Value::String(code.to_string());
+                            }
+                            failed
+                        }
                     };
                     if outgoing_tx.send(outbound_message(outgoing, PayloadKind::Response)).is_err() {
                         break;
@@ -2627,7 +2654,7 @@ fn extension_ui_requires_owner(event: &Value) -> bool {
 fn hello_capabilities(context: &HostClientContext) -> Value {
     let desktop = context.kind == crate::host_router::ClientKind::Desktop;
     let navigation = desktop || context.data_plane_owner().is_some();
-    json!({
+    let mut capabilities = json!({
         // `native` describes the HOST (it has native runtimes), not who is
         // asking: a paired device drives the same workspaces. Reporting it as
         // desktop-only made the client hide the whole registry (no workspaces
@@ -2637,6 +2664,148 @@ fn hello_capabilities(context: &HostClientContext) -> Value {
         "git": navigation,
         "terminal": navigation,
         "management": desktop,
+    });
+    if !desktop {
+        // Approved revision (plan 2026-11-03 §1): Remote terminal commands are
+        // admitted only against the page's workspace identity and one exact
+        // live runtime, on every command family. Only this server — which
+        // enforces the whole contract — may advertise it; a boolean `terminal`
+        // face or a protocol version proves nothing.
+        capabilities["terminalBindingVersion"] = json!(TERMINAL_BINDING_VERSION);
+    }
+    capabilities
+}
+
+/// The approved Remote terminal binding revision. Bumping it is a wire change.
+const TERMINAL_BINDING_VERSION: u64 = 1;
+
+/// Largest integer JavaScript represents exactly (`Number.MAX_SAFE_INTEGER`):
+/// a generation above it cannot round-trip through the client unchanged.
+const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Approved Remote terminal binding (plan 2026-11-03 §3): the page's workspace
+/// identity plus the canonical bootstrap target's session/instance. Owner,
+/// filesystem root, and workspace registration stay server-derived.
+struct TerminalBinding {
+    workspace_id: String,
+    workspace_generation: u64,
+    session_id: String,
+    instance_id: String,
+}
+
+/// A validated admission: everything `TerminalManager::dispatch` needs, taken
+/// from one device-view snapshot and one exact runtime target.
+struct DeviceTerminalAdmission {
+    owner: crate::window_owner::OwnerId,
+    root: std::path::PathBuf,
+    target: RuntimeTarget,
+}
+
+/// Read the approved binding fields: absent means a legacy client, present but
+/// The four binding fields the approved contract requires (plan §3).
+const TERMINAL_BINDING_FIELDS: [&str; 4] = [
+    "workspaceId",
+    "sessionId",
+    "instanceId",
+    "workspaceGeneration",
+];
+
+/// Read the approved binding fields. Precedence is part of the contract
+/// (authentication → schema → view/root → runtime), and schema is two steps: a
+/// *missing* field is a legacy frame (`terminal_protocol_unsupported`) whatever
+/// the supplied fields look like, so presence is settled before any type or
+/// range check.
+fn terminal_binding_from_frame(frame: &Value) -> Result<TerminalBinding, (&'static str, String)> {
+    if let Some(missing) = TERMINAL_BINDING_FIELDS
+        .into_iter()
+        .find(|field| frame.get(*field).is_none())
+    {
+        return Err((
+            "terminal_protocol_unsupported",
+            format!("terminal binding field {missing} is required"),
+        ));
+    }
+    let text = |field: &'static str| -> Result<String, (&'static str, String)> {
+        match frame.get(field) {
+            Some(Value::String(value)) if !value.is_empty() => Ok(value.clone()),
+            _ => Err((
+                "terminal_binding_invalid",
+                format!("terminal binding field {field} must be a nonempty string"),
+            )),
+        }
+    };
+    let workspace_id = text("workspaceId")?;
+    let session_id = text("sessionId")?;
+    let instance_id = text("instanceId")?;
+    let workspace_generation = match frame.get("workspaceGeneration").and_then(Value::as_u64) {
+        Some(value) if value <= JS_MAX_SAFE_INTEGER => value,
+        _ => {
+            return Err((
+                "terminal_binding_invalid",
+                "terminal binding field workspaceGeneration must be a nonnegative safe integer"
+                    .to_string(),
+            ))
+        }
+    };
+    Ok(TerminalBinding {
+        workspace_id,
+        workspace_generation,
+        session_id,
+        instance_id,
+    })
+}
+
+/// Approved admission order (plan §3): schema → one device-view snapshot
+/// (workspace + generation, then the registered root from that same snapshot)
+/// → the exact live runtime. The caller runs `dispatch` under the runtime
+/// admission guard, so a stop that wins the guard makes every later command
+/// here fail instead of mutating terminal state.
+fn admit_device_terminal(
+    state: &HostState,
+    context: &HostClientContext,
+    frame: &Value,
+) -> Result<DeviceTerminalAdmission, (&'static str, String)> {
+    let binding = terminal_binding_from_frame(frame)?;
+    let device = context.device.as_ref().ok_or((
+        "terminal_binding_mismatch",
+        "terminal commands require an authenticated device".to_string(),
+    ))?;
+    // One snapshot: the root is resolved from the same view that was compared,
+    // never from a second read.
+    let view = device_view_for(state, &device.device_id).ok_or((
+        "terminal_binding_mismatch",
+        "the device has no workspace view yet".to_string(),
+    ))?;
+    if view.workspace_id != binding.workspace_id || view.generation != binding.workspace_generation
+    {
+        return Err((
+            "terminal_binding_mismatch",
+            "the page workspace binding no longer matches the device view".to_string(),
+        ));
+    }
+    let root = state.data.workspace_root(&view.workspace_id).map_err(|_| {
+        (
+            "terminal_binding_mismatch",
+            "the page workspace is not registered".to_string(),
+        )
+    })?;
+    Ok(DeviceTerminalAdmission {
+        owner: crate::window_owner::OwnerId::from_string(device.owner_id.clone()),
+        root,
+        // The expected target is built from the *page's* verified values, never
+        // from the live registry entry (B1): inheriting the runtime's generation
+        // here would silently accept a same-instance generation rebind, because
+        // the guard's exact comparison would then compare the live value with
+        // itself. Owner stays server-derived; workspace, session, instance and
+        // generation are the page's captured binding. The admission guard
+        // resolves the exact runtime by this instance and rejects any drift.
+        target: RuntimeTarget {
+            workspace_id: binding.workspace_id,
+            session_id: binding.session_id,
+            instance_id: binding.instance_id,
+            owner_id: Some(device.owner_id.clone()),
+            workspace_generation: binding.workspace_generation,
+        },
     })
 }
 

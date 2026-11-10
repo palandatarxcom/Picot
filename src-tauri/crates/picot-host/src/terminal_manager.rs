@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -31,6 +33,16 @@ const INITIAL_ROWS: u16 = 24;
 const READ_BUF_BYTES: usize = 8 * 1024;
 const CHECKPOINT_MAX_BYTES: usize = 2 * 1024 * 1024;
 const INPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// How long one admitted PTY input may spend in the write path before the
+/// command fails. The runtime admission guard is held across `dispatch`
+/// (plan 2026-11-03 §5), so this bound is what stops one wedged PTY input
+/// buffer from stalling every runtime's stop, crash and removal admission.
+const INPUT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Queued-but-unwritten inputs allowed per terminal. Small on purpose: a full
+/// queue is reported as backpressure instead of buffering keystrokes forever.
+const INPUT_QUEUE_DEPTH: usize = 2;
 
 /// Delivers a `terminal_event` frame to the current authenticated owner client.
 /// HostServer installs this sink and applies owner filtering before delivery.
@@ -56,10 +68,66 @@ struct LiveTerminal {
     generation: u64,
     profile_id: String,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    input: PtyInput,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     #[cfg(windows)]
     job: Option<windows_job::JobHandle>,
+}
+
+/// PTY input path. The blocking `write_all` runs on the terminal's own writer
+/// thread, so `dispatch` can bound how long it waits on a full input buffer
+/// instead of holding the runtime admission guard for as long as the child
+/// refuses to read (plan §5, R5). Bytes are never dropped silently: a wedged
+/// PTY reaches the caller as an explicit `terminal_input` failure.
+/// One queued write: the bytes plus the channel its outcome is reported on.
+type WriteJob = (Vec<u8>, SyncSender<Result<(), String>>);
+
+#[derive(Clone)]
+struct PtyInput {
+    jobs: SyncSender<WriteJob>,
+}
+
+impl PtyInput {
+    fn spawn(mut writer: Box<dyn Write + Send>) -> Self {
+        let (jobs, queue) =
+            sync_channel::<(Vec<u8>, SyncSender<Result<(), String>>)>(INPUT_QUEUE_DEPTH);
+        // One thread per live terminal, bounded by the terminal count; it exits
+        // when the last handle drops and the queue closes.
+        std::thread::spawn(move || {
+            for (bytes, done) in queue {
+                let result = writer
+                    .write_all(&bytes)
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| format!("terminal write failed: {error}"));
+                // A caller that already timed out is gone; the bytes were still
+                // delivered, which the approved admission contract allows.
+                let _ = done.send(result);
+            }
+        });
+        Self { jobs }
+    }
+
+    /// Bounded enqueue plus bounded completion: both halves share one deadline,
+    /// so a wedged PTY cannot extend a single `terminal_input`.
+    fn write(&self, bytes: Vec<u8>) -> Result<(), String> {
+        let (done, completed) = sync_channel::<Result<(), String>>(1);
+        match self.jobs.try_send((bytes, done)) {
+            Ok(()) => {}
+            // Both outcomes are explicit failures, never a silent drop: a full
+            // queue means the PTY is not draining, a closed queue means the
+            // writer thread is gone with the terminal.
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err("terminal input was not accepted by the pty".to_string())
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err("terminal is not running".to_string())
+            }
+        }
+        match completed.recv_timeout(INPUT_WRITE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err("terminal write timed out".to_string()),
+        }
+    }
 }
 
 impl TerminalManager {
@@ -291,19 +359,19 @@ impl TerminalManager {
             .registry
             .require_running(&key, &terminal_id, generation)
             .map_err(err_str_owned)?;
-        let mut live = self.inner.live.lock().expect("live lock");
-        let lt = live
-            .get_mut(&terminal_id)
-            .ok_or_else(|| "terminal is not running".to_string())?;
-        if lt.generation != generation {
-            return Err(err_str_owned(TerminalError::StaleGeneration));
-        }
-        lt.writer
-            .write_all(&bytes)
-            .map_err(|e| format!("terminal write failed: {e}"))?;
-        lt.writer
-            .flush()
-            .map_err(|e| format!("terminal flush failed: {e}"))?;
+        let input = {
+            // Clone the bounded writer handle and release the map lock: other
+            // terminals must not wait behind one wedged input buffer.
+            let live = self.inner.live.lock().expect("live lock");
+            let lt = live
+                .get(&terminal_id)
+                .ok_or_else(|| "terminal is not running".to_string())?;
+            if lt.generation != generation {
+                return Err(err_str_owned(TerminalError::StaleGeneration));
+            }
+            lt.input.clone()
+        };
+        input.write(bytes)?;
         Ok(json!({ "type": "terminal_input_acked", "terminalId": terminal_id }))
     }
 
@@ -649,7 +717,7 @@ impl TerminalManager {
                 generation,
                 profile_id,
                 master,
-                writer,
+                input: PtyInput::spawn(writer),
                 child: Some(child),
                 #[cfg(windows)]
                 job,
@@ -1153,6 +1221,138 @@ fn err_str_owned(err: TerminalError) -> String {
     err_str(err).to_string()
 }
 
+/// A PTY whose child never reads: `write_all` blocks, which is the shape that
+/// used to hold the runtime admission guard (plan §5, R5). `Barrier` reports the
+/// blocking write by channel so a test can start a stop while the writer is
+/// provably still inside `write`, instead of sleeping and hoping.
+#[cfg(test)]
+enum WedgedWriter {
+    Silent,
+    Barrier {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    },
+}
+
+#[cfg(test)]
+impl Write for WedgedWriter {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        let Self::Barrier { entered, release } = self else {
+            std::thread::sleep(Duration::from_secs(60));
+            return Ok(0);
+        };
+        let _ = entered.send(());
+        // Bounded so a test that never releases cannot hang the suite.
+        let _ = release
+            .get_mut()
+            .map(|release| release.recv_timeout(Duration::from_secs(30)));
+        Ok(0)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The test side of [`WedgedWriter::Barrier`]: waits for the writer to enter its
+/// blocking write, then releases it.
+#[cfg(test)]
+pub(crate) struct WedgedHandles {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+impl WedgedHandles {
+    pub(crate) fn wait_entered(&self) -> bool {
+        self.entered.recv_timeout(Duration::from_secs(10)).is_ok()
+    }
+
+    pub(crate) fn release(&self) {
+        let _ = self.release.send(());
+    }
+}
+
+/// Fixture shared with the runtime-admission suite: one running terminal whose
+/// input path cannot drain, so a bounded `terminal_input` and a stop that
+/// completes despite it can both be observed.
+#[cfg(test)]
+pub(crate) fn wedged_input_fixture() -> (TerminalManager, OwnerId, PathBuf, String, u64) {
+    wedged_fixture(WedgedWriter::Silent)
+}
+
+/// The same fixture with a writer that reports entering its blocking write, so
+/// the admission test can start the stop at that exact instant.
+#[cfg(test)]
+pub(crate) fn wedged_input_fixture_with_barrier() -> (
+    (TerminalManager, OwnerId, PathBuf, String, u64),
+    WedgedHandles,
+) {
+    let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+    let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+    let fixture = wedged_fixture(WedgedWriter::Barrier {
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+    });
+    (fixture, WedgedHandles { entered, release })
+}
+
+#[cfg(test)]
+fn wedged_fixture(writer: WedgedWriter) -> (TerminalManager, OwnerId, PathBuf, String, u64) {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let manager = TerminalManager::new(
+        TerminalRegistry::new(15),
+        TerminalStateStore::new(state_dir),
+    );
+    let owner = crate::window_owner::WindowOwnerRegistry::default()
+        .create_owner(
+            "t-wedged".to_string(),
+            PathBuf::from("/ws"),
+            9000,
+            "http://127.0.0.1:9000".to_string(),
+        )
+        .expect("owner")
+        .0;
+    let key = TerminalKey {
+        owner: owner.clone(),
+        workspace_root: PathBuf::from("/ws"),
+    };
+    let reservation = manager
+        .inner
+        .registry
+        .reserve_tab_with_profile(&key, "default", "Terminal".to_string())
+        .unwrap();
+    manager
+        .inner
+        .registry
+        .commit_running(&key, &reservation.terminal_id, reservation.generation)
+        .unwrap();
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("test PTY");
+    manager.inner.live.lock().unwrap().insert(
+        reservation.terminal_id.clone(),
+        LiveTerminal {
+            owner: owner.clone(),
+            workspace_root: PathBuf::from("/ws"),
+            generation: reservation.generation,
+            profile_id: "default".to_string(),
+            master: pair.master,
+            input: PtyInput::spawn(Box::new(writer)),
+            child: None,
+            #[cfg(windows)]
+            job: None,
+        },
+    );
+    (
+        manager,
+        owner,
+        PathBuf::from("/ws"),
+        reservation.terminal_id,
+        reservation.generation,
+    )
+}
+
 fn label_for_profile(profile_id: &str) -> String {
     match profile_id {
         "git-bash" => "Git Bash".to_string(),
@@ -1341,7 +1541,7 @@ mod tests {
                 generation: replacement.generation,
                 profile_id: "default".to_string(),
                 master: pair.master,
-                writer,
+                input: PtyInput::spawn(writer),
                 child: None,
                 #[cfg(windows)]
                 job: None,
@@ -1455,6 +1655,35 @@ mod tests {
         assert_eq!(listed["panelHeightPx"], 320);
         assert_eq!(listed["tabs"][0]["terminalId"], "restored-0");
         assert_eq!(listed["tabs"][1]["terminalId"], "restored-1");
+    }
+
+    /// R5: `terminal_input` on a PTY that never drains fails inside the bounded
+    /// write deadline instead of blocking the caller (and the runtime admission
+    /// guard it holds) forever.
+    #[test]
+    fn terminal_input_on_a_wedged_pty_fails_within_the_bound() {
+        let (mgr, owner, root, terminal_id, generation) = wedged_input_fixture();
+        let payload = json!({
+            "type": "terminal_input",
+            "terminalId": terminal_id,
+            "generation": generation,
+            "dataBase64": BASE64.encode(b"printf 'never runs'\n"),
+        });
+        let started = Instant::now();
+        let outcome = mgr.dispatch(&owner, &root, &payload);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome.unwrap_err(), "terminal write timed out");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a wedged PTY held the call for {elapsed:?}"
+        );
+        // The failure is explicit and repeatable, never a silent drop or a
+        // queued keystroke that might land minutes later.
+        let again = mgr.dispatch(&owner, &root, &payload);
+        assert!(
+            again.is_err(),
+            "a wedged PTY must keep failing, not swallow input"
+        );
     }
 
     #[test]

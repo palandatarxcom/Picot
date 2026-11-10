@@ -204,6 +204,10 @@ struct ManagedRuntime {
     session_file: Arc<Mutex<Option<PathBuf>>>,
 }
 
+/// Test barrier invoked from `stop` after its tombstone (see `stop_barrier`).
+#[cfg(test)]
+type StopBarrier = Arc<dyn Fn(&RuntimeTarget) + Send + Sync>;
+
 struct NativePiManagerInner {
     coordinator: Mutex<RuntimeCoordinator>,
     /// P1 adapter boundary: native callers currently provide RuntimeTarget only.
@@ -221,6 +225,21 @@ struct NativePiManagerInner {
     /// identity makes repeated stop a no-op without allowing stale stops to
     /// affect a replacement using the same instance id.
     closing: Mutex<HashMap<String, RuntimeTarget>>,
+    /// Linearizes terminal admission against runtime loss (stop, crash,
+    /// removal). Lock order: this guard first, then `closing`, `runtimes`,
+    /// `coordinator` — no path acquires it while holding one of those, and
+    /// `with_live_terminal_target` never holds two of them at once.
+    admission: Mutex<()>,
+    /// Test barrier that runs after the stop tombstone and before process
+    /// cleanup: the only window in which a runtime is closing *and* still
+    /// registered, which is exactly the shape admission must reject.
+    #[cfg(test)]
+    stop_barrier: Mutex<Option<StopBarrier>>,
+    /// Test barrier that runs in `crash_and_remove` after it captured the
+    /// current identity, so a test can prove capture, crash and removal are one
+    /// admission: nothing can rebind the identity while it is parked there.
+    #[cfg(test)]
+    crash_barrier: Mutex<Option<CrashBarrier>>,
     cleanup_trace: Mutex<Vec<(String, NativeCleanupStage)>>,
     revoked_owners: Mutex<HashMap<String, u64>>,
     ephemeral_registry: Mutex<Option<Arc<EphemeralRegistry>>>,
@@ -244,12 +263,33 @@ pub struct NativePiManager {
     inner: Arc<NativePiManagerInner>,
 }
 
-fn remove_closed_runtime(inner: &NativePiManagerInner, instance_id: &str) {
+/// The registry entry's current identity for an instance, if any.
+fn live_target(inner: &NativePiManagerInner, instance_id: &str) -> Option<RuntimeTarget> {
+    inner
+        .runtimes
+        .lock()
+        .ok()?
+        .get(instance_id)
+        .and_then(|runtime| runtime.target.lock().ok().map(|target| target.clone()))
+}
+
+/// Remove an exiting runtime, under the caller's admission and only for the
+/// exact identity it observed (plan §5, B2).
+///
+/// The identity check matters because a rebind may have moved generation, owner
+/// or session between the exit and this removal: deleting by instance key alone
+/// could remove a runtime some page still legitimately holds. Anything else
+/// means the entry is already gone (another path removed it) or its identity
+/// changed, and either way this removal has nothing to do.
+fn remove_closed_runtime(inner: &NativePiManagerInner, expected: &RuntimeTarget) {
+    if live_target(inner, &expected.instance_id).as_ref() != Some(expected) {
+        return;
+    }
     let runtime = inner
         .runtimes
         .lock()
         .ok()
-        .and_then(|mut runtimes| runtimes.remove(instance_id));
+        .and_then(|mut runtimes| runtimes.remove(&expected.instance_id));
     let Some(mut runtime) = runtime else {
         return;
     };
@@ -272,11 +312,38 @@ fn remove_closed_runtime(inner: &NativePiManagerInner, instance_id: &str) {
         }
     }
     if let Ok(mut pending_ui) = inner.pending_ui.lock() {
-        pending_ui.remove(instance_id);
+        pending_ui.remove(&expected.instance_id);
     }
 }
 
-fn emit_runtime_crashed(
+/// Attribute a process exit to the runtime's *current* identity and remove it.
+///
+/// The event pump captures a target when it starts; a rebind (generation, owner,
+/// session) makes that capture stale while the process — and the registry entry
+/// — stay the same. Identity capture, crash attribution and removal therefore
+/// share one admission (plan §5, B2): a rebind either lands before the capture,
+/// so this exit belongs to the rebound identity, or after the removal, and then
+/// it finds nothing to revive. Split across admissions, a rebind landing between
+/// them makes the crash and the removal both refuse, and a dead runtime stays
+/// registered and admitted.
+fn crash_and_remove(inner: &Arc<NativePiManagerInner>, instance_id: &str) {
+    let Ok(_admission) = inner.admission.lock() else {
+        return;
+    };
+    let Some(current) = live_target(inner, instance_id) else {
+        return;
+    };
+    #[cfg(test)]
+    hold_crash_barrier(inner, &current);
+    mark_crashed(inner, &current, "runtime_crashed");
+    remove_closed_runtime(inner, &current);
+}
+
+/// The crash half of [`crash_and_remove`], under the caller's admission: taking
+/// that guard before the state change means no terminal dispatch is admitted
+/// after the crash was observed, even though the instance stays in the registry
+/// until removal.
+fn mark_crashed(
     inner: &Arc<NativePiManagerInner>,
     expected_target: &RuntimeTarget,
     reason: impl Into<String>,
@@ -342,6 +409,38 @@ fn emit_runtime_crashed(
     }
 }
 
+/// Crash an exactly-identified runtime without removing it, under its own
+/// admission. Only the crate's tests call this; the production exit path is
+/// [`crash_and_remove`], which never splits capture from removal.
+#[cfg(test)]
+fn emit_runtime_crashed(
+    inner: &Arc<NativePiManagerInner>,
+    expected_target: &RuntimeTarget,
+    reason: impl Into<String>,
+) {
+    let Ok(_admission) = inner.admission.lock() else {
+        return;
+    };
+    mark_crashed(inner, expected_target, reason);
+}
+
+/// Test barrier invoked from `crash_and_remove` once it captured the current
+/// identity, still inside the admission (see `crash_barrier`).
+#[cfg(test)]
+type CrashBarrier = Arc<dyn Fn(&RuntimeTarget) + Send + Sync>;
+
+#[cfg(test)]
+fn hold_crash_barrier(inner: &NativePiManagerInner, target: &RuntimeTarget) {
+    let barrier = inner
+        .crash_barrier
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(barrier) = barrier {
+        barrier(target);
+    }
+}
+
 impl NativePiManager {
     pub fn new(idempotency_capacity: usize) -> Self {
         let (events, _) = broadcast::channel(1024);
@@ -357,6 +456,11 @@ impl NativePiManager {
                 events,
                 pending_ui: Mutex::new(HashMap::new()),
                 closing: Mutex::new(HashMap::new()),
+                admission: Mutex::new(()),
+                #[cfg(test)]
+                stop_barrier: Mutex::new(None),
+                #[cfg(test)]
+                crash_barrier: Mutex::new(None),
                 cleanup_trace: Mutex::new(Vec::new()),
                 revoked_owners: Mutex::new(HashMap::new()),
                 ephemeral_registry: Mutex::new(None),
@@ -525,8 +629,7 @@ impl NativePiManager {
                         frame = bridge.next_frame() => frame,
                         _ = poll.tick() => {
                             if observer.as_mut().and_then(|process| process.try_wait().ok()).flatten().is_some() {
-                                emit_runtime_crashed(&inner, &target, "runtime_crashed");
-                                remove_closed_runtime(&inner, &target.instance_id);
+                                crash_and_remove(&inner, &target.instance_id);
                                 return;
                             }
                             continue;
@@ -536,8 +639,7 @@ impl NativePiManager {
                     bridge.next_frame().await
                 };
                 let Some(frame) = frame else {
-                    emit_runtime_crashed(&inner, &target, "runtime_crashed");
-                    remove_closed_runtime(&inner, &target.instance_id);
+                    crash_and_remove(&inner, &target.instance_id);
                     return;
                 };
                 let current_target = inner.runtimes.lock().ok().and_then(|runtimes| {
@@ -561,8 +663,7 @@ impl NativePiManager {
                         "message": message
                     }),
                     BridgeFrame::TransportError(_) => {
-                        emit_runtime_crashed(&inner, &current_target, "runtime_crashed");
-                        remove_closed_runtime(&inner, &current_target.instance_id);
+                        crash_and_remove(&inner, &target.instance_id);
                         return;
                     }
                 };
@@ -1069,8 +1170,24 @@ impl NativePiManager {
             }
         }
 
-        // Close admission before touching operations or the child.
+        // Close admission before touching operations or the child. The same
+        // guard serializes this with terminal admission, so a dispatch is either
+        // already inside (and finishes) or rejected from here on.
         let already_closing = {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .map_err(|_| "Runtime admission lock poisoned".to_string())?;
+            // Re-verify the exact identity inside the guard (plan §5, B2): a
+            // rebind may have landed between the validation above and this
+            // tombstone, and closing admission for an identity that no longer
+            // exists would stop a runtime nobody asked to stop.
+            if live_target(&self.inner, &target.instance_id)
+                .is_some_and(|current| current != *target)
+            {
+                return Err("Runtime stop rejected: identity changed".to_string());
+            }
             let mut closing = self
                 .inner
                 .closing
@@ -1090,6 +1207,8 @@ impl NativePiManager {
             return Ok(());
         }
         self.record_cleanup(target, NativeCleanupStage::AdmissionClosed);
+        #[cfg(test)]
+        self.hold_stop_after_admission(target);
 
         // Preserve operation records, but make unresolved work explicitly
         // indeterminate so no completed response can be replayed as success.
@@ -1188,6 +1307,106 @@ impl NativePiManager {
             .map_err(|_| "Runtime stop registry lock poisoned".to_string())?
             .get(&target.instance_id)
             .is_some_and(|current| current == target))
+    }
+
+    /// Run one synchronous terminal dispatch only while `expected` is the exact
+    /// live runtime and its admission is open (plan 2026-11-03 §5).
+    ///
+    /// The guard is the same lock `stop` takes to record its closing tombstone,
+    /// so exactly one order is possible: either the dispatch admits first and
+    /// its synchronous mutation completes before stop closes admission, or
+    /// closing/removal is already recorded and the command is rejected before it
+    /// touches terminal state. A check-then-dispatch caller would leave a window
+    /// for the runtime to stop between the two.
+    ///
+    /// Limits (approved): the guarantee starts at host-observed closing, not at
+    /// physical process death; admitted bytes are not revoked; the full PTY
+    /// process execution is not serialized. The closure must be synchronous —
+    /// no await may run while the guard is held.
+    pub fn with_live_terminal_target<T>(
+        &self,
+        expected: &RuntimeTarget,
+        dispatch: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let _admission = self
+            .inner
+            .admission
+            .lock()
+            .map_err(|_| "Runtime admission lock poisoned".to_string())?;
+        if self.is_closing(expected)? {
+            return Err("the page runtime is stopping".to_string());
+        }
+        let live = self
+            .inner
+            .runtimes
+            .lock()
+            .map_err(|_| "Native runtime registry lock poisoned".to_string())?
+            .get(&expected.instance_id)
+            .and_then(|runtime| runtime.target.lock().ok().map(|target| target.clone()));
+        if live.as_ref() != Some(expected) {
+            return Err("the page runtime is not running".to_string());
+        }
+        let (registered, state) = {
+            let coordinator = self
+                .inner
+                .coordinator
+                .lock()
+                .map_err(|_| "Runtime coordinator lock poisoned".to_string())?;
+            // Identity first: `state_of` keys on the instance id alone, so a
+            // rebind would otherwise report the replacement's state as this
+            // target's liveness.
+            (
+                coordinator.validate(expected).is_ok(),
+                coordinator.state_of(expected),
+            )
+        };
+        if !registered {
+            return Err("the page runtime is not registered".to_string());
+        }
+        if !matches!(
+            state,
+            Some(
+                RuntimeState::Starting
+                    | RuntimeState::Trusting
+                    | RuntimeState::Ready
+                    | RuntimeState::Working
+                    | RuntimeState::Idle
+                    | RuntimeState::Suspended
+            )
+        ) {
+            return Err("the page runtime is not live".to_string());
+        }
+        Ok(dispatch())
+    }
+
+    /// Test seam: hold one stop inside the window where its tombstone is
+    /// recorded but the runtime is still registered (plan §5 closing-but-
+    /// registered evidence). `stop` calls the barrier synchronously, so a test
+    /// blocks stop at exactly that boundary without timing sleeps.
+    #[cfg(test)]
+    fn hold_stop_after_admission(&self, target: &RuntimeTarget) {
+        let barrier = self
+            .inner
+            .stop_barrier
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(barrier) = barrier {
+            barrier(target);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_stop_barrier(&self, barrier: Option<StopBarrier>) {
+        if let Ok(mut slot) = self.inner.stop_barrier.lock() {
+            *slot = barrier;
+        }
+    }
+    #[cfg(test)]
+    fn set_crash_barrier(&self, barrier: Option<CrashBarrier>) {
+        if let Ok(mut slot) = self.inner.crash_barrier.lock() {
+            *slot = barrier;
+        }
     }
 
     pub fn cleanup_trace(&self) -> Vec<(String, NativeCleanupStage)> {
@@ -1412,6 +1631,13 @@ impl NativePiManager {
         )) {
             return false;
         }
+        // Identity mutation shares the terminal admission guard (plan §5, B2):
+        // a dispatch admitted under the old identity must finish before the
+        // owner/generation the page captured can change, and a stop that won the
+        // guard must not be revived by this rebind.
+        let Ok(_admission) = self.inner.admission.lock() else {
+            return false;
+        };
         let current = {
             let Ok(runtimes) = self.inner.runtimes.lock() else {
                 return false;
@@ -1431,6 +1657,9 @@ impl NativePiManager {
             };
             target.clone()
         };
+        if self.is_closing(&current).unwrap_or(true) {
+            return false;
+        }
         // Coordinator record first (identity-validated), then mirror into the
         // runtimes map — the same dual bookkeeping as bind_session_id.
         let formal = {
@@ -1450,6 +1679,7 @@ impl NativePiManager {
                 *target = formal.clone();
             }
         }
+        drop(runtimes);
         // The reattaching owner now holds this runtime's secret generation,
         // exactly as a spawn would have recorded it.
         if let Ok(mut secrets) = self.inner.secret_generations.lock() {
@@ -1511,6 +1741,12 @@ impl NativePiManager {
         session_id: &str,
         generation: u64,
     ) -> bool {
+        // Identity mutation shares the terminal admission guard (plan §5, B2).
+        // Segment order under it: closing → release, runtimes → release,
+        // coordinator → release, runtimes mirror → release. Never nested.
+        let Ok(_admission) = self.inner.admission.lock() else {
+            return false;
+        };
         // Read the live identity first (runtimes map and coordinator are in
         // sync here; validate below must see the pre-rebind generation).
         let current = {
@@ -1530,6 +1766,11 @@ impl NativePiManager {
             };
             target.clone()
         };
+        // A stop that already closed admission is final: rebinding the identity
+        // it closed would hand the stopped targets' pages a live-looking runtime.
+        if self.is_closing(&current).unwrap_or(true) {
+            return false;
+        }
         // Coordinator record first (identity-validated), then mirror into the
         // runtimes map — same dual bookkeeping as bind_session_id.
         let formal = {
@@ -1695,6 +1936,19 @@ impl NativePiManager {
     ) -> Result<RuntimeTarget, String> {
         if !temporary.session_id.starts_with("temporary-") {
             return Ok(temporary.clone());
+        }
+        // Session identity is an admission identity component (plan §5, B2):
+        // the rebind runs in the same guard as terminal dispatch.
+        let _admission = self
+            .inner
+            .admission
+            .lock()
+            .map_err(|_| "Runtime admission lock poisoned".to_string())?;
+        if self
+            .is_closing(temporary)
+            .map_err(|_| "Runtime stop registry lock poisoned".to_string())?
+        {
+            return Err("Native runtime is stopping".to_string());
         }
         let mut coordinator = self
             .inner
@@ -1906,6 +2160,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::Arc;
     use std::time::Duration;
 
     // ── P1.11 real-Pi lifecycle smoke ────────────────────────────────
@@ -2190,6 +2445,498 @@ mod tests {
             "a crashed child must not remain reusable"
         );
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    // ── Terminal admission guard (plan 2026-11-03 §5) ───────────────
+    // Barriers, not sleeps: every ordering below is decided by a channel
+    // handshake, so a passing test proves the lock order, not the timing.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_admission_rejects_an_unregistered_target() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let outcome = manager.with_live_terminal_target(&target, || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            outcome.is_err(),
+            "an unregistered runtime is never admitted"
+        );
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_admission_rejects_a_foreign_owner() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let expected = RuntimeTarget::with_owner("ws", "s", "instance-a", "someone-else", 1);
+        assert!(
+            manager.with_live_terminal_target(&expected, || ()).is_err(),
+            "the owner is server-derived and part of the identity"
+        );
+        // The exact target is admitted, so the rejection above is not a blanket
+        // refusal.
+        assert!(manager.with_live_terminal_target(&target, || ()).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_admission_rejects_a_stopped_or_closing_target() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        manager.stop(&target).unwrap();
+        assert!(
+            manager.with_live_terminal_target(&target, || ()).is_err(),
+            "a stopped runtime is not live"
+        );
+        // `stop_first_closing_but_registered_rejects_admission_and_rebind` covers
+        // the closing-but-registered window through the real stop path; a
+        // re-registration here would prove tombstone retention only.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_admission_rejects_a_crashed_target_that_is_still_registered() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        super::emit_runtime_crashed(&manager.inner, &target, "runtime_crashed");
+        // Crash keeps the registry entry; only the coordinator state changes.
+        assert!(manager
+            .inner
+            .runtimes
+            .lock()
+            .unwrap()
+            .contains_key(&target.instance_id));
+        assert!(manager.with_live_terminal_target(&target, || ()).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_admission_rejects_a_replacement_instance_in_the_same_session() {
+        let manager = NativePiManager::in_memory(8);
+        let first = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(first.clone()).unwrap();
+        manager.stop(&first).unwrap();
+        let second = RuntimeTarget::with_owner("ws", "s", "instance-b", "owner", 1);
+        let _replacement = manager.register_in_memory(second.clone()).unwrap();
+        assert!(manager.with_live_terminal_target(&first, || ()).is_err());
+        assert!(manager.with_live_terminal_target(&second, || ()).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_dispatch_wins_the_guard_then_stop_closes_admission() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let dispatching = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            let log = std::sync::Arc::clone(&log);
+            move || {
+                manager
+                    .with_live_terminal_target(&target, || {
+                        log.lock().unwrap().push("dispatch");
+                        inside_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap();
+            }
+        });
+        inside_rx.recv().unwrap();
+        // Stop cannot close admission while the dispatch is inside the guard.
+        let stopping = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            let log = std::sync::Arc::clone(&log);
+            move || {
+                manager.stop(&target).unwrap();
+                log.lock().unwrap().push("stop");
+            }
+        });
+        // One admitted command, then the tombstone: the order is a property of
+        // the guard, not of the scheduling above.
+        release_tx.send(()).unwrap();
+        dispatching.join().unwrap();
+        stopping.join().unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["dispatch", "stop"]);
+        assert!(manager.with_live_terminal_target(&target, || ()).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_wins_the_guard_and_the_mutation_never_runs() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            let log = std::sync::Arc::clone(&log);
+            move || {
+                manager
+                    .with_live_terminal_target(&target, || {
+                        log.lock().unwrap().push("first");
+                        inside_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap();
+            }
+        });
+        inside_rx.recv().unwrap();
+        let stopping = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            move || {
+                manager.stop(&target).unwrap();
+            }
+        });
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        stopping.join().unwrap();
+        assert!(manager
+            .with_live_terminal_target(&target, || log.lock().unwrap().push("second"))
+            .is_err());
+        assert_eq!(*log.lock().unwrap(), vec!["first"]);
+    }
+
+    /// B2 (event pump identity): a rebind that lands between spawn and exit must
+    /// be attributed to the identity the host currently publishes, and the
+    /// removal must be for that same identity — not for the target captured when
+    /// the pump started. Stale-capture case only; the narrower window inside
+    /// `crash_and_remove` is covered by
+    /// `crash_and_remove_holds_admission_across_identity_capture_and_removal`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exit_after_a_rebind_is_attributed_to_the_live_identity() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let mut events = manager.subscribe();
+        let mut fake = manager.register_in_memory(target.clone()).unwrap();
+        // The resident runtime is rebound while its process is still alive.
+        assert!(manager.rebind_owner_generation("owner", "s", 2));
+        let rebound = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 2);
+
+        fake.close().await;
+        let crashed = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the pump reports the exit")
+            .expect("event channel alive");
+        assert_eq!(crashed.event["type"], "runtime_crashed");
+        assert_eq!(
+            crashed.target, rebound,
+            "the exit belongs to the identity the host publishes"
+        );
+        // Removal ran for that identity: the registry entry is gone, and a
+        // stale stop of the pre-rebind target cannot revive or re-close it.
+        assert!(manager
+            .inner
+            .runtimes
+            .lock()
+            .unwrap()
+            .get(&target.instance_id)
+            .is_none());
+        // The rebound identity is not admitted either, and nothing runs for it.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(manager
+            .with_live_terminal_target(&rebound, || ran
+                .store(true, std::sync::atomic::Ordering::SeqCst))
+            .is_err());
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a dead runtime mutates nothing after the rebind"
+        );
+    }
+
+    /// B2 barrier: the crash path captures the identity and then removes it in
+    /// one admission, so a rebind offered while it is parked in between cannot
+    /// land — that window used to make the crash *and* the removal both refuse,
+    /// leaving a dead runtime registered and admitted under the new generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crash_and_remove_holds_admission_across_identity_capture_and_removal() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let mut events = manager.subscribe();
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<RuntimeTarget>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        manager.set_crash_barrier(Some(Arc::new(move |captured| {
+            entered_tx.send(captured.clone()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        })));
+        let exiting = std::thread::spawn({
+            let manager = manager.clone();
+            let instance_id = target.instance_id.clone();
+            move || super::crash_and_remove(&manager.inner, &instance_id)
+        });
+        let captured = entered_rx.recv().unwrap();
+        assert_eq!(captured, target, "the captured identity is the live one");
+        // Parked between capture and removal, the guard is still held: no rebind
+        // can slip in, which is exactly what the pre-fix code allowed.
+        assert!(
+            manager.inner.admission.try_lock().is_err(),
+            "capture, crash and removal are one admission"
+        );
+        release_tx.send(()).unwrap();
+        exiting.join().unwrap();
+        manager.set_crash_barrier(None);
+        let crashed = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the crash is reported")
+            .expect("event channel alive");
+        assert_eq!(crashed.event["type"], "runtime_crashed");
+        assert_eq!(crashed.target, captured);
+        assert!(
+            manager
+                .inner
+                .runtimes
+                .lock()
+                .unwrap()
+                .get(&target.instance_id)
+                .is_none(),
+            "the crash path removed the runtime it captured"
+        );
+    }
+
+    /// Genuine stop-first ordering (plan §5): stop is parked in the window where
+    /// its tombstone is recorded but the runtime is still registered. No
+    /// dispatch is inside the guard before it, so admission — not scheduling —
+    /// is what rejects, and identity rebinding cannot revive the closed target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_first_closing_but_registered_rejects_admission_and_rebind() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        manager.set_stop_barrier(Some(Arc::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        })));
+        let stopping = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            move || manager.stop(&target)
+        });
+        entered_rx.recv().unwrap();
+        // Closing *and* still registered: the registry entry is present, so a
+        // registry-presence check alone would admit this command.
+        assert!(manager
+            .inner
+            .runtimes
+            .lock()
+            .unwrap()
+            .contains_key(&target.instance_id));
+        let outcome = manager.with_live_terminal_target(&target, || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst)
+        });
+        assert!(outcome.is_err(), "closing-but-registered must reject");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        // A generation rebind in this window would hand the stopped page a
+        // live-looking identity, so it must refuse.
+        assert!(!manager.rebind_owner_generation("owner", "s", 9));
+        release_tx.send(()).unwrap();
+        stopping.join().unwrap().unwrap();
+        assert!(manager.with_live_terminal_target(&target, || ()).is_err());
+    }
+
+    /// Dispatch-first ordering across an identity rebind: the admitted mutation
+    /// finished before the rebuilt identity became visible, and the stale
+    /// target is refused afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatch_first_then_rebind_waits_for_the_admitted_mutation() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let dispatching = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            let log = Arc::clone(&log);
+            move || {
+                manager
+                    .with_live_terminal_target(&target, || {
+                        log.lock().unwrap().push("dispatch");
+                        inside_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        log.lock().unwrap().push("mutated");
+                    })
+                    .unwrap();
+            }
+        });
+        inside_rx.recv().unwrap();
+        let rebinding = std::thread::spawn({
+            let manager = manager.clone();
+            let log = Arc::clone(&log);
+            move || {
+                let rebound = manager.rebind_owner_generation("owner", "s", 2);
+                log.lock().unwrap().push("rebind");
+                rebound
+            }
+        });
+        // The rebind cannot enter while the dispatch holds admission: probe the
+        // guard itself instead of waiting and hoping the rebind was slow.
+        assert!(
+            manager.inner.admission.try_lock().is_err(),
+            "the admitted mutation still holds admission"
+        );
+        assert_eq!(*log.lock().unwrap(), vec!["dispatch"]);
+        release_tx.send(()).unwrap();
+        dispatching.join().unwrap();
+        assert!(rebinding.join().unwrap(), "the rebind applies after it");
+        assert_eq!(*log.lock().unwrap(), vec!["dispatch", "mutated", "rebind"]);
+        let rebound = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 2);
+        assert!(
+            manager
+                .with_live_terminal_target(&target, || log.lock().unwrap().push("stale"))
+                .is_err(),
+            "the page's old generation is no longer the live identity"
+        );
+        assert!(manager.with_live_terminal_target(&rebound, || ()).is_ok());
+    }
+
+    /// Rebind-first ordering: the rebuilt identity exists before the stale
+    /// command arrives, so the command rejects with zero mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebind_first_rejects_the_stale_dispatch_without_mutation() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        assert!(manager.rebind_owner_generation("owner", "s", 2));
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(manager
+            .with_live_terminal_target(&target, || ran
+                .store(true, std::sync::atomic::Ordering::SeqCst))
+            .is_err());
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager
+            .with_live_terminal_target(
+                &RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 2),
+                || ()
+            )
+            .is_ok());
+    }
+
+    /// A stop that won the guard is final: the exact tombstone keeps admission
+    /// closed even if the identity is rebound afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stopped_target_cannot_be_revived_by_a_rebind() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        manager.stop(&target).unwrap();
+        // The runtime is gone from the registry, so nothing is there to rebind.
+        assert!(!manager.rebind_owner_generation("owner", "s", 2));
+        assert!(manager.with_live_terminal_target(&target, || ()).is_err());
+    }
+
+    /// R5: a wedged PTY write returns to its caller inside the bounded input
+    /// deadline. Sequential on purpose — it proves the *return*, not that a
+    /// concurrent stop gets in; `a_wedged_pty_write_releases_admission_so_a_concurrent_stop_completes`
+    /// proves the concurrency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wedged_pty_write_returns_inside_the_input_deadline() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let (terminals, owner, root, terminal_id, generation) =
+            crate::terminal_manager::wedged_input_fixture();
+        let payload = serde_json::json!({
+            "type": "terminal_input",
+            "terminalId": terminal_id,
+            "generation": generation,
+            "dataBase64": "cHJpbnRmIGhpCg==",
+        });
+        let started = std::time::Instant::now();
+        let dispatched = manager
+            .with_live_terminal_target(&target, || terminals.dispatch(&owner, &root, &payload))
+            .expect("the target is live, so dispatch runs");
+        assert!(dispatched.is_err(), "the wedged write fails explicitly");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the guard was held for {:?}",
+            started.elapsed()
+        );
+        // The guard is available again: stop closes admission and completes.
+        manager.stop(&target).unwrap();
+        assert!(manager.with_live_terminal_target(&target, || ()).is_err());
+    }
+
+    /// R5 concurrency, no ordering assumption: the writer reports entering its
+    /// blocking write, the stop starts from that instant, and one deadline
+    /// covers both — the input times out and gives admission up, and the stop
+    /// completes, both while the writer is still stuck. Only then is it
+    /// released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wedged_pty_write_releases_admission_so_a_concurrent_stop_completes() {
+        let manager = NativePiManager::in_memory(8);
+        let target = RuntimeTarget::with_owner("ws", "s", "instance-a", "owner", 1);
+        let _fake = manager.register_in_memory(target.clone()).unwrap();
+        let ((terminals, owner, root, terminal_id, generation), wedged) =
+            crate::terminal_manager::wedged_input_fixture_with_barrier();
+        let payload = serde_json::json!({
+            "type": "terminal_input",
+            "terminalId": terminal_id,
+            "generation": generation,
+            "dataBase64": "cHJpbnRmIGhpCg==",
+        });
+        let (done_tx, done) = std::sync::mpsc::channel::<(&'static str, bool)>();
+        let dispatching = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            let done_tx = done_tx.clone();
+            move || {
+                let admitted = manager.with_live_terminal_target(&target, || {
+                    terminals.dispatch(&owner, &root, &payload)
+                });
+                // The wedged write must surface as an explicit failure, not a
+                // silent success that would look like delivered keystrokes.
+                let _ = done_tx.send(("dispatch", matches!(admitted, Ok(Err(_)))));
+            }
+        });
+        assert!(
+            wedged.wait_entered(),
+            "the writer never entered its blocking write"
+        );
+        let stopping = std::thread::spawn({
+            let manager = manager.clone();
+            let target = target.clone();
+            move || {
+                let stopped = manager.stop(&target).is_ok();
+                let _ = done_tx.send(("stop", stopped));
+            }
+        });
+        let deadline = std::time::Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let mut finished: Vec<&'static str> = Vec::new();
+        while finished.len() < 2 {
+            match done.recv_timeout(deadline.saturating_sub(started.elapsed())) {
+                Ok((what, ok)) => {
+                    assert!(ok, "{what} did not complete as expected");
+                    finished.push(what);
+                }
+                Err(_) => panic!("only {finished:?} completed within {deadline:?}"),
+            }
+        }
+        dispatching.join().unwrap();
+        stopping.join().unwrap();
+        // Both halves finished while the writer was still wedged: the input gave
+        // admission up on its own deadline instead of the stop waiting on it.
+        wedged.release();
+        assert!(
+            manager.with_live_terminal_target(&target, || ()).is_err(),
+            "the stopped runtime is no longer admitted"
+        );
     }
 
     #[tokio::test]

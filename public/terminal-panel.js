@@ -35,6 +35,19 @@ export class TerminalPanel {
     this.tabs = [];
     this.activeTerminalId = null;
     this.locked = false;
+    /**
+     * Who holds the interaction lock. The panel stays frozen while any holder
+     * is present, so a workspace transition coming back up cannot unfreeze a
+     * window-close transaction that is still settling.
+     */
+    this.lockHolders = new Set();
+    /** Remote attachment availability: anything but "ready" blocks new tabs. */
+    this.availability = "ready";
+    this.unavailable = false;
+    this.availabilityRetry = null;
+    /** Availability copy retained so a later mount can render it (plan §4). */
+    this.availabilityMessage = "";
+    this.availabilityRetryLabel = "";
     this.activityByTab = new Set();
     this.tabContainers = new Map();
     this.tabButtons = new Map();
@@ -121,7 +134,7 @@ export class TerminalPanel {
     newTabButton.appendChild(createIcon("plus", { size: 16 }));
     newTabButton.title = t("terminal.newTab");
     newTabButton.addEventListener("click", () => {
-      if (!this.locked) this.client?.create?.("default");
+      if (!this.locked && !this.unavailable) this.client?.create?.("default");
     });
     this.tabBarEl.append(newTabButton, this.enlargeButton, collapseButton);
     this.root.append(resizer, this.tabBarEl, this.bodyEl);
@@ -129,6 +142,9 @@ export class TerminalPanel {
     panelContainer.appendChild(this.root);
     this._watchHeaderHeight(panelContainer);
     this.applyLocale();
+    // The attachment state can land before the panel exists (a Remote page
+    // resolves capability during startup), so re-render what was stored.
+    this._renderAvailability();
   }
 
   _watchHeaderHeight(panelContainer) {
@@ -166,6 +182,14 @@ export class TerminalPanel {
     this.root.classList.remove("hidden");
     this.toggleEl.setAttribute("aria-pressed", "true");
     this.clearActivity();
+    if (this.unavailable) {
+      // Read-only status: the panel explains why the terminal is blocked and
+      // offers its one recovery action. No PTY is created here (D2), and the
+      // message must be reachable by clicking the toggle like any other panel.
+      this.layoutHeight();
+      this._renderAvailability();
+      return;
+    }
     const restored = this.tabs.filter((tab) => tab.status === "restoredMetadata");
     if (restored.length > 0) {
       // Fresh app run with persisted metadata: re-create one shell per saved
@@ -230,22 +254,38 @@ export class TerminalPanel {
 
   // ---- Workspace transition participant ----
 
+  /** Take or release one lock source: the panel stays locked while any holds it. */
+  setLockHolder(holder, held) {
+    if (held) this.lockHolders.add(holder);
+    else this.lockHolders.delete(holder);
+    this.locked = this.lockHolders.size > 0;
+  }
+
   /** Freeze interaction and checkpoint running tabs before a host commit. */
   async beforeWorkspaceTransition() {
-    this.locked = true;
+    this.setLockHolder("transition", true);
     // Checkpoint regardless of expanded state: a collapsed panel still has
     // background PTYs whose screen must be recoverable after the reload.
     try {
       await this.client?.checkpointAll?.();
     } catch (error) {
-      this.locked = false;
+      this.setLockHolder("transition", false);
       throw error;
     }
     return true;
   }
 
+  /**
+   * The host commit succeeded and this page keeps its binding: give back the
+   * transition lock. Only the transition's own hold is released — a close
+   * transaction keeps the panel frozen until it settles.
+   */
+  finishWorkspaceTransition() {
+    this.setLockHolder("transition", false);
+  }
+
   cancelWorkspaceTransition() {
-    this.locked = false;
+    this.setLockHolder("transition", false);
   }
 
   // ---- Window close participant ----
@@ -264,19 +304,58 @@ export class TerminalPanel {
   /** On approved discard, close every live terminal; on cancel, leave them. */
   async settleCloseRisk(decision) {
     if (decision === "discard") {
-      this.locked = true;
+      this.setLockHolder("close", true);
       try {
         await this.client?.closeAll?.();
       } catch {
         // Best-effort cleanup; the host remains the final authority.
       }
     } else {
-      this.locked = false;
+      this.setLockHolder("close", false);
     }
   }
 
+  /** The window-close coordinator's lock: separate holder from a transition. */
   setInteractionLocked(locked) {
-    this.locked = Boolean(locked);
+    this.setLockHolder("close", Boolean(locked));
+  }
+
+  /**
+   * Surface the Remote attachment state (plan 2026-11-03 §4). Anything other
+   * than `ready` blocks new tabs and explains why; `onRetry` renders the one
+   * explicit recovery action the state allows (never an automatic retry loop).
+   */
+  setAvailability(state, { message = "", onRetry = null, retryLabel = "" } = {}) {
+    this.availability = state;
+    this.unavailable = state !== "ready";
+    this.availabilityRetry = onRetry;
+    this.availabilityMessage = message;
+    this.availabilityRetryLabel = retryLabel;
+    this._renderAvailability();
+  }
+
+  /** Render the stored availability state into the panel body (if mounted). */
+  _renderAvailability() {
+    this.bodyEl?.querySelector("[data-terminal-availability]")?.remove();
+    if (this.availability === "ready" || !this.bodyEl || !this.availabilityMessage) return;
+    const el = document.createElement("div");
+    el.className = "terminal-start-error";
+    el.dataset.terminalAvailability = this.availability;
+    el.setAttribute("role", "status");
+    const text = document.createElement("span");
+    text.textContent = this.availabilityMessage;
+    el.appendChild(text);
+    if (this.availabilityRetry) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.dataset.terminalRetry = "";
+      // Blocked bindings need "Reload" (re-navigate the page); a stopped runtime
+      // needs "Retry" (re-query). One action per state, named for what it does.
+      retry.textContent = this.availabilityRetryLabel || t("terminal.retry");
+      retry.addEventListener("click", () => this.availabilityRetry?.());
+      el.appendChild(retry);
+    }
+    this.bodyEl.prepend(el);
   }
 
   // ---- Tab metadata (host events update these) ----
@@ -300,6 +379,21 @@ export class TerminalPanel {
     if (this.tabs.length === 0 && this.expanded) {
       this.collapse();
     }
+  }
+
+  /**
+   * Drop the local projection because the binding it described is gone (plan §4,
+   * B3). Sends nothing: the daemon keeps its PTYs, and a later authoritative
+   * list re-projects whatever the host still owns. The availability banner is a
+   * separate element and stays visible.
+   */
+  clearProjection() {
+    this.tabs = [];
+    this.activeTerminalId = null;
+    this.activityByTab.clear();
+    this._renderTabBar();
+    this._updateToggleAffordance();
+    this.clearStartError();
   }
 
   /** Surface a host-side start failure inside the open panel. */
@@ -558,5 +652,6 @@ export class TerminalPanel {
     this.toggleEl?.setAttribute("aria-label", toggleLabel);
     this.toggleEl?.setAttribute("title", toggleLabel);
     this._renderTabBar();
+    this._renderAvailability();
   }
 }

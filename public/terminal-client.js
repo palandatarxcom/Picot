@@ -28,6 +28,24 @@ export class TerminalClient {
     this.tabs = new Map();
     this.workspaceGeneration = null;
     this.requestCounter = 0;
+    /** Remote binding from the canonical bootstrap target; null on Desktop. */
+    this.binding = null;
+    /** Bumped on every invalidation so old replies cannot satisfy new waiters. */
+    this.epoch = 0;
+    this.frozen = false;
+    /**
+     * Highest command id issued before the last invalidation. Ids are monotonic
+     * (`tm-<n>`), so this one boundary answers "does this reply belong to the
+     * current epoch?" for every response — including the high-frequency
+     * input/ack families — without an unbounded requestId map (plan §4).
+     */
+    this.staleThrough = 0;
+    /**
+     * Remote attachment command phase: `null` (open), `"attaching"` (only the
+     * controlled initial list may pass), or `"closed"` (no binding).
+     */
+    this.attachPhase = "closed";
+    this.initialListSent = false;
     /** Pending sendAndAwait matchers awaiting a synchronous response. */
     this._awaiters = [];
     /**
@@ -45,6 +63,93 @@ export class TerminalClient {
     return true;
   }
 
+  /**
+   * Install the Remote binding captured from the canonical bootstrap target:
+   * `{ workspaceId, sessionId, instanceId }`. Every command then carries it, and
+   * the host admits the command only against that page and that exact runtime.
+   * Desktop never calls this, so its envelope stays unchanged.
+   */
+  setBinding({ workspaceId, sessionId, instanceId } = {}) {
+    const valid = [workspaceId, sessionId, instanceId].every(
+      (value) => typeof value === "string" && value.trim(),
+    );
+    if (!valid) return false;
+    this.binding = { workspaceId, sessionId, instanceId };
+    return true;
+  }
+
+  /**
+   * Invalidate the Remote binding and every in-flight waiter (plan §4). After
+   * this the command gate is closed — no frame can be sent until a fresh
+   * binding and generation are installed — existing awaiters settle with null
+   * immediately, their timers are cleared, and the local tab projection is
+   * disposed *without* closing daemon PTYs.
+   *
+   * Not `setWorkspaceGeneration(null)`: `Number(null)` is `0`, which would leave
+   * the gate open on a stale page.
+   */
+  invalidateBinding() {
+    this.binding = null;
+    this.workspaceGeneration = null;
+    this.epoch += 1;
+    this.staleThrough = this.requestCounter;
+    this.attachPhase = "closed";
+    this.initialListSent = false;
+    this.unfreeze();
+    for (const awaiter of this._awaiters.splice(0)) {
+      clearTimeout(awaiter.timer);
+      awaiter.resolve(null);
+    }
+    this._pendingCommands.clear();
+    this.reset();
+  }
+
+  /**
+   * Start a Remote attachment attempt (plan §4). The previous binding,
+   * generation and local tab projection are gone immediately, so no command —
+   * least of all a keystroke through a still-mounted xterm — can be sent while
+   * context is resolving. Until the authoritative list is applied only the one
+   * controlled initial list is allowed through.
+   */
+  beginAttach() {
+    this.invalidateBinding();
+    this.attachPhase = "attaching";
+  }
+
+  /** The authoritative list for the current attempt is applied: input opens. */
+  markReady() {
+    this.attachPhase = null;
+  }
+
+  /**
+   * True when a response carrying this requestId belongs to the current
+   * invalidation epoch. Anything at or below the boundary was issued before the
+   * last invalidation and must not touch current state (plan §4, R1).
+   */
+  isCurrentRequest(requestId) {
+    const id = typeof requestId === "string" ? requestId : "";
+    const serial = Number(id.slice(id.lastIndexOf("-") + 1));
+    // Above the boundary it belongs to this epoch; above the counter it is not
+    // an id this client ever issued.
+    return (
+      Number.isSafeInteger(serial) && serial > this.staleThrough && serial <= this.requestCounter
+    );
+  }
+
+  /**
+   * Freeze user command entry points for a locally initiated transition, while
+   * still allowing the controlled pre-transition checkpoint (plan §4). xterm
+   * keyboard input and panel controls both go through `command`, so this closes
+   * them together instead of relying on the panel's interaction lock.
+   */
+  freeze() {
+    this.frozen = true;
+  }
+
+  unfreeze() {
+    this.frozen = false;
+  }
+
   /** Drop every tab and destroy its adapter (e.g. before a full rebuild). */
   reset() {
     for (const entry of this.tabs.values()) {
@@ -57,6 +162,15 @@ export class TerminalClient {
   /** Build a terminal_command envelope around an inner payload and send it. */
   command(payload) {
     if (this.workspaceGeneration === null) return null;
+    // Freeze allows only the controlled checkpoint: everything else is a user
+    // entry point whose binding is about to change.
+    if (this.frozen && payload?.type !== "terminal_checkpoint") return null;
+    // Attaching is not Ready: only the single controlled initial list may be
+    // sent, never a user command (plan §4, R2).
+    if (this.attachPhase === "attaching") {
+      if (payload?.type !== "terminal_list" || this.initialListSent) return null;
+      this.initialListSent = true;
+    }
     const requestId = `tm-${++this.requestCounter}`;
     const envelope = {
       type: "terminal_command",
@@ -64,10 +178,12 @@ export class TerminalClient {
       workspaceGeneration: this.workspaceGeneration,
       payload,
     };
+    if (this.binding) Object.assign(envelope, this.binding);
     if (TRACKED_COMMAND_TYPES.has(payload?.type)) {
       this._pendingCommands.set(requestId, payload.type);
     }
-    return this.send(envelope);
+    this.send(envelope);
+    return requestId;
   }
 
   /**
@@ -77,16 +193,23 @@ export class TerminalClient {
    */
   sendAndAwait(payload, match, timeoutMs = 5000) {
     return new Promise((resolve) => {
-      const awaiter = { resolve, match };
-      this._awaiters.push(awaiter);
-      this.command(payload);
-      setTimeout(() => {
+      // Correlate by the requestId this client generated plus the epoch it was
+      // generated in: a late reply from an invalidated attempt can neither
+      // satisfy this waiter nor be satisfied by it.
+      const requestId = this.command(payload);
+      if (requestId === null) {
+        resolve(null);
+        return;
+      }
+      const awaiter = { resolve, match, requestId, epoch: this.epoch, timer: null };
+      awaiter.timer = setTimeout(() => {
         const idx = this._awaiters.indexOf(awaiter);
         if (idx >= 0) {
           this._awaiters.splice(idx, 1);
           resolve(null);
         }
       }, timeoutMs);
+      this._awaiters.push(awaiter);
     });
   }
 
@@ -101,8 +224,12 @@ export class TerminalClient {
   resolveResponse(msg) {
     if (msg?.requestId) this._pendingCommands.delete(msg.requestId);
     for (let i = this._awaiters.length - 1; i >= 0; i -= 1) {
-      if (this._awaiters[i].match(msg)) {
-        const { resolve } = this._awaiters[i];
+      const awaiter = this._awaiters[i];
+      if (awaiter.epoch !== this.epoch) continue;
+      if (!msg?.requestId || msg.requestId !== awaiter.requestId) continue;
+      if (awaiter.match(msg)) {
+        const { resolve, timer } = awaiter;
+        clearTimeout(timer);
         this._awaiters.splice(i, 1);
         resolve(msg);
       }

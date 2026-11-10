@@ -239,24 +239,175 @@ describe("TerminalClient replay", () => {
     expect(client.createTab).not.toHaveBeenCalled();
   });
 
-  test("sendAndAwait resolves when a matching response arrives", async () => {
+  test("sendAndAwait resolves when the correlated response arrives", async () => {
     const send = vi.fn();
     const client = new TerminalClient({ send, createTab: fakeTab });
+    client.setWorkspaceGeneration(0);
     const promise = client.sendAndAwait(
       { type: "terminal_close", terminalId: "t1", generation: 1 },
       (msg) => msg.type === "terminal_closed" && msg.terminalId === "t1",
     );
-    client.resolveResponse({ type: "terminal_closed", terminalId: "t1" });
-    expect(await promise).toEqual({ type: "terminal_closed", terminalId: "t1" });
+    const requestId = send.mock.calls[0][0].requestId;
+    client.resolveResponse({ type: "terminal_closed", terminalId: "t1", requestId });
+    expect(await promise).toEqual({ type: "terminal_closed", terminalId: "t1", requestId });
   });
 
   test("sendAndAwait resolves null on timeout", async () => {
     const client = new TerminalClient({ send: vi.fn(), createTab: fakeTab });
+    client.setWorkspaceGeneration(0);
     const promise = client.sendAndAwait(
       { type: "terminal_close", terminalId: "t1", generation: 1 },
       () => false,
       10,
     );
     expect(await promise).toBeNull();
+  });
+
+  test("a reply without the generated requestId never satisfies an awaiter", async () => {
+    const send = vi.fn();
+    const client = new TerminalClient({ send, createTab: fakeTab });
+    client.setWorkspaceGeneration(0);
+    const promise = client.sendAndAwait(
+      { type: "terminal_close", terminalId: "t1", generation: 1 },
+      (msg) => msg.type === "terminal_closed" && msg.terminalId === "t1",
+      10,
+    );
+    // Right shape, wrong correlation: a stale reply from an earlier attempt.
+    client.resolveResponse({
+      type: "terminal_closed",
+      terminalId: "t1",
+      requestId: "tm-999",
+    });
+    expect(await promise).toBeNull();
+  });
+});
+
+describe("Remote binding", () => {
+  function bound() {
+    const send = vi.fn();
+    const client = new TerminalClient({ send, createTab: fakeTab });
+    client.setWorkspaceGeneration(0);
+    client.setBinding({ workspaceId: "w-1", sessionId: "s-1", instanceId: "i-1" });
+    return { client, send };
+  }
+
+  test("carries the approved comparison fields on every command", () => {
+    const { client, send } = bound();
+    client.command({ type: "terminal_list" });
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "terminal_command",
+        workspaceId: "w-1",
+        workspaceGeneration: 0,
+        sessionId: "s-1",
+        instanceId: "i-1",
+        payload: { type: "terminal_list" },
+      }),
+    );
+  });
+
+  test("Desktop envelopes keep their pre-approval shape", () => {
+    const send = vi.fn();
+    const client = new TerminalClient({ send, createTab: fakeTab });
+    client.setWorkspaceGeneration(3);
+    client.command({ type: "terminal_list" });
+    const envelope = send.mock.calls[0][0];
+    expect(envelope).not.toHaveProperty("workspaceId");
+    expect(envelope).not.toHaveProperty("sessionId");
+    expect(envelope).not.toHaveProperty("instanceId");
+    expect(envelope.workspaceGeneration).toBe(3);
+  });
+
+  test("a malformed binding is refused instead of half-installed", () => {
+    const client = new TerminalClient({ send: vi.fn(), createTab: fakeTab });
+    expect(client.setBinding({ workspaceId: "w", sessionId: "", instanceId: "i" })).toBe(false);
+    expect(client.binding).toBeNull();
+  });
+
+  test("invalidation closes the gate, drops local tabs, and never sends a close", () => {
+    const { client, send } = bound();
+    const tab = fakeTab();
+    client.createTab = () => tab;
+    client.applySnapshot(snapshot());
+    send.mockClear();
+
+    client.invalidateBinding();
+
+    expect(client.tabs.size).toBe(0);
+    expect(tab.calls).toContain("destroy");
+    // No terminal frame: the daemon PTYs are untouched on invalidation.
+    expect(send).not.toHaveBeenCalled();
+    expect(client.command({ type: "terminal_list" })).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+    // Explicitly not `setWorkspaceGeneration(null)` (Number(null) === 0).
+    expect(client.workspaceGeneration).toBeNull();
+  });
+
+  test("invalidation settles pending awaiters immediately and clears their timers", async () => {
+    const { client } = bound();
+    const promise = client.sendAndAwait(
+      { type: "terminal_close", terminalId: "t1", generation: 1 },
+      () => true,
+      5000,
+    );
+    client.invalidateBinding();
+    expect(await promise).toBeNull();
+    expect(client._awaiters).toHaveLength(0);
+  });
+
+  test("a late reply from an invalidated epoch cannot satisfy a new waiter", async () => {
+    const { client, send } = bound();
+    const old = client.sendAndAwait(
+      { type: "terminal_close", terminalId: "t1", generation: 1 },
+      () => true,
+      5000,
+    );
+    const oldRequestId = send.mock.calls[0][0].requestId;
+    client.invalidateBinding();
+    client.setWorkspaceGeneration(0);
+    const fresh = client.sendAndAwait(
+      { type: "terminal_checkpoint", terminalId: "t1", generation: 1 },
+      () => true,
+      5000,
+    );
+    client.resolveResponse({ type: "terminal_closed", terminalId: "t1", requestId: oldRequestId });
+    expect(await old).toBeNull();
+    // The stale reply did not resolve the new waiter either.
+    expect(client._awaiters).toHaveLength(1);
+    const freshRequestId = send.mock.calls.at(-1)[0].requestId;
+    client.resolveResponse({ type: "terminal_checkpoint_acked", requestId: freshRequestId });
+    expect(await fresh).not.toBeNull();
+  });
+
+  test("freeze blocks user commands but allows the controlled checkpoint", () => {
+    const { client, send } = bound();
+    client.freeze();
+    // xterm keyboard input reaches the host only through `command`.
+    expect(
+      client.command({ type: "terminal_input", terminalId: "t1", dataBase64: "YQ==" }),
+    ).toBeNull();
+    expect(client.command({ type: "terminal_create" })).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+
+    const requestId = client.command({
+      type: "terminal_checkpoint",
+      terminalId: "t1",
+      generation: 1,
+      watermark: 0,
+      snapshotBase64: "c25hcA==",
+    });
+    expect(requestId).toBe("tm-1");
+    expect(send).toHaveBeenCalledTimes(1);
+
+    client.unfreeze();
+    expect(client.command({ type: "terminal_input", terminalId: "t1", dataBase64: "YQ==" })).toBe(
+      "tm-2",
+    );
+  });
+
+  test("requestList returns the requestId the attachment correlates on", () => {
+    const { client, send } = bound();
+    expect(client.requestList()).toBe("tm-1");
+    expect(send.mock.calls[0][0].payload).toEqual({ type: "terminal_list" });
   });
 });

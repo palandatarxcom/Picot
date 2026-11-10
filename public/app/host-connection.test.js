@@ -11,7 +11,9 @@ import {
   readCapabilities,
   resolveHostFromUrl,
   resolveWsUrlForHost,
+  supportsRemoteTerminal,
   switchHost,
+  TERMINAL_BINDING_REVISION,
   watchCredentialInvalid,
 } from "./host-connection.js";
 
@@ -85,6 +87,7 @@ describe("readCapabilities", () => {
       git: true,
       terminal: true,
       management: true,
+      terminalBindingVersion: 0,
     });
     expect(
       readCapabilities({
@@ -103,6 +106,7 @@ describe("readCapabilities", () => {
       git: true,
       terminal: true,
       management: false,
+      terminalBindingVersion: 0,
     });
   });
 
@@ -114,6 +118,7 @@ describe("readCapabilities", () => {
       git: true,
       terminal: true,
       management: false,
+      terminalBindingVersion: 0,
     });
     expect(readCapabilities(null).management).toBe(false);
   });
@@ -124,6 +129,55 @@ describe("readCapabilities", () => {
     expect(caps.navigation).toBe(false);
     expect(caps.git).toBe(true);
     expect(caps.management).toBe(false);
+  });
+
+  test("the approved terminal binding revision survives the face mapper", () => {
+    const caps = readCapabilities({
+      capabilities: { native: true, terminal: true, terminalBindingVersion: 1 },
+    });
+    expect(caps.terminalBindingVersion).toBe(TERMINAL_BINDING_REVISION);
+    expect(caps.terminal).toBe(true);
+    expect(supportsRemoteTerminal(caps)).toBe(true);
+  });
+
+  test("absent, string, boolean, fractional, and unknown revisions never authorize", () => {
+    const revisions = [undefined, "1", true, 1.5, 0, 2, -1, null];
+    for (const revision of revisions) {
+      const caps = readCapabilities({
+        capabilities: { native: true, terminal: true, terminalBindingVersion: revision },
+      });
+      // Only a positive safe integer is preserved verbatim; everything else
+      // collapses to 0. Either way the gate refuses it.
+      expect(caps.terminalBindingVersion, `revision ${revision}`).toBe(revision === 2 ? 2 : 0);
+      expect(supportsRemoteTerminal(caps), `revision ${revision}`).toBe(false);
+    }
+  });
+
+  test("a legacy ack keeps its face defaults but still cannot authorize terminal", () => {
+    const caps = readCapabilities({ type: "hello_ack" });
+    // Unrelated legacy defaults are unchanged (Desktop included).
+    expect(caps).toEqual({
+      native: true,
+      class: "native",
+      navigation: true,
+      git: true,
+      terminal: true,
+      management: false,
+      terminalBindingVersion: 0,
+    });
+    // …and the terminal gate still refuses it: `terminal: true` alone is not
+    // evidence of the approved contract.
+    expect(supportsRemoteTerminal(caps)).toBe(false);
+  });
+
+  test("terminal face must be true as well as the revision", () => {
+    expect(
+      supportsRemoteTerminal({
+        terminal: false,
+        terminalBindingVersion: TERMINAL_BINDING_REVISION,
+      }),
+    ).toBe(false);
+    expect(supportsRemoteTerminal(undefined)).toBe(false);
   });
 });
 

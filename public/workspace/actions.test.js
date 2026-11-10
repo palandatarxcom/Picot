@@ -112,6 +112,73 @@ describe("startInWindowNewSession parallel-spawn", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
+  it("invalidates the old binding immediately before the host commit", async () => {
+    const order = [];
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 9,
+      targetOrigin: "http://127.0.0.1:47826/workspaces/ws/sessions/s",
+    });
+    transport.commitWorkspaceTransition = vi.fn(async () => {
+      order.push("commit");
+    });
+
+    const ok = await startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/other",
+      navigate: () => order.push("navigate"),
+      onBeforeSwap: vi.fn(),
+      shouldSpawnParallel: () => true,
+      // Deferred checkpoint: the freeze finishes before anything else runs.
+      beforeWorkspaceTransition: async () => {
+        order.push("freeze");
+        return true;
+      },
+      beforeWorkspaceCommit: () => order.push("invalidate"),
+      onWorkspaceTransitionCancelled: () => order.push("cancel"),
+      renderError: () => order.push("error"),
+    });
+
+    expect(ok).toBe(true);
+    // Invalidation sits between the freeze and the commit, never after it.
+    expect(order).toEqual(["freeze", "invalidate", "commit", "navigate"]);
+  });
+
+  it("still invalidates before a commit that fails, and cancels the transition", async () => {
+    const order = [];
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 9,
+      targetOrigin: "http://127.0.0.1:47826/workspaces/ws/sessions/s",
+    });
+    transport.commitWorkspaceTransition = vi.fn(async () => {
+      order.push("commit");
+      throw new Error("commit refused");
+    });
+    transport.cancelWorkspaceTransition = vi.fn().mockResolvedValue(undefined);
+
+    const ok = await startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/other",
+      navigate: () => order.push("navigate"),
+      onBeforeSwap: vi.fn(),
+      shouldSpawnParallel: () => true,
+      beforeWorkspaceTransition: async () => {
+        order.push("freeze");
+        return true;
+      },
+      beforeWorkspaceCommit: () => order.push("invalidate"),
+      onWorkspaceTransitionCancelled: () => order.push("cancel"),
+      renderError: () => order.push("error"),
+    });
+
+    expect(ok).toBe(false);
+    expect(order).toEqual(["freeze", "invalidate", "commit", "cancel", "error"]);
+    expect(transport.cancelWorkspaceTransition).toHaveBeenCalledWith(9);
+  });
+
   it("surfaces native preparation errors before showing the swap overlay", async () => {
     const transport = makeTransport();
     transport.prepareWorkspaceTarget.mockRejectedValue(new Error("boom"));

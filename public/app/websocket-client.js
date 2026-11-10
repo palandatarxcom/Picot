@@ -64,6 +64,10 @@ export class WebSocketClient extends EventTarget {
     this.capabilities = { native: false };
     // True after HostServer accepts hello. `connected` fires only after this.
     this.authenticated = false;
+    // Bumped on every authenticated hello_ack, so consumers can tell whose ack
+    // authorized them: an old connection's capability never authorizes a new
+    // one (plan 2026-11-03 §1/§4).
+    this.connectionEpoch = 0;
     this._pendingConnect = false;
     // Pending host requests keyed by requestId. Each entry resolves/rejects
     // the promise returned by sendControl() when a matching host_response
@@ -275,12 +279,28 @@ export class WebSocketClient extends EventTarget {
     return target;
   }
 
-  async _bootstrapHttpTarget(fetchImpl) {
+  /**
+   * Side-effect-free canonical bootstrap query (plan 2026-11-03 §5): resolves
+   * the live target for the *captured* workspace/session without touching
+   * routing, subscriptions, or snapshots. A Remote terminal attach verifies the
+   * returned identity before installing it, so it must not run the routing
+   * application `loadCanonicalTarget` performs.
+   */
+  async queryCanonicalTarget(query, fetchImpl = globalThis.fetch?.bind(globalThis)) {
+    const workspaceId = query?.workspaceId;
+    const sessionId = query?.sessionId;
+    if (!workspaceId || !sessionId) return null;
+    return this.identity === "bridge"
+      ? await this._bootstrapRemoteTarget({ workspaceId, sessionId })
+      : await this._bootstrapHttpTarget(fetchImpl, { workspaceId, sessionId });
+  }
+
+  async _bootstrapHttpTarget(
+    fetchImpl,
+    { workspaceId = this.workspaceId, sessionId = this.sessionId } = {},
+  ) {
     if (typeof fetchImpl !== "function") return null;
-    const query = new URLSearchParams({
-      workspaceId: this.workspaceId,
-      sessionId: this.sessionId,
-    });
+    const query = new URLSearchParams({ workspaceId, sessionId });
     const response = await fetchImpl(`/v2/bootstrap?${query}`);
     if (!response.ok) throw new Error(`Host bootstrap failed (${response.status})`);
     return response.json();
@@ -289,15 +309,18 @@ export class WebSocketClient extends EventTarget {
   // The op has a fixed schema host-side — any field beyond these five is
   // refused — so the frame is built here instead of sendData(), which adds
   // `protocolVersion`. `workspace.bootstrap` answers `data_response.target`.
-  async _bootstrapRemoteTarget() {
+  async _bootstrapRemoteTarget({
+    workspaceId = this.workspaceId,
+    sessionId = this.sessionId,
+  } = {}) {
     if (!this.ws || this.ws.readyState !== WS_OPEN) this.connect();
     const reply = await this._sendRequest(
       (requestId) => ({
         type: "data_request",
         requestId,
         operation: "workspace.bootstrap",
-        workspaceId: this.workspaceId,
-        sessionId: this.sessionId,
+        workspaceId,
+        sessionId,
       }),
       { label: 'Data operation "workspace.bootstrap"' },
     );
@@ -757,6 +780,7 @@ export class WebSocketClient extends EventTarget {
     if (message.type === "hello_ack") {
       this.capabilities = this._capabilitiesFromAck(message);
       this.authenticated = true;
+      this.connectionEpoch += 1;
       this.dispatchEvent(new CustomEvent("hostCapabilities", { detail: this.capabilities }));
       this._subscribeCanonicalTarget();
       this._requestCanonicalSnapshot();

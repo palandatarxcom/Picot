@@ -702,3 +702,31 @@ test("a deep session link with no runtime still boots the page (PM C10①)", asy
     window.history.replaceState({}, "", "/");
   }
 });
+
+test("desktop pages keep the legacy generation handoff and build no Remote attachment", async () => {
+  await import("./app.js?terminal-desktop-binding");
+  const socket = FakeWebSocket.instances.at(-1);
+  socket.readyState = FakeWebSocket.OPEN;
+
+  // Even a server that enforces the Remote binding contract advertises nothing
+  // that changes a desktop page: no attachment exists, and the owner bootstrap
+  // remains the generation handoff.
+  socket.onmessage({
+    data: JSON.stringify({
+      type: "hello_ack",
+      protocolVersion: 2,
+      capabilities: { native: true, terminal: true, terminalBindingVersion: 1 },
+    }),
+  });
+  socket.onmessage({
+    data: JSON.stringify({ type: "owner_bootstrap", workspaceGeneration: 7, instances: [] }),
+  });
+  expect(globalThis.__picotRemoteTerminal).toBeNull();
+
+  document.querySelector("[data-terminal-toggle]").click();
+  const list = socket.sent.find((message) => message.payload?.type === "terminal_list");
+  expect(list).toBeDefined();
+  expect(list.workspaceGeneration).toBe(7);
+  expect(list).not.toHaveProperty("workspaceId");
+  expect(list).not.toHaveProperty("instanceId");
+});

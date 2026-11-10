@@ -397,6 +397,13 @@ async fn real_daemon_pairing_ack_subscription_request_navigation_and_revoke_are_
             serde_json::from_str::<Value>(text).unwrap()
         };
         let ack = token_free(&recv(&mut a).await); assert_eq!(ack["type"], "hello_ack");
+        // The additive Remote terminal revision survives the bridge's ack
+        // sanitization: a device client can only learn it enforces the binding
+        // contract from the authenticated ack the bridge forwards (plan §1).
+        assert_eq!(
+            ack["capabilities"]["terminalBindingVersion"], json!(1),
+            "the bridge must preserve the additive capability: {ack}"
+        );
         assert_eq!(saved.tokens.lock().unwrap().len(), 1);
         let wire_target = json!({"workspaceId":ws_id,"sessionId":"session","instanceId":"instance"});
         send(&mut a, &json!({"type":"runtime_subscribe","requestId":"sub","target":wire_target}).to_string()).await;

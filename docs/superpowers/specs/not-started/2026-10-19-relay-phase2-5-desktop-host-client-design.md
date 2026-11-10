@@ -225,3 +225,48 @@ key 指纹（首 8…末 8、4 字符分组）+ relay endpoint + 变更项差异
 2. **页面级重载切换**（契约 4）：切换 host = 整页重载（≈1s 闪烁），换取零状态残留；不做闭包内热切换。不点头则回退「稳定 façade」路线（工作量 +2~3 人日，R2-08 全部失败态仍需逐项处理）。
 
 **状态**：两项均已同意，plan 重排为 Draft 3（`docs/superpowers/plans/2026-10-19-relay-phase2-5-desktop-host-client.md`）；终审通过后开工。
+
+## 13. Remote 终端绑定契约（2026-11-03 Dr. Lin 拍板）
+
+本节修订 §5.2 契约 1 的 terminal 行，并把 §12 白名单从两项扩为三项。动机是已定位的缺陷：Remote 页面启动时拿不到 owner_bootstrap，终端 generation 恒为 null，命令被前端自己丢弃；而 device 分支此前只按「device view 的 workspace 根」派发，既不比对页面 workspace/generation，也不比对精确 runtime——陈旧页面可能在共享视图切换后到另一个工作区执行命令。
+
+### 13.1 wire（additive，逐项记录）
+
+| 项 | 形状 | 约束 |
+| --- | --- | --- |
+| `hello_ack.capabilities.terminalBindingVersion` | 整数 `1` | 仅当服务端对**每一条** Remote `terminal_command` 执行 13.2/13.3 时才宣告；经桥的凭据净化后必须保留；缺字段、字符串、布尔、未知修订号一律视为不支持 |
+| `terminal_command` 顶层 `workspaceId` | 非空字符串 | 页面所属 workspace；与 `workspaceGeneration` 一起对**一次** device view 快照比对 |
+| `terminal_command` 顶层 `workspaceGeneration` | 非负 JS 安全整数（≤ 2^53-1） | 同上；数值相等不代表同一工作区，两个字段必须同时相等 |
+| `terminal_command` 顶层 `sessionId` / `instanceId` | 非空字符串 | 来自该页面捕获的 canonical bootstrap target，用来锁定**精确 runtime** |
+
+owner、filesystem root、workspace 注册关系永远由服务端推导，不回读 wire 字段；Desktop 信封不变：它原本就携带 `workspaceGeneration` 比较令牌，构成契约的四个字段对 Desktop 不是新增项（Desktop 不带 `workspaceId`/`sessionId`/`instanceId`，仍走 owner-registry 分支）。服务端构造的 expected target 全部取**页面已验证的** workspace/session/instance/generation，加服务端 owner——不从 live runtime 继承 generation，因此同 instance 的 generation 重绑会让旧页面在 dispatch 前被拒。
+
+### 13.2 准入顺序与拒绝码
+
+每次 Remote 终端命令按 `authentication → schema → view/root → runtime` 的顺序判定，任一环失败都在 `TerminalManager::dispatch` 之前返回 `terminal_command_failed`（保留 `requestId` 与人类可读 `error`，新增 `code`）：
+
+| code | 触发 |
+| --- | --- |
+| `terminal_protocol_unsupported` | 旧客户端：四个契约字段中**任一个**缺失（先判存在性，再判类型/范围，字段读取顺序不影响结果） |
+| `terminal_binding_invalid` | 字段存在但类型/范围非法（空串、字符串化的代数、非安全整数等） |
+| `terminal_binding_mismatch` | 无 device view、workspace 未注册、workspace 或 generation 与快照不一致 |
+| `terminal_runtime_unavailable` | 精确 target 不存在、被替换、已 stopped/crashed、正在关闭、owner 不符 |
+
+拒绝一律不触发终端的自动 list 重试；D1 的陈旧页面进入 blocked 状态并给出重新加载/重新导航入口，`runtime_not_found` 进入 unavailable 状态并给出显式重试。认证/授权失败沿用既有错误，不被新码覆盖。
+
+### 13.3 版本矩阵
+
+| 组合 | 行为 |
+| --- | --- |
+| 新客户端 → 旧服务端（含 `terminal: true` 但无修订号） | 终端不可用并提示升级；零终端帧、零 PTY 变更；不探测、不回落、不允许用户覆盖 |
+| 旧客户端 → 新服务端 | 任何命令族在 dispatch 前被 `terminal_protocol_unsupported` 拒绝；连接与其它已授权操作不受影响 |
+| 新 → 新 | 修订号放行；精确绑定成功、陈旧绑定/runtime 停止/关闭中一律拒绝且不产生变更；重连不复用旧 capability 与旧 context |
+| 新 → 缺失/未知/畸形修订号 | 与旧服务端同路径，零终端帧 |
+
+### 13.4 精确 runtime 与停止线性化
+
+依赖的是**本页那个** runtime（workspace + session + instance + 服务端 owner 全等），不是工作区里任意存活 runtime：兄弟 runtime 不救已停止的页面 target，同会话的替换实例必须重新取上下文。服务端用 `with_live_terminal_target` 守卫与 stop/crash/removal 线性化（实现与锁序见 `ARCHITECTURE.md#运行时准入守卫（terminal admission，2026-11-03 Dr. Lin 拍板）`）。边界：保证起点是宿主观测到的 closing/removal，不是物理进程死亡；已准入字节不被撤销；PTY 在 runtime 消失后保留（这是刻意的）；不承诺 bootstrap+dispatch 原子、不承诺无丢失恢复。
+
+### 13.5 与 F1/F6 的关系
+
+checkpoint watermark 与 xterm 解析屏障（F1）、重叠合并 journal 的普通 gap 恢复（F6）仍是独立缺陷，未纳入本次修复，也未获批准；因此在它们被单独批准并验证前，不得宣称 lossless checkpoint 恢复或完整普通 gap 恢复。

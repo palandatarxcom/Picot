@@ -313,6 +313,55 @@ test("setInteractionLocked toggles the lock", () => {
   expect(panel.locked).toBe(false);
 });
 
+test("a transition that finishes cannot unfreeze a window-close transaction (R3)", async () => {
+  const checkpointAll = vi.fn(async () => {});
+  const { panel } = mountedPanel({ client: { checkpointAll } });
+  panel.setTabs([
+    { terminalId: "t1", generation: 1, label: "zsh", profileId: "default", status: "running" },
+  ]);
+  // A same-workspace commit is in flight when the host asks to close the window.
+  await panel.beforeWorkspaceTransition();
+  panel.setInteractionLocked(true);
+  // The commit succeeds and the page keeps its binding.
+  panel.finishWorkspaceTransition();
+  expect(panel.locked).toBe(true);
+  // The close transaction still owns its own lock, so the panel stays frozen
+  // until the coordinator releases it.
+  panel.setInteractionLocked(false);
+  expect(panel.locked).toBe(false);
+});
+
+test("a close transaction that settles cannot unfreeze a running transition (R3)", async () => {
+  const checkpointAll = vi.fn(async () => {});
+  const { panel } = mountedPanel({ client: { checkpointAll } });
+  panel.setInteractionLocked(true);
+  await panel.beforeWorkspaceTransition();
+  panel.setInteractionLocked(false);
+  expect(panel.locked).toBe(true);
+  panel.finishWorkspaceTransition();
+  expect(panel.locked).toBe(false);
+});
+
+test("clearProjection drops tabs, active tab and activity without touching the client", async () => {
+  const closeAll = vi.fn(async () => {});
+  const { panel } = mountedPanel({ client: { closeAll } });
+  panel.setTabs([
+    { terminalId: "t1", generation: 1, label: "zsh", profileId: "default", status: "running" },
+    { terminalId: "t2", generation: 1, label: "zsh", profileId: "default", status: "running" },
+  ]);
+  panel.setActiveTerminalId("t2");
+  panel.markActivity("t1");
+  panel.clearProjection();
+  expect(panel.tabs).toEqual([]);
+  expect(panel.activeTerminalId).toBeNull();
+  expect(panel.getProjection()).toEqual({ count: 0, hasActivity: false });
+  // Close risk follows the projection: no live tab is reported any more.
+  expect(panel.getCloseRisk().terminalTabs).toEqual([]);
+  // The projection is page state only: no daemon PTY is closed here.
+  expect(closeAll).not.toHaveBeenCalled();
+  expect(document.querySelectorAll(".terminal-tab[data-terminal-id]")).toHaveLength(0);
+});
+
 test("markActivity tracks background output and clearActivity resets it", () => {
   const { panel } = mountedPanel();
   panel.setTabs([
@@ -421,4 +470,81 @@ test("keyboard resize and tab roving update the active terminal", () => {
   expect(refitTab).toHaveBeenCalledWith("t2");
   expect(focusTab).toHaveBeenCalledWith("t2");
   expect(preventRove).toHaveBeenCalledTimes(1);
+});
+
+test("unavailable opens a read-only status panel instead of hiding the reason", async () => {
+  const client = { create: vi.fn(), closeAll: vi.fn(), checkpointAll: vi.fn() };
+  const retry = vi.fn();
+  const { panel } = mountedPanel({ client });
+
+  panel.setAvailability("unavailable", {
+    message: "no live runtime",
+    onRetry: retry,
+  });
+  // The panel is collapsed by default, so the reason is only reachable through
+  // the real toggle — clicking it must open the panel, not silently do nothing.
+  expect(panel.root.classList.contains("hidden")).toBe(true);
+  panel.toggleEl.click();
+  await Promise.resolve();
+  expect(panel.isExpanded()).toBe(true);
+  expect(panel.root.classList.contains("hidden")).toBe(false);
+
+  const banner = panel.bodyEl.querySelector("[data-terminal-availability='unavailable']");
+  expect(banner).not.toBeNull();
+  // Reachable, not merely present in hidden DOM.
+  expect(banner.closest(".terminal-panel")).toBe(panel.root);
+  expect(banner.querySelector("span").textContent).toBe("no live runtime");
+  const button = banner.querySelector("[data-terminal-retry]");
+  expect(button).not.toBeNull();
+  button.click();
+  expect(retry).toHaveBeenCalledTimes(1);
+  // Read-only: no PTY is created for a page without a runtime (D2).
+  expect(client.create).not.toHaveBeenCalled();
+
+  // Ready clears the banner and reopens the surface.
+  panel.setAvailability("ready");
+  expect(panel.bodyEl.querySelector("[data-terminal-availability]")).toBeNull();
+  expect(panel.unavailable).toBe(false);
+});
+
+test("an availability state set before mount is rendered once the panel exists", () => {
+  const client = { create: vi.fn(), closeAll: vi.fn(), checkpointAll: vi.fn() };
+  const panel = new TerminalPanel({ native: true, client, getAvailableHeight: () => 800 });
+  // Remote capability/context resolution can land before the panel is mounted.
+  panel.setAvailability("unavailable", { message: "no live runtime" });
+  expect(panel.bodyEl).toBeNull();
+  panel.mount({ toggleContainer: document.body, panelContainer: document.body });
+  const banner = panel.bodyEl.querySelector("[data-terminal-availability='unavailable']");
+  expect(banner).not.toBeNull();
+  expect(banner.textContent).toBe("no live runtime");
+});
+
+test("a blocked binding labels its action Reload, not a generic retry", () => {
+  const { panel } = mountedPanel();
+  panel.setAvailability("blocked", {
+    message: "binding changed",
+    onRetry: () => {},
+    retryLabel: "Reload page",
+  });
+  const button = panel.bodyEl.querySelector("[data-terminal-retry]");
+  expect(button.textContent).toBe("Reload page");
+});
+
+test("a retry action is rendered once and calls back exactly once", () => {
+  const { panel } = mountedPanel();
+  const retry = vi.fn();
+  panel.setAvailability("unavailable", { message: "no live runtime", onRetry: retry });
+  const button = panel.bodyEl.querySelector("[data-terminal-retry]");
+  expect(button).not.toBeNull();
+  button.click();
+  button.click();
+  expect(retry).toHaveBeenCalledTimes(2);
+});
+
+test("a blocked binding renders the reload guidance, not a retry loop", () => {
+  const { panel } = mountedPanel();
+  panel.setAvailability("blocked", { message: "binding changed", onRetry: () => {} });
+  const banner = panel.bodyEl.querySelector("[data-terminal-availability='blocked']");
+  expect(banner.dataset.terminalAvailability).toBe("blocked");
+  expect(banner.textContent).toContain("binding changed");
 });

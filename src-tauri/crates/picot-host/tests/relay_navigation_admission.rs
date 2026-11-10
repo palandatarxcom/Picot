@@ -148,32 +148,44 @@ async fn connect_device(host: &HostServer, client_id: &str, token: &str) -> (Cli
     (socket, ack)
 }
 
-/// A host with one registered workspace, a paired device seeded with the same
-/// workspace in its view, and the terminal manager attached (the D2 terminal
-/// row needs it). No control handler is installed: the frame path is what
-/// these tests assert.
+/// A host with two registered workspaces, a paired device whose view starts on
+/// workspace A, an owner-stamped device token, and the terminal manager
+/// attached (the D2 terminal row needs it). No control handler is installed:
+/// the frame path is what these tests assert. In-memory runtimes are seeded on
+/// demand; their process handles are retained by the wave so the event pump
+/// does not report a crash for a live fixture.
 struct Wave {
     temp: PathBuf,
     host: HostServer,
+    auth: Arc<Mutex<RemoteAuth>>,
     token: String,
     capability: String,
+    owner: String,
+    workspace_a: String,
+    workspace_b: String,
+    runtimes: Vec<picot_host::pi_rpc_bridge::InMemoryPiProcess>,
 }
 
 async fn wave(tag: &str) -> Wave {
     let temp = temp_dir(tag);
-    let workspace_dir = temp.join("workspace");
-    fs::create_dir_all(&workspace_dir).unwrap();
-    let workspace_dir = workspace_dir.canonicalize().unwrap();
+    let workspace_a_dir = temp.join("workspace");
+    let workspace_b_dir = temp.join("workspace-b");
+    fs::create_dir_all(&workspace_a_dir).unwrap();
+    fs::create_dir_all(&workspace_b_dir).unwrap();
+    let workspace_a_dir = workspace_a_dir.canonicalize().unwrap();
+    let workspace_b_dir = workspace_b_dir.canonicalize().unwrap();
     let metadata = open_store(&temp);
-    let workspace_id = register_workspace(&metadata, &workspace_dir);
+    let workspace_a = register_workspace(&metadata, &workspace_a_dir);
+    let workspace_b = register_workspace(&metadata, &workspace_b_dir);
     let registry = Arc::new(WindowOwnerRegistry::default());
-    let (owner, capability) = seed_window(&registry, &temp, &workspace_id);
+    let (owner, capability) = seed_window(&registry, &temp, &workspace_a);
     let auth = Arc::new(Mutex::new(RemoteAuth::new(Arc::clone(&metadata))));
+    let runtimes = NativePiManager::new(8);
     let host = tokio::time::timeout(
         STEP,
         HostServer::start(
             temp.join("public"),
-            NativePiManager::new(8),
+            runtimes,
             Arc::clone(&auth),
             Arc::clone(&metadata),
         ),
@@ -194,7 +206,7 @@ async fn wave(tag: &str) -> Wave {
         .store_device_view(
             DEVICE,
             &DeviceView {
-                workspace_id: workspace_id.clone(),
+                workspace_id: workspace_a.clone(),
                 session_id: None,
                 generation: 0,
             },
@@ -203,13 +215,56 @@ async fn wave(tag: &str) -> Wave {
     Wave {
         temp,
         host,
+        auth,
         token,
         capability,
+        owner: owner.as_str().to_owned(),
+        workspace_a,
+        workspace_b,
+        runtimes: Vec::new(),
     }
 }
 
 impl Wave {
+    /// Register a live in-memory runtime for the exact-target admission checks.
+    fn seed_runtime(&mut self, workspace_id: &str, session_id: &str, instance_id: &str) {
+        self.seed_runtime_owned_by(workspace_id, session_id, instance_id, &self.owner.clone());
+    }
+
+    fn seed_runtime_owned_by(
+        &mut self,
+        workspace_id: &str,
+        session_id: &str,
+        instance_id: &str,
+        owner: &str,
+    ) {
+        let target = RuntimeTarget::with_owner(workspace_id, session_id, instance_id, owner, 0);
+        let process = self
+            .host
+            .native_manager()
+            .register_in_memory(target)
+            .expect("in-memory runtime registers");
+        self.runtimes.push(process);
+    }
+
+    /// Move the device view (contract 1: the device's own authority snapshot).
+    fn set_view(&self, workspace_id: &str, generation: u64) {
+        self.auth
+            .lock()
+            .unwrap()
+            .store_device_view(
+                DEVICE,
+                &DeviceView {
+                    workspace_id: workspace_id.to_owned(),
+                    session_id: None,
+                    generation,
+                },
+            )
+            .unwrap();
+    }
+
     fn drop(self) {
+        self.host.native_manager().stop_all();
         self.host.stop();
         let _ = fs::remove_dir_all(self.temp);
     }
@@ -239,6 +294,10 @@ async fn capabilities_are_advertised_per_face_and_the_ack_stays_additive() {
     // same workspaces, so hiding the registry would empty its sidebar.
     assert_eq!(caps["native"], json!(true), "{ack}");
     assert_eq!(caps["management"], json!(false), "{ack}");
+    // The approved revision is additive and non-boolean: a server that
+    // enforces the complete binding contract advertises exactly `1`, and no
+    // client may infer it from `terminal: true`.
+    assert_eq!(caps["terminalBindingVersion"], json!(1), "{ack}");
     // Additive only: dropping the new field leaves exactly the legacy ack.
     let mut legacy = ack.clone();
     legacy.as_object_mut().unwrap().remove("capabilities");
@@ -262,6 +321,13 @@ async fn capabilities_are_advertised_per_face_and_the_ack_stays_additive() {
     for face in ["native", "navigation", "git", "terminal", "management"] {
         assert_eq!(caps[face], json!(true), "desktop {face}: {desktop_ack}");
     }
+    // Desktop keeps its pre-approval envelope: the revision describes the
+    // Remote binding contract, and a desktop connection never needs it.
+    assert_eq!(
+        desktop_ack["capabilities"]["terminalBindingVersion"],
+        Value::Null,
+        "{desktop_ack}"
+    );
     close_quietly(desktop);
     wave.drop();
 }
@@ -478,37 +544,535 @@ async fn workspace_bootstrap_is_a_fixed_schema_op() {
     let _ = fs::remove_dir_all(temp);
 }
 
+/// The approved Remote binding (plan 2026-11-03 §1–§3): the page's workspace
+/// identity plus the canonical bootstrap target, carried alongside the payload.
+fn terminal_frame(request_id: &str, binding: (&str, u64, &str, &str), payload: Value) -> Value {
+    let (workspace_id, generation, session_id, instance_id) = binding;
+    json!({
+        "type": "terminal_command",
+        "requestId": request_id,
+        "workspaceId": workspace_id,
+        "workspaceGeneration": generation,
+        "sessionId": session_id,
+        "instanceId": instance_id,
+        "payload": payload,
+    })
+}
+
 /// The terminal row of the matrix: a device's `terminal_command` runs against
 /// its own view's workspace root instead of the pairing window's registry
-/// binding (the pre-T5 answer was "requires a desktop owner").
+/// binding. Since the 2026-11-03 approval it also has to prove which page and
+/// which exact runtime it belongs to.
 #[tokio::test]
 async fn device_terminal_commands_run_against_the_device_view() {
-    let wave = wave("terminal").await;
+    let mut wave = wave("terminal").await;
+    let workspace_a = wave.workspace_a.clone();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a");
     let (mut device, ack) = connect_device(&wave.host, "device-a", &wave.token).await;
     assert_eq!(ack["type"], "hello_ack", "{ack}");
 
     let reply = send_frame(
         &mut device,
-        json!({
-            "type": "terminal_command", "requestId": "term-1",
-            "payload": { "type": "terminal_list" }
-        }),
+        terminal_frame(
+            "term-1",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
     )
     .await;
     assert_eq!(reply["type"], "terminal_listed", "{reply}");
     assert_eq!(reply["requestId"], "term-1", "{reply}");
 
     // An unknown payload still answers as a failed terminal command (the
-    // device branch is the terminal path, not a silent drop).
+    // device branch is the terminal path, not a silent drop), and it is a
+    // dispatch-level failure: no structured admission code.
     let bad = send_frame(
         &mut device,
-        json!({
-            "type": "terminal_command", "requestId": "term-2",
-            "payload": { "type": "terminal_bogus" }
-        }),
+        terminal_frame(
+            "term-2",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_bogus" }),
+        ),
     )
     .await;
     assert_eq!(bad["type"], "terminal_command_failed", "{bad}");
+    assert_eq!(bad["code"], Value::Null, "{bad}");
+    assert!(
+        bad["error"].as_str().unwrap().contains("terminal_bogus"),
+        "{bad}"
+    );
+
+    close_quietly(device);
+    wave.drop();
+}
+
+/// New server ← old client (plan §1 version matrix): a frame that carries only
+/// the legacy compare token has no page identity and no exact runtime, so it is
+/// rejected with `terminal_protocol_unsupported` for every command family,
+/// before `TerminalManager::dispatch` — no PTY, no terminal state.
+#[tokio::test]
+async fn legacy_terminal_frames_are_rejected_before_dispatch() {
+    let mut wave = wave("terminal-legacy").await;
+    let workspace_a = wave.workspace_a.clone();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a");
+    let (mut device, ack) = connect_device(&wave.host, "device-a", &wave.token).await;
+    // A server that enforces the contract advertises the revision; nothing
+    // weaker may be inferred from `terminal: true`.
+    assert_eq!(
+        ack["capabilities"]["terminalBindingVersion"],
+        json!(1),
+        "{ack}"
+    );
+
+    let payloads = [
+        json!({ "type": "terminal_list" }),
+        json!({ "type": "terminal_create" }),
+        json!({ "type": "terminal_input", "terminalId": "t", "generation": 1 }),
+        json!({ "type": "terminal_resize", "terminalId": "t", "generation": 1 }),
+        json!({ "type": "terminal_ack", "terminalId": "t", "generation": 1 }),
+        json!({ "type": "terminal_checkpoint", "terminalId": "t", "generation": 1 }),
+        json!({ "type": "terminal_close", "terminalId": "t", "generation": 1 }),
+        json!({ "type": "terminal_restart", "terminalId": "t", "generation": 1 }),
+        json!({ "type": "terminal_activate", "terminalId": "t" }),
+        json!({ "type": "terminal_reorder", "terminalId": "t" }),
+        json!({ "type": "terminal_set_panel_height", "heightPx": 300 }),
+    ];
+    for (index, payload) in payloads.into_iter().enumerate() {
+        let reply = send_frame(
+            &mut device,
+            json!({
+                "type": "terminal_command",
+                "requestId": format!("legacy-{index}"),
+                "workspaceGeneration": 0,
+                "payload": payload,
+            }),
+        )
+        .await;
+        assert_eq!(reply["type"], "terminal_command_failed", "{reply}");
+        assert_eq!(
+            reply["requestId"],
+            json!(format!("legacy-{index}")),
+            "{reply}"
+        );
+        assert_eq!(reply["code"], "terminal_protocol_unsupported", "{reply}");
+    }
+
+    // Nothing reached the manager: the workspace still has no terminal.
+    let listed = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-ok",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(listed["type"], "terminal_listed", "{listed}");
+    assert_eq!(listed["tabs"].as_array().unwrap().len(), 0, "{listed}");
+
+    close_quietly(device);
+    wave.drop();
+}
+
+/// Supplied comparison values of the wrong type or range are a different
+/// failure from absent ones: `terminal_binding_invalid`, still before dispatch.
+#[tokio::test]
+async fn malformed_terminal_binding_is_rejected_before_dispatch() {
+    let mut wave = wave("terminal-malformed").await;
+    let workspace_a = wave.workspace_a.clone();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a");
+    let (mut device, _ack) = connect_device(&wave.host, "device-a", &wave.token).await;
+
+    let mut frame = terminal_frame(
+        "term-1",
+        (&workspace_a, 0, "session-a", "instance-a"),
+        json!({ "type": "terminal_create" }),
+    );
+    let cases: Vec<(&str, Value)> = vec![
+        ("workspaceId", json!(7)),
+        ("workspaceId", json!("")),
+        ("workspaceGeneration", json!("0")),
+        ("workspaceGeneration", json!(1.5)),
+        ("workspaceGeneration", json!(9_007_199_254_740_992_u64)),
+        ("sessionId", json!("")),
+        ("instanceId", json!(12)),
+    ];
+    for (index, (field, value)) in cases.into_iter().enumerate() {
+        let mut bad = frame.clone();
+        bad["requestId"] = json!(format!("bad-{index}"));
+        bad[field] = value;
+        let reply = send_frame(&mut device, bad).await;
+        assert_eq!(reply["type"], "terminal_command_failed", "{field}: {reply}");
+        assert_eq!(
+            reply["code"], "terminal_binding_invalid",
+            "{field}: {reply}"
+        );
+    }
+    frame["requestId"] = json!("term-ok");
+    let listed = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-ok",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(listed["tabs"].as_array().unwrap().len(), 0, "{listed}");
+
+    close_quietly(device);
+    wave.drop();
+}
+
+/// Rejection precedence is part of the approved contract (plan §1/§3): schema
+/// before view/root before runtime, and inside schema a *missing* field before a
+/// malformed one. Field read order must not decide which code a frame gets.
+#[tokio::test]
+async fn terminal_rejection_codes_follow_the_approved_precedence() {
+    let mut wave = wave("terminal-precedence").await;
+    let workspace_a = wave.workspace_a.clone();
+    let workspace_b = wave.workspace_b.clone();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a");
+    let (mut device, _ack) = connect_device(&wave.host, "device-a", &wave.token).await;
+
+    // Missing field wins over a malformed one in the same frame.
+    let mut missing_and_malformed = terminal_frame(
+        "prec-1",
+        (&workspace_a, 0, "session-a", "instance-a"),
+        json!({ "type": "terminal_create" }),
+    );
+    missing_and_malformed["workspaceId"] = json!(7);
+    missing_and_malformed
+        .as_object_mut()
+        .unwrap()
+        .remove("sessionId");
+    let reply = send_frame(&mut device, missing_and_malformed).await;
+    assert_eq!(
+        reply["code"], "terminal_protocol_unsupported",
+        "a missing field is a legacy frame whatever the others look like: {reply}"
+    );
+
+    // Malformed beats the view mismatch it would also fail.
+    let mut malformed_and_mismatched = terminal_frame(
+        "prec-2",
+        (&workspace_b, 0, "session-a", "instance-a"),
+        json!({ "type": "terminal_create" }),
+    );
+    malformed_and_mismatched["workspaceGeneration"] = json!("0");
+    let reply = send_frame(&mut device, malformed_and_mismatched).await;
+    assert_eq!(reply["code"], "terminal_binding_invalid", "{reply}");
+
+    // View/root mismatch beats runtime availability: this workspace has no
+    // registered runtime at all, and the frame still reports the binding.
+    let reply = send_frame(
+        &mut device,
+        terminal_frame(
+            "prec-3",
+            (&workspace_b, 0, "session-b", "instance-missing"),
+            json!({ "type": "terminal_create" }),
+        ),
+    )
+    .await;
+    assert_eq!(reply["code"], "terminal_binding_mismatch", "{reply}");
+
+    // With the view and schema valid, the missing exact runtime is the code.
+    let reply = send_frame(
+        &mut device,
+        terminal_frame(
+            "prec-4",
+            (&workspace_a, 0, "session-a", "instance-missing"),
+            json!({ "type": "terminal_create" }),
+        ),
+    )
+    .await;
+    assert_eq!(reply["code"], "terminal_runtime_unavailable", "{reply}");
+
+    // No create reached the manager: the workspace is still empty.
+    let listed = send_frame(
+        &mut device,
+        terminal_frame(
+            "prec-list",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(listed["type"], "terminal_listed", "{listed}");
+    assert_eq!(listed["tabs"].as_array().unwrap().len(), 0, "{listed}");
+
+    close_quietly(device);
+    wave.drop();
+}
+
+/// B1 over the wire: the expected runtime identity carries the *page's* captured
+/// generation, never the live one. A same-instance generation rebind leaves the
+/// device view untouched, so only the page value can tell the page is stale.
+#[tokio::test]
+async fn a_same_instance_generation_rebind_rejects_the_page_binding() {
+    let mut wave = wave("terminal-generation-drift").await;
+    let workspace_a = wave.workspace_a.clone();
+    let owner = wave.owner.clone();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a");
+    let (mut device, _ack) = connect_device(&wave.host, "device-a", &wave.token).await;
+
+    let live = send_frame(
+        &mut device,
+        terminal_frame(
+            "drift-1",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(live["type"], "terminal_listed", "{live}");
+
+    // Same workspace, session, instance and owner; only the runtime generation
+    // moves. Page and device view stay at 0.
+    assert!(
+        wave.host
+            .native_manager()
+            .rebind_owner_generation(&owner, "session-a", 1),
+        "the fixture rebinds the resident runtime"
+    );
+    for (index, payload) in [
+        json!({ "type": "terminal_list" }),
+        json!({ "type": "terminal_create" }),
+        json!({ "type": "terminal_input", "terminalId": "t", "generation": 1 }),
+        json!({ "type": "terminal_close", "terminalId": "t", "generation": 1 }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = send_frame(
+            &mut device,
+            terminal_frame(
+                &format!("drift-{index}"),
+                (&workspace_a, 0, "session-a", "instance-a"),
+                payload,
+            ),
+        )
+        .await;
+        assert_eq!(
+            reply["code"], "terminal_runtime_unavailable",
+            "a page captured before the rebind is stale: {reply}"
+        );
+    }
+
+    // Zero mutation: once the runtime carries the page's generation again, the
+    // workspace still has no terminal (no create leaked through).
+    assert!(wave
+        .host
+        .native_manager()
+        .rebind_owner_generation(&owner, "session-a", 0));
+    let listed = send_frame(
+        &mut device,
+        terminal_frame(
+            "drift-after",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(listed["type"], "terminal_listed", "{listed}");
+    assert_eq!(listed["tabs"].as_array().unwrap().len(), 0, "{listed}");
+
+    close_quietly(device);
+    wave.drop();
+}
+
+/// D1 over the wire: the page's workspace and generation are compared with one
+/// device-view snapshot, so a stale page cannot execute in the workspace the
+/// shared view moved to — and identical numeric generations do not make two
+/// workspaces interchangeable.
+#[tokio::test]
+async fn terminal_binding_is_compared_with_one_device_view_snapshot() {
+    let mut wave = wave("terminal-view").await;
+    let workspace_a = wave.workspace_a.clone();
+    let workspace_b = wave.workspace_b.clone();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a");
+    wave.seed_runtime(&workspace_b, "session-b", "instance-b");
+    let (mut device, _ack) = connect_device(&wave.host, "device-a", &wave.token).await;
+
+    let first = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-a",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(first["type"], "terminal_listed", "{first}");
+
+    // Stale generation inside the same workspace.
+    let stale = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-stale",
+            (&workspace_a, 5, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(stale["code"], "terminal_binding_mismatch", "{stale}");
+
+    // Shared view moves to B. B's generation (0) is numerically identical to
+    // A's, so only the workspace identity can tell the two pages apart.
+    wave.set_view(&workspace_b, 0);
+    let old_page = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-old-a",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_create" }),
+        ),
+    )
+    .await;
+    assert_eq!(old_page["code"], "terminal_binding_mismatch", "{old_page}");
+
+    // The rejection happened before dispatch, so A's workspace still has no
+    // terminal once the view returns to it.
+    wave.set_view(&workspace_a, 0);
+    let listed = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-a-again",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(listed["type"], "terminal_listed", "{listed}");
+    assert_eq!(listed["tabs"].as_array().unwrap().len(), 0, "{listed}");
+
+    // Unregistered workspace: same structured rejection, never a fallback to
+    // the pairing window's root.
+    wave.set_view("workspace-unregistered", 0);
+    let unregistered = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-unregistered",
+            ("workspace-unregistered", 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        unregistered["code"], "terminal_binding_mismatch",
+        "{unregistered}"
+    );
+
+    close_quietly(device);
+    wave.drop();
+}
+
+/// The runtime dependency is the exact target of the page, not any live runtime
+/// in its workspace (approved §5): absence, a stopped/replaced instance, and a
+/// foreign-owner runtime all fail closed with `terminal_runtime_unavailable`.
+#[tokio::test]
+async fn terminal_admission_requires_the_exact_live_target() {
+    let mut wave = wave("terminal-target").await;
+    let workspace_a = wave.workspace_a.clone();
+    let owner = wave.owner.clone();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a");
+    let (mut device, _ack) = connect_device(&wave.host, "device-a", &wave.token).await;
+
+    let unknown = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-unknown",
+            (&workspace_a, 0, "session-a", "instance-missing"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(unknown["code"], "terminal_runtime_unavailable", "{unknown}");
+
+    // A live sibling in the same workspace never rescues a stopped page target.
+    wave.seed_runtime(&workspace_a, "session-b", "instance-b");
+    wave.host
+        .native_manager()
+        .stop(&RuntimeTarget::with_owner(
+            workspace_a.clone(),
+            "session-b",
+            "instance-b",
+            owner.clone(),
+            0,
+        ))
+        .unwrap();
+    let stopped_sibling = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-sibling",
+            (&workspace_a, 0, "session-b", "instance-b"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        stopped_sibling["code"], "terminal_runtime_unavailable",
+        "{stopped_sibling}"
+    );
+    let live_sibling = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-live-sibling",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(live_sibling["type"], "terminal_listed", "{live_sibling}");
+
+    // A runtime owned by someone else is not this page's target.
+    wave.seed_runtime_owned_by(&workspace_a, "session-c", "instance-c", "someone-else");
+    let foreign = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-foreign",
+            (&workspace_a, 0, "session-c", "instance-c"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(foreign["code"], "terminal_runtime_unavailable", "{foreign}");
+
+    // Replacement inside one session: the old instance is gone for good, the
+    // new one needs its own captured binding.
+    wave.host
+        .native_manager()
+        .stop(&RuntimeTarget::with_owner(
+            workspace_a.clone(),
+            "session-a",
+            "instance-a",
+            owner.clone(),
+            0,
+        ))
+        .unwrap();
+    wave.seed_runtime(&workspace_a, "session-a", "instance-a2");
+    let replaced = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-replaced",
+            (&workspace_a, 0, "session-a", "instance-a"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        replaced["code"], "terminal_runtime_unavailable",
+        "{replaced}"
+    );
+    let replacement = send_frame(
+        &mut device,
+        terminal_frame(
+            "term-replacement",
+            (&workspace_a, 0, "session-a", "instance-a2"),
+            json!({ "type": "terminal_list" }),
+        ),
+    )
+    .await;
+    assert_eq!(replacement["type"], "terminal_listed", "{replacement}");
 
     close_quietly(device);
     wave.drop();

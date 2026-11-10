@@ -7,7 +7,12 @@
 
 import { createComposerDraftStore } from "./app/composer-draft-store.js";
 import { resolveComposerSessionIdentity } from "./app/composer-session-identity.js";
-import { connectHost, HOST_PARAM, watchCredentialInvalid } from "./app/host-connection.js";
+import {
+  connectHost,
+  HOST_PARAM,
+  supportsRemoteTerminal,
+  watchCredentialInvalid,
+} from "./app/host-connection.js";
 import { installHostOriginFetch } from "./app/host-origin.js";
 import { createPromptDelivery } from "./app/prompt-delivery.js";
 import { createSessionStoppedBanner } from "./app/session-stopped-banner.js";
@@ -82,6 +87,7 @@ import {
 } from "./preferences-client.js";
 import { renderPreviewThemeOptions } from "./preview-themes.js";
 import { QuickChatDialog } from "./quick-chat-dialog.js";
+import { RemoteTerminalAttachment } from "./remote-terminal-attachment.js";
 import { resolvePreparedRuntimeTarget } from "./session/in-place-runtime-target.js";
 import {
   shouldRefreshSidebarForNewSession,
@@ -1710,6 +1716,63 @@ const terminalPanel = new TerminalPanel({
     },
   },
 });
+// ── Remote terminal attachment (plan 2026-11-03 §4) ────────────────────────
+// A remote-host page may only send terminal frames after it has proven, on the
+// current connection: the approved binding revision, a freshly captured
+// canonical target for *this page's* workspace/session, and the authoritative
+// list for that target. Desktop keeps its generation handoff untouched.
+const REMOTE_TERMINAL_REASON_MESSAGES = {
+  protocol: () => t("terminal.remoteUnavailableProtocol"),
+  runtime: () => t("terminal.remoteUnavailableRuntime"),
+};
+function applyRemoteTerminalState(state, detail = {}) {
+  const reason = detail.reason || (state === "unavailable" ? "runtime" : null);
+  let message = "";
+  if (state === "attaching") message = t("terminal.remoteAttaching");
+  else if (state === "blocked") message = t("terminal.remoteBindingBlocked");
+  else if (state === "unavailable") message = REMOTE_TERMINAL_REASON_MESSAGES[reason]?.() || "";
+  // One explicit recovery action per state: retry re-queries a live runtime,
+  // reload re-navigates a page whose binding moved (D1). A protocol gap has no
+  // client-side remedy, so it gets guidance only.
+  let onRetry = null;
+  let retryLabel = "";
+  if (state === "unavailable" && reason === "runtime") {
+    onRetry = () => void remoteTerminal?.retry();
+  } else if (state === "blocked") {
+    onRetry = () => globalThis.location?.reload?.();
+    // Blocked means the page's binding moved (D1): the action re-navigates, so
+    // it is labelled for what it does instead of a generic retry.
+    retryLabel = t("terminal.reload");
+  }
+  // Anything but ready means the binding this projection described is gone
+  // (plan §4, B3): drop its tabs/active/activity from the page. No frame is
+  // sent, so daemon PTYs keep running, and the banner below stays visible.
+  if (state !== "ready") terminalPanel.clearProjection?.();
+  terminalPanel.setAvailability(state, { message, onRetry, retryLabel });
+}
+const remoteTerminal = remoteHost
+  ? new RemoteTerminalAttachment({
+      client: terminalClient,
+      capabilities: () =>
+        wsClient.authenticated
+          ? {
+              ...transport.capabilities,
+              terminalBindingSupported: supportsRemoteTerminal(transport.capabilities),
+            }
+          : null,
+      connectionEpoch: () => wsClient.connectionEpoch,
+      route: () => {
+        const target = wsClient.getRuntimeTarget();
+        return target?.workspaceId && target?.sessionId
+          ? { workspaceId: target.workspaceId, sessionId: target.sessionId }
+          : null;
+      },
+      queryContext: (query) => wsClient.queryCanonicalTarget(query),
+      onState: (state, detail) => applyRemoteTerminalState(state, detail),
+    })
+  : null;
+const refreshRemoteTerminal = () => void remoteTerminal?.notifyConnection();
+
 // Find bar for the terminal panel. Mounted lazily together with the panel
 // (mountTerminalPanelIfNative) and opened via Cmd/Ctrl+F from the global
 // keydown handler when the terminal has focus.
@@ -1740,6 +1803,15 @@ function mountTerminalPanelIfNative() {
   }
   windowCloseCoordinator.registerParticipant("terminal", terminalPanel);
 }
+if (remoteTerminal) {
+  // Read the *current* authenticated state as well as subscribing: `connected`
+  // already fired during the top-level canonical bootstrap, long before these
+  // handlers existed (plan §4).
+  wsClient.addEventListener("connected", refreshRemoteTerminal);
+  wsClient.addEventListener("hostCapabilities", refreshRemoteTerminal);
+  wsClient.addEventListener("disconnected", () => remoteTerminal.notifyDisconnect());
+  refreshRemoteTerminal();
+}
 wsClient.addEventListener("terminalEvent", (event) => {
   const msg = event.detail || {};
   // Async PTY events arrive wrapped in a `terminal_event` envelope.
@@ -1756,7 +1828,14 @@ wsClient.addEventListener("terminalEvent", (event) => {
   }
   // Synchronous command responses (terminal_created/listed/closed/...).
   terminalClient.resolveResponse(msg);
+  // One epoch gate in front of every synchronous response (plan §4, R1): a reply
+  // to a request issued before the last invalidation can neither rebuild tabs,
+  // trigger another list, nor block a newer attachment.
+  if (remoteTerminal && !remoteTerminal.ownsResponse(msg)) return;
   if (msg.type === "terminal_listed") {
+    // A list that does not belong to the current attachment attempt (or that
+    // arrives after invalidation) must not rebuild tabs or enable input.
+    if (remoteTerminal && !remoteTerminal.acceptListed(msg)) return;
     terminalClient.applyListed(msg);
     terminalPanel.setTabs(
       (msg.tabs || []).map((tab) => ({
@@ -1772,6 +1851,8 @@ wsClient.addEventListener("terminalEvent", (event) => {
     if (Number.isFinite(msg.panelHeightPx)) {
       terminalPanel.setHeight(msg.panelHeightPx);
     }
+    // Ready only after the authoritative list is the local projection (R2).
+    remoteTerminal?.listedApplied(msg);
   } else if (
     msg.type === "terminal_created" ||
     msg.type === "terminal_restarted" ||
@@ -1780,9 +1861,29 @@ wsClient.addEventListener("terminalEvent", (event) => {
     terminalClient.command({ type: "terminal_list" });
   }
 });
+// Admission rejections carry the approved code (plan §3). They are terminal
+// state, not transient command errors: retrying them with another list is the
+// loop this branch exists to prevent.
+const REMOTE_TERMINAL_REJECTIONS = new Set([
+  "terminal_protocol_unsupported",
+  "terminal_binding_invalid",
+  "terminal_binding_mismatch",
+  "terminal_runtime_unavailable",
+]);
 wsClient.addEventListener("terminalCommandFailed", (event) => {
-  const message = event.detail?.error;
-  const commandType = terminalClient.consumeCommandType(event.detail?.requestId);
+  const detail = event.detail || {};
+  const message = detail.error;
+  const commandType = terminalClient.consumeCommandType(detail.requestId);
+  if (remoteTerminal) {
+    // Same epoch gate as success responses: a failure from an invalidated
+    // attempt must not block the current one or start a list (R1).
+    if (!remoteTerminal.ownsResponse(detail)) return;
+    if (REMOTE_TERMINAL_REJECTIONS.has(detail.code)) {
+      console.warn("[terminal] remote admission rejected:", detail);
+      remoteTerminal.bindingRejected(detail.code, detail.requestId);
+      return;
+    }
+  }
   console.warn("[terminal] command failed:", event.detail);
   if (
     (commandType === "terminal_create" || commandType === "terminal_restart") &&
@@ -1795,6 +1896,48 @@ wsClient.addEventListener("terminalCommandFailed", (event) => {
 });
 mountTerminalPanelIfNative();
 
+/**
+ * Freeze the Remote terminal for a locally initiated workspace/session
+ * transition (plan §4): user command entry points close *before* the commit,
+ * the controlled checkpoint runs while the old binding is still valid, and the
+ * binding is invalidated immediately before the commit so nothing can be sent
+ * under it. Desktop has no remote attachment and keeps its behavior.
+ */
+async function beginTerminalTransition() {
+  if (!remoteTerminal) {
+    // Desktop keeps its original pre-commit checkpoint: the panel freezes and
+    // checkpoints every running tab, and the caller cancels on refusal.
+    await terminalPanel.beforeWorkspaceTransition?.();
+    return;
+  }
+  await remoteTerminal.beginTransition(() => terminalPanel.beforeWorkspaceTransition?.());
+}
+function cancelTerminalTransition() {
+  terminalPanel.cancelWorkspaceTransition?.();
+  if (!remoteTerminal) return;
+  // After `commitTerminalTransition` the binding is already gone, so the
+  // attachment takes a fresh one instead of unfreezing a dead binding.
+  void remoteTerminal.cancelTransition();
+}
+function commitTerminalTransition() {
+  // Invalidate before the commit: no command may be sent under the old binding
+  // while the host binds the new workspace/session. The panel stays frozen —
+  // the checkpoint is done, but the binding is not replaced yet.
+  if (!remoteTerminal) return;
+  remoteTerminal.commitTransition();
+}
+
+/**
+ * The host commit succeeded. Only now does the transition give its interaction
+ * lock back: a cross-workspace navigation keeps the panel frozen until the page
+ * leaves, and a page that stays reattaches to the new binding here. The release
+ * is the transition's own hold, so a window-close transaction in flight stays
+ * frozen (plan §4).
+ */
+function finishTerminalTransition({ reattach = false } = {}) {
+  terminalPanel.finishWorkspaceTransition?.();
+  if (reattach) refreshRemoteTerminal();
+}
 async function prepareEphemeralWorkspaceTransition() {
   quickChatDialog.setInteractionLocked(true);
   filePreviewPanel.setInteractionLocked(true);
@@ -1802,7 +1945,7 @@ async function prepareEphemeralWorkspaceTransition() {
     const accepted = await sideChatManager.prepareWorkspaceTransition();
     if (accepted) {
       sideChatManager.setInteractionLocked(true);
-      await terminalPanel.beforeWorkspaceTransition?.();
+      await beginTerminalTransition();
     } else {
       quickChatDialog.setInteractionLocked(false);
       filePreviewPanel.setInteractionLocked(false);
@@ -1820,14 +1963,16 @@ function cancelEphemeralWorkspaceTransition() {
   sideChatManager.setInteractionLocked(false);
   quickChatDialog.setInteractionLocked(false);
   filePreviewPanel.setInteractionLocked(false);
-  terminalPanel.cancelWorkspaceTransition?.();
+  cancelTerminalTransition();
 }
 
 wsClient.addEventListener("ownerBootstrap", async (event) => {
   if (!nativeAvailable()) return;
-  // The host advertises the current workspace generation; terminal commands
-  // carry it as a compare-only attachment token (broker rejects a mismatch).
-  if (typeof event.detail?.workspaceGeneration === "number") {
+  // Owner bootstrap is the *desktop* generation handoff. On a remote-host page
+  // the same owner id can receive the owner's broadcast, and letting it write
+  // the terminal/Git generation would rebind this page to another window's
+  // workspace. The ephemeral bootstrap below stays for both.
+  if (!remoteHost && typeof event.detail?.workspaceGeneration === "number") {
     terminalClient.setWorkspaceGeneration(event.detail.workspaceGeneration);
     gitClient.setWorkspaceGeneration(event.detail.workspaceGeneration);
     // The generation is now known: (re)probe status unconditionally. Covers
@@ -2947,6 +3092,9 @@ setupNotificationWindowEvents({
 wsClient.addEventListener("runtimeEvent", (e) => {
   const frame = e.detail;
   if (!frame?.event) return;
+  // Exact-target runtime loss invalidates the Remote terminal binding; a late
+  // event from an older instance leaves a newer binding alone (plan §4).
+  remoteTerminal?.handleRuntimeEvent(frame);
   // M3 mutual exclusion: OAuth envelopes are consumed first and never reach
   // the config gateway or chat rendering; config responses follow.
   if (oauthGateway.consumeFrame(frame)) return;
@@ -5911,6 +6059,7 @@ async function handleNewProjectChat(project) {
       shouldSpawnParallel: () => mobileClientMode,
       navigate: navigateInWindow,
       onBeforeSwap: onBeforeInstanceSwap,
+      beforeWorkspaceCommit: () => commitTerminalTransition(),
       beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
       onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
       renderError: (message) => messageRenderer.renderError(message),
@@ -6013,12 +6162,15 @@ async function handleSessionSelectImpl(session, project) {
       if (typeof prepared?.transitionGeneration !== "number") {
         throw new Error("Workspace transition was not prepared");
       }
+      await beginTerminalTransition();
+      commitTerminalTransition();
       await transport.commitWorkspaceTransition(prepared.transitionGeneration);
       snapshotUiStateForNavigation();
       navigateInWindow(prepared.targetOrigin, { targetCwd: selectedWorkspacePath });
       return;
     } catch (error) {
       console.error("[Session route] workspace transition failed:", error);
+      cancelTerminalTransition();
       messageRenderer.renderError(t("errors.failedToSwitchSession", { error }));
       return;
     }
@@ -6066,6 +6218,10 @@ async function handleSessionSelectImpl(session, project) {
       if (typeof prepared?.transitionGeneration !== "number") {
         throw new Error("Session runtime transition was not prepared");
       }
+      // Same-workspace selection keeps the page: invalidate the old binding
+      // before the commit, then reattach to the prepared target.
+      await beginTerminalTransition();
+      commitTerminalTransition();
       await transport.commitWorkspaceTransition(prepared.transitionGeneration);
       const instances = (await transport.runtimeInstances())?.instances || [];
       const target = resolvePreparedRuntimeTarget(instances, prepared);
@@ -6092,8 +6248,10 @@ async function handleSessionSelectImpl(session, project) {
       // the snapshot; whichever lands first paints, and the snapshot render
       // then chooses between the two sources.
       void fetchDiskHistory(target, session.filePath);
+      finishTerminalTransition({ reattach: true });
     } catch (error) {
       console.error("[Session route] runtime transition failed:", error);
+      cancelTerminalTransition();
       messageRenderer.renderError(t("errors.failedToSwitchSession", { error }));
     }
     return;
@@ -6454,7 +6612,23 @@ globalThis.__picotSessionDebug = sessionDebug;
 globalThis.__picotSessionView = {
   select: handleSessionSelect,
   configReady: () => configReadiness.isReady(),
+  // Test seam for the same-workspace session branch: it compares against the
+  // file browser's current workspace, which only a host-driven file-tree load
+  // sets. jsdom cannot run that load, so the route tests seed the value instead
+  // of faking the handler they assert.
+  setFileBrowserWorkspacePath: (path) => {
+    fileBrowserWorkspacePath = path;
+  },
 };
+// Remote terminal attachment inspection: the state machine's own state plus the
+// panel's rendered availability (no DOM scraping in tests).
+globalThis.__picotRemoteTerminal = remoteTerminal
+  ? {
+      state: () => remoteTerminal.state,
+      availability: () => terminalPanel.availability,
+      retry: () => remoteTerminal.retry(),
+    }
+  : null;
 
 // Upstream switch hydration state: the disk history captured once per
 // startup/switch. The snapshot render compares against it instead of
@@ -8477,6 +8651,7 @@ function handleRegisteredWorkspace(targetCwd) {
     transport,
     navigate: navigateInWindow,
     onBeforeSwap: onBeforeInstanceSwap,
+    beforeWorkspaceCommit: () => commitTerminalTransition(),
     beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
     onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
     renderError: (message) => messageRenderer.renderError(message),
@@ -8495,6 +8670,7 @@ async function handleOpenFolder() {
       transport,
       navigate: navigateInWindow,
       onBeforeSwap: onBeforeInstanceSwap,
+      beforeWorkspaceCommit: () => commitTerminalTransition(),
       beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
       onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
       renderError: (message) => messageRenderer.renderError(message),

@@ -954,3 +954,74 @@ describe("WebSocketClient remote canonical bootstrap", () => {
     expect(http).not.toHaveBeenCalled();
   });
 });
+
+describe("canonical bootstrap query (Remote terminal context)", () => {
+  function bridgeClient(route = { workspaceId: "w-page", sessionId: "s-page" }) {
+    const sent = [];
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", { identity: "bridge" });
+    client.ws = {
+      readyState: WebSocket.OPEN,
+      send: (message) => sent.push(JSON.parse(message)),
+    };
+    client.workspaceId = route.workspaceId;
+    client.sessionId = route.sessionId;
+    client._instanceIdValue = "i-page";
+    return { client, sent };
+  }
+
+  test("sends the captured ids and applies nothing to routing", async () => {
+    const { client, sent } = bridgeClient();
+    const subscribe = vi.spyOn(client, "_subscribeCanonicalTarget");
+    const snapshot = vi.spyOn(client, "_requestCanonicalSnapshot");
+    const before = client.getRuntimeTarget();
+
+    const pending = client.queryCanonicalTarget({ workspaceId: "w-other", sessionId: "s-other" });
+    const frame = sent.at(-1);
+    expect(frame).toMatchObject({
+      type: "data_request",
+      operation: "workspace.bootstrap",
+      workspaceId: "w-other",
+      sessionId: "s-other",
+    });
+
+    client.handleMessage({
+      type: "data_response",
+      requestId: frame.requestId,
+      operation: "workspace.bootstrap",
+      target: { workspaceId: "w-other", sessionId: "s-other", instanceId: "i-other" },
+    });
+    await expect(pending).resolves.toMatchObject({ instanceId: "i-other" });
+
+    // Side-effect free: the page keeps its own route, subscriptions, snapshot.
+    expect(client.getRuntimeTarget()).toEqual(before);
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(snapshot).not.toHaveBeenCalled();
+  });
+
+  test("a refused query rejects with the host's code instead of a fabricated target", async () => {
+    const { client, sent } = bridgeClient();
+    const pending = client.queryCanonicalTarget({ workspaceId: "w-page", sessionId: "s-page" });
+    const frame = sent.at(-1);
+    client.handleMessage({
+      type: "error",
+      requestId: frame.requestId,
+      error: { code: "runtime_not_found", message: "Runtime target is not running" },
+    });
+    await expect(pending).rejects.toMatchObject({ code: "runtime_not_found" });
+  });
+
+  test("a query without a workspace or session is answered locally", async () => {
+    const { client, sent } = bridgeClient();
+    await expect(client.queryCanonicalTarget({})).resolves.toBeNull();
+    expect(sent).toHaveLength(0);
+  });
+
+  test("connectionEpoch advances with every authenticated ack", async () => {
+    const { client } = bridgeClient();
+    expect(client.connectionEpoch).toBe(0);
+    client.handleMessage({ type: "hello_ack", protocolVersion: 2, capabilities: {} });
+    expect(client.connectionEpoch).toBe(1);
+    client.handleMessage({ type: "hello_ack", protocolVersion: 2, capabilities: {} });
+    expect(client.connectionEpoch).toBe(2);
+  });
+});

@@ -20,6 +20,13 @@ export const LAST_HOST_KEY = "picot-last-host";
 /** Faces a hello_ack may advertise (contract 1 / D2 action matrix). */
 const FACES = ["native", "navigation", "git", "terminal", "management"];
 
+/**
+ * The only Remote terminal binding revision this client knows (plan
+ * 2026-11-03 §1). A server that enforces the whole admission contract
+ * advertises exactly this integer; anything else is unavailable.
+ */
+export const TERMINAL_BINDING_REVISION = 1;
+
 function locationOf(env) {
   return env?.location || globalThis.location;
 }
@@ -69,7 +76,27 @@ export function readCapabilities(ack) {
   const native = face("native");
   const capabilities = { native, class: native ? "native" : "remote" };
   for (const name of FACES) if (name !== "native") capabilities[name] = face(name);
+  // Non-boolean revision: kept verbatim so the terminal gate can require the
+  // exact approved value. Absent, string, boolean, or unknown revisions all
+  // collapse to 0 — no optimistic downgrade, and the legacy face defaults above
+  // stay byte-identical for every other consumer.
+  const revision = advertised?.terminalBindingVersion;
+  capabilities.terminalBindingVersion =
+    Number.isSafeInteger(revision) && revision > 0 ? revision : 0;
   return capabilities;
+}
+
+/**
+ * Whether this connection may run Remote terminal commands at all. Both the
+ * face and the approved revision are required on the *current* authenticated
+ * connection: `terminal: true` alone, an old server, or a stale ack from a
+ * previous connection never authorizes a terminal frame.
+ */
+export function supportsRemoteTerminal(capabilities) {
+  return (
+    capabilities?.terminal === true &&
+    capabilities?.terminalBindingVersion === TERMINAL_BINDING_REVISION
+  );
 }
 
 /**

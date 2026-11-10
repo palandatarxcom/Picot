@@ -228,13 +228,13 @@ relay 数据面绕开 axum 入口的物理帧上限，各上限统一进契约�
 | 数据面：runtime 订阅/请求/快照、文件、聊天、steer | 放行 | 授权对象改为 device view（原为窗口 owner + generation 复读） |
 | 导航：`workspace.list`、`workspace_target_prepare/commit/cancel`、打开会话 | 放行 | 全部走 device view 分支；并发 prepare/commit 按 generation 拒绝旧请求并显式报错 |
 | Git（`git.*`） | 放行 | 归入导航面，cwd 按请求参数校验（同现状） |
-| terminal（`terminal_command`） | 放行 | 新 device 分支，cwd 取 device view 的 workspace 根 |
+| terminal（`terminal_command`） | 放行，需 approved binding | 新 device 分支：先按 §3 绑定契约校验（页面 workspaceId + generation 对一次 device view 快照，sessionId/instanceId 为捕获的 canonical target），root 取自同一快照，再经 exact-runtime admission 守卫后同步 dispatch；cwd 是 device view 的 workspace 根 |
 | 工作区创建/删除/停止、设置类、admin（`daemon.status`/`stop`/`restart`） | 永拒 | Desktop-only 不变 |
 
 - **桥的信任边界（契约 3）**：随机 loopback 端口是隐蔽性，不是认证——任何本机进程或浏览器页面都能连到它。桥因此要求**每窗口一份 grant**：`host_grant` 只对注入的 `WebviewWindow` 铸凭据（窗口身份不信客户端自报），凭据绑定 `server_id` 与该窗口当时的页面 origin；proxy 在改写或拨号**之前**校验 hello 里的 `bridgeGrant`（精确 Origin + host + 活窗口），缺失、伪造、跨 host、跨窗口、窗口已关闭的一律关连接且**不注入**任何凭据，`rewrite` 同时剥掉客户端伪造的同名/凭据字段。Origin 是纵深防御（浏览器无法伪造），grant 才是认证。窗口切换先 release、窗口销毁先同步吊销再异步清理；`invalidate_window` 先失效后断活连接，避免吊销与重认证交错。这不是「同机同用户即信任」：本地 daemon 的 `/v2/ws` 未认证只能落只读面，桥却是零认证即注入 deviceToken，两者威胁模型不同。首帧非 hello 或 15s 超时同样关连接、不注入凭据。
   桥与窗口的参考计数不变；proxy 结束时**只有当其 relay 会话尚未 hello 过（或已换成新一代会话）**才保留该会话供重拨复用，否则连会话一起停——daemon 会话只应答一次 hello，保留已 hello 的会话会让 WebView 重连收到 `invalid_frame` 并陷入重连循环。
 - **hello_ack 净化（契约 3）**：配对模式下远端 `hello_ack` 携带新铸 deviceToken——桥解析该帧、接管持久化，向 WebView 只转发**剔除 `deviceToken` 后**的 ack；持久化失败则关连接并把配对状态置 `PairingFailed`（重开新 offer 才能再配对，不静默丢 token，也不假装成功）。普通模式 ack 不含凭据，原样转发；其余业务帧不解析、双向透传。本机 desktopCapability 绝不出本机，deviceToken 只在 Rust 侧出现（日志走既有 token redaction）。
-- **wire 白名单（§12 已点头）**：既有帧一律不改；新增仅限两项——`workspace.bootstrap` 受限 op（由 HTTP 盘点定名单方法、固定 schema，长度/超时沿 `transport_limits`，**禁止任意 URL 代理**）、`hello_ack.capabilities` 对象（additive，前端据此放行管理面；老客户端忽略）。其余扩展须先改 spec。
+- **wire 白名单（§12 已点头；2026-11-03 增补 terminal binding）**：既有帧一律不改；新增仅限三项——（3）`hello_ack.capabilities.terminalBindingVersion: 1`（整数修订号，additive；只在服务端对每一条 Remote 终端命令执行完整 §3 契约时宣告，桥净化后仍保留；缺失/字符串/布尔/未知值一律不可用，老客户端忽略）——另两项是`workspace.bootstrap` 受限 op（由 HTTP 盘点定名单方法、固定 schema，长度/超时沿 `transport_limits`，**禁止任意 URL 代理**）、`hello_ack.capabilities` 对象（additive，前端据此放行管理面；老客户端忽略）。其余扩展须先改 spec。
 - **HTTP 面处置（契约 2）**：relay 通道只隧道 WS 会话帧，没有 HTTP 承接协议，本地加代理路由也不会让远端 handler 可达——因此**不做通用 HTTP 代理**，前端每个相对 HTTP 调用逐项三选一：映射到既有/新增受限 WS op、远程模式显式禁用、显式保持本机（静态资源）。清盘与逐项处置见 `docs/superpowers/specs/not-started/2026-10-19-relay-phase2-5-http-inventory.md`（文档留存，不再有守卫测试）。
 - **切换 = 页面级重载（契约 4）**：host 参数在**窗口 URL** 上，切换即导航 + 整页重载，模块闭包、投影、pending、在途请求随旧页面消亡；草稿与 keyed cache 按 host 命名空间存 localStorage 跨重载保留；切前 flush 复用既有 quit 前 flush 机制。桥**按 host 共享、按窗口引用计数**：同一 host 多窗口共享一个桥，桥上每条 proxy 连接 = 一条独立 relay 会话；最后一个窗口离开才停桥。同 host 双窗口共享同一个 device view。
 - **host_store 威胁边界**：`app_config_dir/picot-hosts.json`（0600，tmp+rename 原子替换，写失败保旧文件）存 HostProfile 与 deviceToken。服务端只存 token hash，这里存的是**明文 bearer token**——泄露后果**重于**服务端库，本机同用户任意进程可读；本期接受，macOS Keychain 留作后续加固。此文件同时是 TOFU 信任基线，**损坏不回退默认值**：保留原文件、阻塞覆盖性保存、UI 要求重新配对或手动恢复。本机删 host 只删本地 profile+token，远端设备记录仍在（撤销是远端 owner 的动作）。
@@ -376,6 +376,22 @@ Sidebar session discovery follows Pi `/resume`: one registered workspace bucket 
 Normal and Focus share `public/sidebar/session-tree-model.js`: missing parents and malformed cycles are promoted/broken without dropping files, then flattened with Pi-style branch prefixes. Normal shows five sessions initially per expanded workspace and adds ten per request; Focus uses the same five/ten pagination. Normal loads registry history lazily on expansion; Focus ensures the selected workspace history when entered. Session selection is not a registry data refresh: same-workspace selection updates the active row and chat history without a WebView reload, while cross-workspace selection prepares/commits a new runtime and navigates to its host-origin route. `focusWorkspaceId` is carried only when the target canonical cwd matches the focused workspace and is removed for cross-workspace or unknown navigation.
 
 已知实现边界：host-wide 的两个完整扫描 permit 当前只包住 `workspace_sessions`；兼容/独立的 `list_sessions` 与 `search_sessions` 仍各自 `spawn_blocking`，不共享该上限。sidebar 的 registry count warmup 由 WebView 对所有 registry rows 并行发起，冷启动通过 `requestIdleCallback({ timeout: 800 })` 调度，空闲不足时也会在该上限到期后执行。它们是性能债务，不是 session 数据一致性或授权依据；若扩大 workspace 数量或搜索频率，应先将这些路径纳入统一 scan scheduler，再提高任何并发上限。
+
+### 运行时准入守卫（terminal admission，2026-11-03 Dr. Lin 拍板）
+
+Remote 终端命令的「精确 runtime 仍然存活」不是一次查询，而是一段与生命周期转换共享的线性化区间。`NativePiManager::with_live_terminal_target(expected, dispatch)` 持 `admission` 锁完成三件事，并在同一把锁内同步执行 `TerminalManager::dispatch`：
+
+- `closing` 墓碑命中（`stop` 的 admission-closing 步骤在同一把锁内落碑）→ 拒绝；
+- 注册表里的 exact target 必须与 `expected` 全字段相等（workspace/session/instance/generation/owner，owner 由服务端盖章）；
+- coordinator 观测状态不得是 `Crashed`/`Stopped`（崩溃路径在同一把锁内改状态）。
+
+锁图是「`admission` 在外层，内部锁分段取用、逐段释放」：`admission → closing`（取完释放）→ `admission → runtimes → target`（取完释放）→ `admission → coordinator`（取完释放）。`with_live_terminal_target` 不同时持有多把内部锁；`stop` 的 tombstone 落碑与 crash 路径的 Crashed 迁移都先取 `admission`，因此不存在「检查后再 dispatch」的窗口，也不引入 `closing → coordinator` 嵌套（既有 `request` 是 `coordinator → closing`，反向嵌套会被禁止）。持 `admission` 期间只调用不再自行取锁的私有实现（`mark_crashed`、`remove_closed_runtime`），入口方法自己取锁后再委托给它们，因此不存在持守卫递归取 `admission` 的路径。
+
+同一临界区覆盖全部身份变更，不只是 dispatch 与 stop：owner 重绑（`rebind_runtime_owner`）、generation 重绑（`rebind_owner_generation`）、session 重绑（`bind_session_id`）都在 `admission` 内先核对旧身份、再拒绝 closing 墓碑、再改 coordinator、再 mirror runtimes；`stop` 在 `admission` 内重新验证 exact identity 后才落碑（验证与落碑之间身份被重绑则拒绝该 stop）；crash/exit 路径（`crash_and_remove`）在一次 `admission` 内读取注册表当前身份、完成 Crashed 迁移并按该 exact target removal——身份捕获、crash 与 removal 不再是三个各自取锁的步骤，因此重绑要么发生在捕获之前（崩溃归给重绑后的身份），要么发生在 removal 之后（找不到可复活的对象），不存在「crash 与 removal 都被拒、死 runtime 留在 registry 里」的窗口。event pump 用注册表当前身份归属退出而不是 spawn 时的陈旧 target。先后语义只有两种：守卫先赢 → 同步 dispatch 在 stop 关闭准入前跑完，重绑要等它；closing/crash/removal 先赢 → 之后所有命令在 dispatch 之前被拒（即使 registry 仍在、`runtime_stopped` 事件尚未送达），且该 target 不能被重绑复活。
+
+已知边界（不是缺口）：保证起点是宿主观测到的 closing/removal，不是物理进程死亡的瞬间；已准入的字节/PTY 输出不会被撤销，`stop` 也不杀死已存在的 PTY；完整 PTY 进程执行不被序列化；diagnostics 类进程崩溃与宿主检测之间仍有间隙。PTY 输入为限时写（每个 terminal 一个 writer 线程 + 有界队列，超时是显式失败而不是静默丢弃），因此「子进程不读 stdin」不会把 `admission` 无限期占住——但注入到内核缓冲的字节仍可能在守卫释放后才被读出，这是同一「不撤销已准入字节」边界的表现。状态 IO / spawn 仍发生在守卫内（`terminal_create` 在 `with_live_terminal_target` 的闭包里同步 spawn 并持久化，`HostServer` 整段 dispatch 都在守卫内执行），因此本设计**不证明**端到端时限；给出的是 PTY 输入的有界等待，不是整个 dispatch 的有界时长。
+
+前端对已失效 epoch 的迟到响应一律丢弃：`TerminalClient` 以「最近一次失效时的 requestId 上限」（单调 id 边界，非无界 map）作为统一 epoch 门，普通成功、失败与 list 响应都在进入 `app.js` 处理前校验，input/ack 同样落在这个边界内。`Attaching` 只放行受控初始 list，用户命令（xterm 键盘、面板控件）要等权威 list 应用后才开放。
 
 ### 子进程注册表与孤儿清扫
 

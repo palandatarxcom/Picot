@@ -51,6 +51,7 @@ async function attachToWorkspace({
   transport,
   navigate,
   onBeforeSwap,
+  beforeWorkspaceCommit,
   beforeWorkspaceTransition,
   onWorkspaceTransitionCancelled,
   renderError,
@@ -75,6 +76,10 @@ async function attachToWorkspace({
         throw new Error("Workspace transition was not prepared");
       }
       dismissOverlay = runOnBeforeSwap(onBeforeSwap, "Opening workspace…");
+      // The caller invalidates anything bound to the workspace being left
+      // *before* the host commits (plan 2026-11-03 §4): the freeze alone still
+      // allows the controlled checkpoint, not a lasting binding.
+      beforeWorkspaceCommit?.();
       await transport.commitWorkspaceTransition(prepared.transitionGeneration);
       navigate(prepared.targetOrigin, { targetCwd });
       return { samePort: false, targetOrigin: prepared.targetOrigin };
@@ -100,6 +105,7 @@ export async function startRegisteredWorkspaceSession({
   transport,
   navigate,
   onBeforeSwap,
+  beforeWorkspaceCommit,
   beforeWorkspaceTransition,
   onWorkspaceTransitionCancelled,
   renderError,
@@ -117,6 +123,7 @@ export async function startRegisteredWorkspaceSession({
     transport,
     navigate,
     onBeforeSwap,
+    beforeWorkspaceCommit,
     beforeWorkspaceTransition,
     onWorkspaceTransitionCancelled,
     renderError,
@@ -130,6 +137,7 @@ export async function startInWindowNewSession({
   getCurrentCwd,
   navigate,
   onBeforeSwap,
+  beforeWorkspaceCommit,
   beforeWorkspaceTransition,
   onWorkspaceTransitionCancelled,
   renderError,
@@ -167,6 +175,7 @@ export async function startInWindowNewSession({
     transport,
     navigate,
     onBeforeSwap,
+    beforeWorkspaceCommit,
     beforeWorkspaceTransition,
     onWorkspaceTransitionCancelled,
     renderError,
@@ -183,6 +192,7 @@ async function spawnFreshSession({
   transport,
   navigate,
   onBeforeSwap,
+  beforeWorkspaceCommit,
   beforeWorkspaceTransition,
   onWorkspaceTransitionCancelled,
   renderError,
@@ -212,6 +222,7 @@ async function spawnFreshSession({
       throw new Error("Native workspace transition was not prepared");
     }
     dismissOverlay = runOnBeforeSwap(onBeforeSwap, label);
+    beforeWorkspaceCommit?.();
     await transport.commitWorkspaceTransition(prepared.transitionGeneration);
     console.debug(`[Session route] ${debugTag}:created`, { targetCwd });
     navigate(prepared.targetOrigin, { targetCwd });
@@ -245,6 +256,7 @@ export async function startNewProjectChat({
   shouldSpawnParallel,
   navigate,
   onBeforeSwap,
+  beforeWorkspaceCommit,
   beforeWorkspaceTransition,
   onWorkspaceTransitionCancelled,
   renderError,
@@ -282,6 +294,7 @@ export async function startNewProjectChat({
       transport,
       navigate,
       onBeforeSwap,
+      beforeWorkspaceCommit,
       beforeWorkspaceTransition,
       onWorkspaceTransitionCancelled,
       renderError,
@@ -297,6 +310,7 @@ export async function startNewProjectChat({
       transport,
       navigate,
       onBeforeSwap,
+      beforeWorkspaceCommit,
       beforeWorkspaceTransition,
       onWorkspaceTransitionCancelled,
       renderError,
@@ -309,6 +323,7 @@ export async function startNewProjectChat({
     transport,
     navigate,
     onBeforeSwap,
+    beforeWorkspaceCommit,
     beforeWorkspaceTransition,
     onWorkspaceTransitionCancelled,
     renderError,
@@ -327,6 +342,7 @@ export async function openProjectWorkspace({
   transport,
   navigate,
   onBeforeSwap,
+  beforeWorkspaceCommit,
   beforeWorkspaceTransition,
   onWorkspaceTransitionCancelled,
   renderError,
@@ -348,6 +364,7 @@ export async function openProjectWorkspace({
       transport,
       onBeforeSwap,
       navigate,
+      beforeWorkspaceCommit,
       beforeWorkspaceTransition,
       onWorkspaceTransitionCancelled,
       renderError,
@@ -363,6 +380,7 @@ export async function openFolderAsWorkspace({
   transport,
   navigate,
   onBeforeSwap,
+  beforeWorkspaceCommit,
   beforeWorkspaceTransition,
   onWorkspaceTransitionCancelled,
   renderError,
@@ -389,6 +407,7 @@ export async function openFolderAsWorkspace({
       transport,
       navigate,
       onBeforeSwap,
+      beforeWorkspaceCommit,
       beforeWorkspaceTransition,
       onWorkspaceTransitionCancelled,
       renderError,
