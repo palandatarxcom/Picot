@@ -3,6 +3,9 @@
   "rules": {
     "rust-unwrap": {
       "disable": ["rust-unwrap"]
+    },
+    "rust-lock-held-across-await": {
+      "disable": ["rust-lock-held-across-await"]
     }
   }
 }

@@ -5,8 +5,12 @@
 useDefault = true
 
 [allowlist]
-description = "Rust build artifacts (compiled dependency metadata)"
-paths = ['''(^|/)target/''', '''\.rmeta$''']
+description = "Rust build artifacts, local-only memory digests, and crate identifiers"
+# `target/` and `*.rmeta` are gitignored build output. `.memory/` is gitignored
+# local session digests: their logs quote daemon owner/workspace UUIDs, which
+# the generic-api-key rule reads as a credential when a log line pairs a keyword
+# with an adjacent hex value. None of these files are committed.
+paths = ['''(^|/)target/''', '''\.rmeta$''', '''(^|/)\.memory/''']
 # Prose in docs reads like a key-value pair to gitleaks' generic-api-key rule
 # whenever it contains a keyword (e.g. "access") within ~20 chars of a comma
 # separator followed by a >=10-char value — README's "quick access to Compact,
@@ -14,3 +18,13 @@ paths = ['''(^|/)target/''', '''\.rmeta$''']
 # every turn via the turn-end secrets gate. These words never belong to a real
 # credential, so stopword them instead of excluding markdown from the lane.
 stopwords = ["Expand", "Collapse", "Compact"]
+# Cargo.lock lists `"crypto_secretbox",` followed by `"curve25519-dalek"` in a
+# `dependencies = [...]` array; the "secret" substring plus the adjacent quoted
+# value makes the generic-api-key rule report the pair on every scan. Both are
+# crate identifiers, never credentials. The hex string is the literal fake token
+# in the session-export URL tests (`#[cfg(test)]` in src-tauri/src/main.rs).
+regexes = [
+  '''crypto_secretbox''',
+  '''curve25519-dalek''',
+  '''0123456789abcdef0123456789abcde''',
+]
