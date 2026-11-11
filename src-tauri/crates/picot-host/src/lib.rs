@@ -24,6 +24,7 @@ pub mod cache_optimizer_config;
 pub mod caveman_config;
 pub mod child_supervision;
 pub mod environment_install;
+pub mod environment_mirror;
 pub mod environment_probe;
 pub mod environment_prompt;
 pub mod fff_config;

@@ -364,7 +364,7 @@ mod windows_impl {
             .collect();
         if managed.is_empty() {
             let next = format!("{current};{pi_dir}");
-            write_user_path(&wide(&next)[..next.len()], kind)?;
+            write_user_path(&user_path_units(&next), kind)?;
             return Ok("user Path: updated".into());
         }
         Ok("user Path: already configured".into())
@@ -384,7 +384,7 @@ mod windows_impl {
             .filter(|entry| !entry.eq_ignore_ascii_case(pi_dir))
             .collect::<Vec<_>>()
             .join(";");
-        write_user_path(&wide(&next)[..next.len()], kind)?;
+        write_user_path(&user_path_units(&next), kind)?;
         Ok("user Path: removed".into())
     }
 }
@@ -396,4 +396,46 @@ pub(crate) fn apply_windows(pi_dir: &str) -> Result<String, String> {
 #[cfg(target_os = "windows")]
 pub(crate) fn remove_windows(pi_dir: &str) -> Result<String, String> {
     windows_impl::remove(pi_dir)
+}
+
+/// The UTF-16 code units of a user-Path value, without a NUL terminator:
+/// `write_user_path` appends its own. Slicing a `wide()` buffer by the
+/// string's UTF-8 byte length silently assumes ASCII — a CJK character is
+/// 3 UTF-8 bytes but 1 UTF-16 unit, so that index overruns the buffer and
+/// panics before the write can even return an error.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn user_path_units(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+#[cfg(test)]
+mod user_path_units_tests {
+    use super::*;
+
+    #[test]
+    fn user_path_units_count_utf16_elements_not_utf8_bytes() {
+        // The Windows writer appends its own NUL, so the value carries no
+        // terminator and its length is the UTF-16 element count — which for
+        // any non-ASCII entry differs from the UTF-8 byte length the old
+        // slicing code used as an index.
+        let non_ascii = "C:\\Users\\林\\R\\bin\\x64";
+        let units = user_path_units(non_ascii);
+        assert_eq!(units, non_ascii.encode_utf16().collect::<Vec<_>>());
+        assert!(!units.contains(&0), "no terminator: the writer adds one");
+        assert_ne!(
+            units.len(),
+            non_ascii.len(),
+            "UTF-8 byte length must not stand in for the UTF-16 element count"
+        );
+        let mixed = "C:\\Users\\林\\.cargo\\bin;C:\\Users\\林\\R\\bin\\x64";
+        assert_eq!(
+            user_path_units(mixed),
+            mixed.encode_utf16().collect::<Vec<_>>()
+        );
+        let ascii = "C:\\Program Files\\R\\R-4.6.2\\bin\\x64";
+        assert_eq!(
+            user_path_units(ascii),
+            ascii.encode_utf16().collect::<Vec<_>>()
+        );
+    }
 }

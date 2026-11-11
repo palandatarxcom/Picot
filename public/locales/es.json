@@ -1612,6 +1612,8 @@
       "version": "Versión",
       "path": "Ruta",
       "siteLabel": "Página oficial",
+      "restartHint": "Instalado, pero R aún no está en el PATH de Picot: reinicie Picot para que las sesiones de agente puedan usarlo",
+      "offPathHint": "Instalado (detectado en el registro), pero no está en el PATH: ejecute Instalar/Actualizar aquí y Picot lo añadirá al Path del usuario",
       "install": "Instalar",
       "update": "Actualizar",
       "retry": "Reintentar",
@@ -1646,6 +1648,10 @@
         "uv": {
           "name": "uv",
           "purpose": "Gestión de dependencias de herramientas y proyectos Python"
+        },
+        "r": {
+          "name": "R",
+          "purpose": "Runtime de computación estadística R (R/Rscript), necesario para proyectos y paquetes de R; no es RStudio"
         },
         "officecli": {
           "name": "OfficeCLI",

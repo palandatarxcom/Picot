@@ -39,10 +39,11 @@ use crate::runtime_coordinator::RuntimeTarget;
 use crate::session_ui_profile_store::validate_session_path;
 use crate::window_owner::{self, WindowOwnerRegistry};
 use crate::{
-    cache_optimizer_config, caveman_config, environment_probe, fff_config, git_pi_runner,
-    goal_config, host_credentials, host_data, host_ephemeral, host_models, host_router,
-    host_skills, lens_config, package_manager, pi_path, ponytail_config, project_trust,
-    rpiv_config, search_env_config, skill_install, vcc_config, windows_child, workspace_controls,
+    cache_optimizer_config, caveman_config, environment_mirror, environment_probe, fff_config,
+    git_pi_runner, goal_config, host_credentials, host_data, host_ephemeral, host_models,
+    host_router, host_skills, lens_config, package_manager, pi_path, ponytail_config,
+    project_trust, rpiv_config, search_env_config, skill_install, vcc_config, windows_child,
+    workspace_controls,
 };
 use serde_json::{json, Map, Value};
 use std::fs::{self, File};
@@ -516,7 +517,7 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         let installer = installer.as_ref().map_err(|error| error.clone())?;
                         let tool_arg = arg_str("tool").unwrap_or_default();
                         let tool = environment_probe::ToolId::from_str(&tool_arg)
-                            .ok_or("tool must be git, python3, npm, uv, officecli or dws")?;
+                            .ok_or("tool must be git, python3, npm, uv, r, officecli or dws")?;
                         let action = match arg_str("action").as_deref() {
                             Some("install") => environment_probe::ToolAction::Install,
                             Some("update") => environment_probe::ToolAction::Update,
@@ -525,7 +526,16 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                         // The prompt is built from the host's own facts, never
                         // from the page: the page cannot widen the scope.
                         let probe = environment_probe::probe_one(tool);
-                        let snapshot = installer.start(tool, action, &probe)?;
+                        // R only: resolve the download entry from CRAN's
+                        // official mirror list (network, 5s budget) before the
+                        // installer takes its lock; every other tool installs
+                        // from the official page.
+                        let download_url = if tool == environment_probe::ToolId::R {
+                            environment_mirror::select_r_download_url().await
+                        } else {
+                            environment_mirror::CRAN_OFFICIAL_URL.to_string()
+                        };
+                        let snapshot = installer.start(tool, action, &probe, &download_url)?;
                         Ok(serde_json::to_value(snapshot).map_err(|error| error.to_string())?)
                     }
                     "environment_install_status" | "environment_install_cancel" => {
