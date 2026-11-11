@@ -275,7 +275,12 @@ describe("connectHost", () => {
   test("remote asks host_status and uses the bridge URL", async () => {
     const invoke = vi.fn(async (command) => {
       if (command === "host_status")
-        return { serverId: "r1", status: "online", wsUrl: "ws://127.0.0.1:55123/v2/ws" };
+        return {
+          serverId: "r1",
+          status: "online",
+          wsUrl: "ws://127.0.0.1:55123/v2/ws",
+          bridgeGrantVersion: 1,
+        };
       throw new Error(`unexpected command ${command}`);
     });
     const connection = await connectHost({
@@ -283,7 +288,7 @@ describe("connectHost", () => {
       invoke,
     });
     expect(invoke.mock.calls).toEqual([["host_status", { serverId: "r1" }]]);
-    expect(connection).toEqual({
+    expect(connection).toMatchObject({
       host: "r1",
       identity: "bridge",
       wsUrl: "ws://127.0.0.1:55123/v2/ws",
@@ -292,6 +297,9 @@ describe("connectHost", () => {
         capabilitiesFromAck: readCapabilities,
       },
     });
+    // The connection authorizes through the dedicated command, never the status
+    // call and never an endpoint the page can dial on its own.
+    expect(connection.clientOptions.bridgeGrantProvider).toEqual(expect.any(Function));
   });
 
   const recoveryEnv = (href, storage = new Map()) => {
@@ -334,20 +342,18 @@ describe("connectHost", () => {
     expect(replaced).toEqual(["http://127.0.0.1:47821/?workspaceId=w1"]);
   });
 
-  test("a host that reports no bridge URL falls back instead of dialing the origin", async () => {
+  test("a host that reports no bridge URL is blocked instead of dialing the origin", async () => {
     const { env, replaced } = recoveryEnv("http://127.0.0.1:47821/?host=r1");
     const invoke = vi.fn(async (command) => {
       if (command === "host_status") return { serverId: "r1", status: "offline" };
       throw new Error(`unexpected command ${command}`);
     });
     const connection = await connectHost({ env, invoke });
-    expect(connection).toEqual({
-      host: LOCAL_HOST,
-      identity: "desktop",
-      wsUrl: "ws://127.0.0.1:47821/v2/ws",
-      clientOptions: { capabilitiesFromAck: readCapabilities },
-    });
-    expect(replaced).toEqual(["http://127.0.0.1:47821/"]);
+    // No bridge means no grant authority: the entry blocks rather than dialing
+    // the page origin (an Origin-only bridge is exactly what T3 closed) and
+    // rather than silently downgrading this window to the local host.
+    expect(connection).toEqual({ host: "r1", identity: "bridge", blocked: true });
+    expect(replaced).toEqual([]);
   });
 
   test("the recovery redirect runs once, so it can never loop on itself", async () => {
@@ -433,5 +439,145 @@ describe("applyLastHostDefault", () => {
       },
     };
     expect(await applyLastHostDefault({ env: unreadable, invoke: failing })).toBeNull();
+  });
+});
+
+describe("bridge grant delivery", () => {
+  const GRANT = "bg1_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+  const WS = "ws://127.0.0.1:55123/v2/ws";
+  const remoteEnv = () => ({ location: { href: "http://127.0.0.1:47821/?host=r1" } });
+  const statusReply = (overrides = {}) => ({
+    serverId: "r1",
+    status: "online",
+    wsUrl: WS,
+    bridgeGrantVersion: 1,
+    ...overrides,
+  });
+
+  async function connect(handler) {
+    const invoke = vi.fn(async (command, args) => {
+      if (command === "host_status") return statusReply();
+      if (command === "host_grant") return handler(command, args);
+      throw new Error(`unexpected command ${command}`);
+    });
+    const connection = await connectHost({ env: remoteEnv(), invoke });
+    return { connection, invoke };
+  }
+
+  test("the bridge connection carries a command-backed grant provider", async () => {
+    const { connection, invoke } = await connect(async () => ({
+      bridgeGrantVersion: 1,
+      bridgeGrant: GRANT,
+      wsUrl: WS,
+    }));
+    expect(connection).toMatchObject({ host: "r1", identity: "bridge", wsUrl: WS });
+    expect(connection.blocked).toBeUndefined();
+    expect(typeof connection.clientOptions.bridgeGrantProvider).toBe("function");
+    await expect(connection.clientOptions.bridgeGrantProvider()).resolves.toBe(GRANT);
+    // Identity comes from the injected window; the command carries only the host.
+    expect(invoke.mock.calls[1]).toEqual(["host_grant", { serverId: "r1" }]);
+  });
+
+  test("each call asks the app for a fresh grant", async () => {
+    let issued = 0;
+    const { connection } = await connect(async () => {
+      issued += 1;
+      return { bridgeGrantVersion: 1, bridgeGrant: GRANT, wsUrl: WS };
+    });
+    const { bridgeGrantProvider } = connection.clientOptions;
+    await bridgeGrantProvider();
+    await bridgeGrantProvider();
+    expect(issued).toBe(2);
+  });
+
+  test.each([
+    ["wrong version", { bridgeGrantVersion: 2 }],
+    ["missing version", { bridgeGrantVersion: undefined }],
+    ["another endpoint", { wsUrl: "ws://127.0.0.1:1/v2/ws" }],
+    ["a missing grant", { bridgeGrant: undefined }],
+    ["a malformed grant", { bridgeGrant: "not-a-grant" }],
+    ["a grant with trailing data", { bridgeGrant: `${GRANT}X` }],
+    ["a nonstring grant", { bridgeGrant: 42 }],
+  ])("a reply with %s is a fixed nonsecret failure", async (_name, overrides) => {
+    const { connection } = await connect(async () => ({
+      bridgeGrantVersion: 1,
+      bridgeGrant: GRANT,
+      wsUrl: WS,
+      ...overrides,
+    }));
+    await expect(connection.clientOptions.bridgeGrantProvider()).rejects.toThrow(
+      "Host grant unavailable",
+    );
+  });
+
+  test("a failing command reports a fixed error, never the raw IPC reply", async () => {
+    const { connection } = await connect(async () => {
+      throw new Error("Host grant unavailable: bg1_secretleak");
+    });
+    await expect(connection.clientOptions.bridgeGrantProvider()).rejects.toThrow(
+      "Host grant unavailable",
+    );
+    await expect(connection.clientOptions.bridgeGrantProvider()).rejects.not.toThrow(
+      /bg1_secretleak/,
+    );
+  });
+
+  test("a bridge without grant version 1 is blocked, never dialed or downgraded", async () => {
+    const { env, replaced, rewrites } = (() => {
+      const replaced = [];
+      const rewrites = [];
+      return {
+        replaced,
+        rewrites,
+        env: {
+          location: {
+            href: "http://127.0.0.1:47821/?host=r1",
+            protocol: "http:",
+            host: "127.0.0.1:47821",
+            replace: (url) => replaced.push(url),
+          },
+          sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+          history: { replaceState: (_state, _title, url) => rewrites.push(url) },
+        },
+      };
+    })();
+    const invoke = vi.fn(async () => ({
+      serverId: "r1",
+      status: "online",
+      wsUrl: WS,
+    }));
+    const connection = await connectHost({ env, invoke });
+    expect(connection).toEqual({ host: "r1", identity: "bridge", blocked: true });
+    expect(connection.wsUrl).toBeUndefined();
+    expect(connection.clientOptions).toBeUndefined();
+    expect(replaced).toEqual([]);
+    expect(rewrites).toEqual([]);
+    expect(invoke.mock.calls).toEqual([["host_status", { serverId: "r1" }]]);
+  });
+
+  test("no grant ever reaches browser storage, history or the URL", async () => {
+    const sentinel = `bg1_${"S".repeat(43)}`;
+    const stored = [];
+    const rewrites = [];
+    const env = {
+      location: { href: "http://127.0.0.1:47821/?host=r1" },
+      localStorage: { getItem: () => null, setItem: (...args) => stored.push(args) },
+      sessionStorage: {
+        getItem: () => null,
+        setItem: (...args) => stored.push(args),
+        removeItem: () => {},
+      },
+      history: { replaceState: (...args) => rewrites.push(args) },
+    };
+    const invoke = vi.fn(async (command) => {
+      if (command === "host_status")
+        return { serverId: "r1", status: "online", wsUrl: WS, bridgeGrantVersion: 1 };
+      return { bridgeGrantVersion: 1, bridgeGrant: sentinel, wsUrl: WS };
+    });
+    const connection = await connectHost({ env, invoke });
+    await connection.clientOptions.bridgeGrantProvider();
+    expect(JSON.stringify(connection)).not.toContain(sentinel);
+    expect(JSON.stringify(stored)).not.toContain(sentinel);
+    expect(JSON.stringify(rewrites)).not.toContain(sentinel);
   });
 });

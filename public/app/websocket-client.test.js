@@ -1025,3 +1025,232 @@ describe("canonical bootstrap query (Remote terminal context)", () => {
     expect(client.connectionEpoch).toBe(2);
   });
 });
+
+describe("bridge grant admission", () => {
+  const GRANT = "bg1_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+  const OTHER = "bg1_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+
+  /** Lets the provider promise chain (adoption + then) settle. */
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** A real-enough WebSocket so `connect()` can construct it. */
+  function installSockets() {
+    const created = [];
+    class FakeSocket {
+      constructor(url) {
+        this.url = url;
+        this.readyState = 0;
+        this.sent = [];
+        created.push(this);
+      }
+      send(message) {
+        this.sent.push(JSON.parse(message));
+      }
+      close() {
+        this.readyState = 3;
+      }
+      open() {
+        this.readyState = 1;
+        this.onopen?.();
+      }
+    }
+    const previous = globalThis.WebSocket;
+    globalThis.WebSocket = FakeSocket;
+    return { created, restore: () => (globalThis.WebSocket = previous) };
+  }
+
+  test("a bridge attempt awaits its provider before opening any socket", async () => {
+    const { created, restore } = installSockets();
+    const secret = `bg1_${"A".repeat(43)}`;
+    let release;
+    const provider = vi.fn(() => new Promise((resolve) => (release = resolve)));
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+      identity: "bridge",
+      bridgeGrantProvider: provider,
+    });
+    try {
+      client.connect();
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(created).toHaveLength(0);
+      release(secret);
+      await flush();
+      expect(created).toHaveLength(1);
+      created[0].open();
+      expect(created[0].sent[0]).toMatchObject({ type: "hello", bridgeGrant: secret });
+      expect(created[0].sent[0].desktopCapability).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a stale attempt that resolves after a reconnect opens no socket", async () => {
+    const { created, restore } = installSockets();
+    const resolvers = [];
+    const provider = vi.fn(() => new Promise((resolve) => resolvers.push(resolve)));
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+      identity: "bridge",
+      bridgeGrantProvider: provider,
+    });
+    try {
+      client.connect();
+      // The socket never opened; a fresh attempt starts while the first is pending.
+      client.connectionState = "closed";
+      client.connect();
+      expect(provider).toHaveBeenCalledTimes(2);
+      resolvers[0](GRANT);
+      await flush();
+      expect(created).toHaveLength(0);
+      resolvers[1](OTHER);
+      await flush();
+      expect(created).toHaveLength(1);
+      created[0].open();
+      expect(created[0].sent[0].bridgeGrant).toBe(OTHER);
+    } finally {
+      restore();
+    }
+  });
+
+  test("every reconnect asks the command for a fresh grant", async () => {
+    const { created, restore } = installSockets();
+    const provider = vi.fn(async () => GRANT);
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+      identity: "bridge",
+      bridgeGrantProvider: provider,
+    });
+    try {
+      client.connect();
+      await flush();
+      created[0].open();
+      expect(created[0].sent[0].bridgeGrant).toBe(GRANT);
+      // A dropped socket reconnects: the grant is reissued, never reused.
+      provider.mockResolvedValue(OTHER);
+      created[0].readyState = 3;
+      client.connectionState = "closed";
+      client.connect();
+      await flush();
+      created[1].open();
+      expect(created[1].sent[0].bridgeGrant).toBe(OTHER);
+      expect(provider).toHaveBeenCalledTimes(2);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a rejected, missing or malformed grant opens no socket and reports a fixed error", async () => {
+    const { created, restore } = installSockets();
+    const cases = [
+      { name: "rejected command", provider: () => Promise.reject(new Error("ipc leaked secret")) },
+      { name: "no provider", provider: undefined },
+      { name: "not a grant", provider: async () => "deviceToken" },
+      { name: "null grant", provider: async () => null },
+      { name: "undefined grant", provider: async () => undefined },
+      { name: "non-string grant", provider: async () => 42 },
+    ];
+    try {
+      for (const { name, provider } of cases) {
+        created.length = 0;
+        const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+          identity: "bridge",
+          bridgeGrantProvider: provider,
+        });
+        const errors = [];
+        client.addEventListener("error", (event) => errors.push(event.detail));
+        client.connect();
+        await flush();
+        expect(created, name).toHaveLength(0);
+        expect(client.connectionState, name).toBe("closed");
+        expect(errors, name).toEqual([{ code: "bridge_grant_unavailable" }]);
+        client.disconnect();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("stale socket callbacks cannot overwrite a replacement attempt", async () => {
+    const { created, restore } = installSockets();
+    const first = `bg1_${"A".repeat(43)}`;
+    const second = `bg1_${"B".repeat(43)}`;
+    const provider = vi.fn(async () => first);
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+      identity: "bridge",
+      bridgeGrantProvider: provider,
+    });
+    const disconnected = vi.fn();
+    client.addEventListener("disconnected", disconnected);
+    try {
+      client.connect();
+      await flush();
+      created[0].open();
+      expect(client.connectionState).toBe("open");
+
+      // The first socket dies at transport level; the replacement connects.
+      client.connectionState = "closed";
+      client.ws.readyState = 3;
+      provider.mockResolvedValue(second);
+      client.connect();
+      await flush();
+      created[1].open();
+      expect(client.connectionState).toBe("open");
+      expect(client.ws).toBe(created[1]);
+      const hellos = created[1].sent.filter((frame) => frame.type === "hello");
+      expect(hellos).toHaveLength(1);
+      expect(hellos[0].bridgeGrant).toBe(second);
+
+      // The old socket's late close must not close the new attempt, schedule a
+      // retry, or resurrect the old grant's hello path.
+      const retries = vi.spyOn(client, "attemptReconnect");
+      created[0].onclose({ code: 1006 });
+      created[0].onopen?.();
+      created[0].onmessage({ data: '{"type":"hello_ack"}' });
+      expect(client.connectionState).toBe("open");
+      expect(client.ws).toBe(created[1]);
+      expect(retries).not.toHaveBeenCalled();
+      expect(disconnected).not.toHaveBeenCalled();
+      retries.mockRestore();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a disconnected attempt issues no socket when its grant arrives late", async () => {
+    const { created, restore } = installSockets();
+    let release;
+    const provider = vi.fn(() => new Promise((resolve) => (release = resolve)));
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+      identity: "bridge",
+      bridgeGrantProvider: provider,
+    });
+    try {
+      client.connect();
+      client.disconnect();
+      release(GRANT);
+      await flush();
+      expect(created).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("the issued grant is never cached on the client outside its attempt", async () => {
+    const { created, restore } = installSockets();
+    const secret = `bg1_${"Q".repeat(43)}`;
+    const client = new WebSocketClient("ws://127.0.0.1:49000/v2/ws", {
+      identity: "bridge",
+      bridgeGrantProvider: async () => secret,
+    });
+    try {
+      client.connect();
+      await flush();
+      created[0].open();
+      // The socket's own `sent` frames are the wire, not client state: a real
+      // WebSocket exposes no such field. Everything else on the instance must be
+      // grant-free, and the provider itself is a function, never the secret.
+      const own = Object.entries(client).filter(([key]) => key !== "ws");
+      expect(JSON.stringify(own)).not.toContain(secret);
+      expect(typeof client._bridgeGrantProvider).toBe("function");
+    } finally {
+      restore();
+    }
+  });
+});

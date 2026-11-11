@@ -3,7 +3,7 @@
 **状态：** Draft 修订 2（定稿） — 军师二轮评审（R2-01–R2-12）吸收完毕，四份实施契约（§5.2）与 §12 两项（wire 扩展、页面级重载切换）已获 Dr. Lin 同意（2026-10-20，「同意军师的意见」）。plan 按契约重排为 Draft 3；终审通过后开工。
 **日期：** 2026-10-19
 
-**现行实现偏差（Dr. Lin 要求按代码更新）：** 本文保留下方原始 grant 设计和评审记录供追溯，但 §2.2、§5、§5.2、§10 和 §12 中 per-window grant、精确 Origin 与 grant 吊销的要求不描述当前实现。当前 `relay/host_bridge.rs` 检查 Origin 为 HTTP loopback host；首帧须为 hello，桥剥除客户端提交的 `bridgeGrant` 等凭据并注入桥持有的设备或配对凭据，不签发或验证窗口 grant。随机端口和 Origin 不构成可靠的本机调用方认证；本机进程可伪造 Origin，潜在风险尚未验证。当前行为与安全边界以 `ARCHITECTURE.md` 为准；此记录不声称漏洞已复现或已修复。
+**现行实现偏差（Dr. Lin 要求按代码更新；per-window grant 已于 2026-11-10 实现）：** 本文保留下方原始 grant 设计和评审记录供追溯。§2.2、§5、§5.2、§10 与 §12 中 per-window grant、精确 Origin 与 grant 吊销的要求现已实现：`host_grant` 命令从注入窗口推导身份，为当前 `(窗口, host)` 绑定铸造 47 字符随机秘密（`bg1_` + 43 个 base64url，仅内存，重发即替换）；前端把它放进首个 `hello.bridgeGrant`（不进 URL、存储、日志）；桥在读取凭据、改写 hello、拨号之前校验秘密 + 未撤销 + 精确页面 Origin，失败零副作用；窗口关闭、切 host、删除 host 与 app 退出同步作废并取消该绑定拥有的 proxy；异步清理按绑定身份而非 label，同 label 重开不受迟到清理影响。与原文的两处刻意差异：grant 不注入 window init script，而是经专用命令按需取得；重连重发新秘密并作废旧秘密（不是单次使用，也没有定时过期）。残留风险：有效 bearer 泄漏可重放到重发/作废为止；被盗 bearer 与伪造精确 Origin 组合仍可冒充窗口；真实桌面生命周期次序的证据尚未补齐。当前行为与安全边界以 `ARCHITECTURE.md` 为准；此记录不声称本文其他未实现的 gap 已被修复。
 **演化关系：** 母 spec `implemented/2026-09-20-persistent-daemon-relay-design.md` §4.6（Phase 2.5 增补）的实施化设计。Phase 2 daemon 侧（`2026-10-17-relay-phase2-pair-device-design.md`，T0–T12）已交付：daemon 出站 relay、E2EE、一扫码配对、Gate B、设备撤销、真 relay 冒烟 OK。本文把桌面版 Picot 变成可连接任意远程 host 的完整客户端。协议事实引母 spec §2 与 pair-device spec，不重复调研。
 **参照：** Paseo `packages/app/src/types/host-connection.ts`（HostProfile/RelayHostConnection）、`runtime/host-runtime.ts`（连接工厂/链接消费）、`runtime/host-confirmation.ts`（TOFU 语义与指纹格式）、`hosts/host-confirmation-sheet.tsx`、`packages/client/src/daemon-client-relay-e2ee-transport.ts`（客户端 E2EE 传输包装）。
 

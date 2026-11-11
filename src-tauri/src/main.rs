@@ -35,8 +35,8 @@ use daemon_client::surface_ops::ForwardedSurfaceOps;
 use daemon_client::window_ledger::{route_for_url, LedgerRow, WindowLedger};
 #[cfg(target_os = "macos")]
 use host_client::commands::{
-    host_add, host_confirm_tofu, host_list, host_remove, host_status, relay_device_list,
-    relay_revoke_device,
+    host_add, host_confirm_tofu, host_grant, host_list, host_remove, host_status,
+    relay_device_list, relay_revoke_device,
 };
 use picot_host::daemon::admin::ManagerIdentity;
 use picot_host::{child_supervision, window_owner};
@@ -315,6 +315,14 @@ fn open_native_window(
     // fail-closed, with the opaque `about:` exceptions as the only survivors of
     // a dropped admin channel.
     let nav_owner = owner.as_str().to_string();
+    // An accepted navigation that leaves this window's current host binding
+    // (different origin, or a different ?host= on the same origin) invalidates
+    // that binding synchronously; the async cleanup follows under the same
+    // identity. The same host at the same origin is the designed reconnect.
+    let nav_client = app
+        .try_state::<host_client::HostClientState>()
+        .map(|state| state.0.clone());
+    let nav_label = label.to_string();
     let parsed_url: tauri::Url = url
         .parse()
         .map_err(|error| format!("Invalid native Host URL: {error}"))?;
@@ -325,7 +333,38 @@ fn open_native_window(
         .icon(icon)
         .map_err(|error| error.to_string())?
         .initialization_script(init_script)
-        .on_navigation(move |url| mirror.authorize(&nav_owner, url))
+        .on_navigation(move |url| {
+            let allowed = mirror.authorize(&nav_owner, url);
+            if allowed {
+                // Only a top-level http(s) document carries the page's host
+                // binding; `about:` documents are sandboxed preview subframes.
+                if let Some(Ok(client)) = &nav_client {
+                    if !matches!(url.scheme(), "http" | "https") {
+                        return allowed;
+                    }
+                    // Parsed origin and decoded `host` (never a fragment), so
+                    // this agrees with the page's own `URL.searchParams`.
+                    let page_origin = url.origin().ascii_serialization();
+                    let host_param = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "host")
+                        .map(|(_, value)| value.into_owned());
+                    let captured = client.invalidate_window_on_navigation(
+                        &nav_label,
+                        &page_origin,
+                        host_param.as_deref(),
+                    );
+                    if captured.is_some() {
+                        let client = client.clone();
+                        let label = nav_label.clone();
+                        tauri::async_runtime::spawn(async move {
+                            client.close_window_with(&label, captured).await;
+                        });
+                    }
+                }
+            }
+            allowed
+        })
         .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
         // Built hidden so the saved geometry is applied before the first
         // paint: restoring a visible window shows a resize jump.
@@ -3280,8 +3319,13 @@ fn main() {
                     if let Ok(client) = &state.0 {
                         let client = client.clone();
                         let label = window.label().to_owned();
+                        // The authorization dies synchronously, before the
+                        // async task can wait on the core lock: a late grant
+                        // or admission for this window is impossible, and the
+                        // captured identity protects a same-label replacement.
+                        let captured = client.invalidate_window(&label);
                         tauri::async_runtime::spawn(async move {
-                            client.close_window(&label).await;
+                            client.close_window_with(&label, captured).await;
                         });
                     }
                 }
@@ -3319,6 +3363,7 @@ fn main() {
             host_confirm_tofu,
             host_remove,
             host_status,
+            host_grant,
             relay_device_list,
             relay_revoke_device
         ])

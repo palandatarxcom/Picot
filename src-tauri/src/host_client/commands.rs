@@ -63,7 +63,25 @@ pub async fn host_status(
     server_id: String,
 ) -> Result<Value, String> {
     let (client, id, origin) = caller(&app, &window)?;
-    client.status(&id, &origin, &server_id).await
+    // Captured before the command can await: a delayed status must not
+    // re-issue authorization for a binding the window has left.
+    let captured = client.capture(&id);
+    client.status(&id, &origin, &server_id, captured).await
+}
+
+/// Issue this window's bridge grant for the host it is currently attached to.
+/// Identity comes from the injected window, never from the arguments: the
+/// secret is minted for the caller's own binding and cannot be requested for,
+/// renewed for or revoked from another window's binding.
+#[tauri::command]
+pub async fn host_grant(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    server_id: String,
+) -> Result<Value, String> {
+    let (client, id, origin) = caller(&app, &window)?;
+    let captured = client.capture(&id);
+    client.grant(&id, &origin, &server_id, captured).await
 }
 #[tauri::command]
 pub async fn relay_device_list(

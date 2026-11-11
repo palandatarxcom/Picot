@@ -14,6 +14,11 @@ const WS_OPEN = 1;
 const WS_CLOSING = 2;
 const WS_CLOSED = 3;
 
+// `bg1_` plus 43 unpadded base64url characters (32 random bytes). The shape is
+// re-checked here so a malformed value can never reach the wire, whatever the
+// provider returned.
+const BRIDGE_GRANT_PATTERN = /^bg1_[A-Za-z0-9_-]{43}$/;
+
 /**
  * Resolve sole WebSocket endpoint from current HostServer origin.
  *
@@ -30,12 +35,22 @@ export function resolveWebSocketUrl(env = globalThis.window || globalThis) {
 }
 
 export class WebSocketClient extends EventTarget {
-  constructor(url, { identity = "desktop", capabilitiesFromAck } = {}) {
+  constructor(url, { identity = "desktop", capabilitiesFromAck, bridgeGrantProvider } = {}) {
     super();
     this.url = url;
     // "bridge" is a window behind the app-owned loopback bridge (remote host):
-    // its hello never carries the desktop capability.
+    // its hello never carries the desktop capability, and it presents its
+    // per-window grant instead.
     this.identity = identity;
+    // Identity-level requirement, not a transport option: a bridge connection
+    // without a provider can never authorize, so it opens no socket at all.
+    this._bridgeGrantProvider =
+      identity === "bridge" && typeof bridgeGrantProvider === "function"
+        ? bridgeGrantProvider
+        : null;
+    // Discards stale async grants and callbacks only; never an authorization
+    // mechanism the server sees.
+    this._attempt = 0;
     this._capabilitiesFromAck = capabilitiesFromAck || (() => ({ native: true, class: "native" }));
     this.ws = null;
     this.reconnectAttempts = 0;
@@ -133,17 +148,76 @@ export class WebSocketClient extends EventTarget {
     if (this.ws && (this.ws.readyState === WS_CLOSING || this.ws.readyState === WS_CLOSED)) {
       this.ws = null;
     }
-    this.ws = new WebSocket(this.url);
+    // One token per attempt: a grant that resolves after a disconnect or a newer
+    // attempt is dropped instead of authorizing a stale socket.
+    const attempt = ++this._attempt;
+    if (this.identity !== "bridge") {
+      this._openSocket(attempt, null);
+      return;
+    }
+    // A bridge connection is authorized by a per-window grant, so the secret has
+    // to exist before the socket does. Fail closed: no grant, no socket, no
+    // hello — and never a silent downgrade to an Origin-only bridge.
+    const provider = this._bridgeGrantProvider;
+    if (typeof provider !== "function") {
+      this._refuseAttempt(attempt);
+      return;
+    }
+    let pending;
+    try {
+      pending = Promise.resolve(provider());
+    } catch {
+      this._refuseAttempt(attempt);
+      return;
+    }
+    pending.then(
+      (grant) => this._openSocket(attempt, grant),
+      () => this._refuseAttempt(attempt),
+    );
+  }
 
-    this.ws.onopen = () => {
+  /** Ends a bridge attempt that has no usable grant: no socket, fixed detail. */
+  _refuseAttempt(attempt) {
+    if (attempt !== this._attempt || this.isIntentionallyClosed) return;
+    this.connectionState = "closed";
+    this._pendingConnect = false;
+    // Fixed, nonsecret code: the raw IPC reply never reaches a log or the DOM.
+    this.dispatchEvent(new CustomEvent("error", { detail: { code: "bridge_grant_unavailable" } }));
+    this.dispatchEvent(new CustomEvent("disconnected"));
+    this.attemptReconnect();
+  }
+
+  /** Opens the socket for `attempt`, carrying its grant in this closure only. */
+  _openSocket(attempt, grant) {
+    if (attempt !== this._attempt || this.isIntentionallyClosed) return;
+    let pendingGrant = this.identity === "bridge" ? grant : null;
+    if (
+      this.identity === "bridge" &&
+      (typeof pendingGrant !== "string" || !BRIDGE_GRANT_PATTERN.test(pendingGrant))
+    ) {
+      this._refuseAttempt(attempt);
+      return;
+    }
+    const socket = new WebSocket(this.url);
+    this.ws = socket;
+
+    /** True only while this exact socket is still the current attempt's. */
+    const live = () => attempt === this._attempt && this.ws === socket;
+
+    socket.onopen = () => {
+      if (!live() || this.isIntentionallyClosed) return;
       console.log("[WS] Open; sending hello");
       this.reconnectAttempts = 0;
       this.connectionState = "open";
       this.authenticated = false;
-      this._sendClientHello();
+      // Hand the secret to exactly one hello, then drop the reference.
+      const helloGrant = pendingGrant;
+      pendingGrant = null;
+      this._sendClientHello(helloGrant);
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (!live()) return;
       try {
         const message = JSON.parse(event.data);
         this.handleMessage(message);
@@ -152,12 +226,14 @@ export class WebSocketClient extends EventTarget {
       }
     };
 
-    this.ws.onerror = (error) => {
+    socket.onerror = (error) => {
+      if (!live()) return;
       console.error("[WS] Error:", error);
       this.dispatchEvent(new CustomEvent("error", { detail: error }));
     };
 
-    this.ws.onclose = (event) => {
+    socket.onclose = (event) => {
+      if (!live()) return;
       console.log(`[WS] Disconnected (code=${event.code}, reason=${event.reason || "n/a"})`);
       this.connectionState = "closed";
       this.dispatchEvent(new CustomEvent("disconnected"));
@@ -172,6 +248,8 @@ export class WebSocketClient extends EventTarget {
 
   disconnect() {
     this.isIntentionallyClosed = true;
+    // Any grant still in flight belongs to a socket that must never open.
+    this._attempt += 1;
     this.connectionState = "closed";
     this.authenticated = false;
     this._pendingConnect = false;
@@ -179,9 +257,9 @@ export class WebSocketClient extends EventTarget {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    if (this.ws) {
-      this.ws.close();
-    }
+    const socket = this.ws;
+    this.ws = null;
+    socket?.close();
   }
 
   // Force reconnect — resets attempt counter and connects fresh
@@ -359,8 +437,9 @@ export class WebSocketClient extends EventTarget {
     );
   }
 
-  // Send canonical v2 hello. Desktop windows present injected capability.
-  _sendClientHello() {
+  // Send canonical v2 hello. Desktop windows present injected capability; a
+  // bridge window presents its per-window grant and never the capability.
+  _sendClientHello(grant) {
     if (!this.ws || this.ws.readyState !== WS_OPEN) return;
     const capability = this._readNativeCapability();
     this._readCanonicalRoute();
@@ -371,6 +450,13 @@ export class WebSocketClient extends EventTarget {
       clientId: this.clientId || `desktop-${globalThis.crypto?.randomUUID?.() || Date.now()}`,
     };
     if (this.identity === "desktop") hello.desktopCapability = capability;
+    if (
+      this.identity === "bridge" &&
+      typeof grant === "string" &&
+      BRIDGE_GRANT_PATTERN.test(grant)
+    ) {
+      hello.bridgeGrant = grant;
+    }
     try {
       this.ws.send(JSON.stringify(hello));
     } catch (err) {

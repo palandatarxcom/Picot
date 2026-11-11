@@ -3,8 +3,12 @@
 
 //! Plan D7 / Task 4 Step 1: "token in everything error/log path redacted (grep
 //! log sink)". Redaction by convention decays, so the convention is a test:
-//! every logging line in the files that hold a token is scanned, and a format
-//! that interpolates the token value fails the build.
+//! every logging line in the files that hold a credential is scanned, and a
+//! format that interpolates the credential value fails the build.
+//!
+//! The bridge's per-window grant (plan 2026-11-10) extends the same rule to
+//! `grant` / `bridgeGrant` / `secret` identifiers: the secret lives in Rust
+//! memory and in one hello field, never in a log line.
 //!
 //! What counts as a violation on a line carrying `log::…!`, `eprintln!` or
 //! `println!`:
@@ -30,6 +34,11 @@ const SOURCES: &[&str] = &[
     "src/daemon_client/mod.rs",
     "src/daemon_client/manager.rs",
     "src/daemon_client/exit_waiter.rs",
+    // Per-window bridge grant (plan 2026-11-10): the secret may only exist in
+    // memory and in the hello field it was minted for.
+    "crates/picot-host/src/relay/host_bridge.rs",
+    "src/host_client/mod.rs",
+    "src/host_client/commands.rs",
 ];
 
 /// The repository's `src-tauri` directory, published by `picot-host/build.rs`
@@ -86,7 +95,7 @@ fn interpolated_token(line: &str) -> Option<String> {
         let spec = &tail[..end];
         if spec
             .split([':', '?'])
-            .any(|word| word.trim() == "token" || word.trim().ends_with("_token"))
+            .any(|word| names_the_credential(word.trim()))
         {
             return Some(format!("{{{spec}}}"));
         }
@@ -95,19 +104,32 @@ fn interpolated_token(line: &str) -> Option<String> {
     None
 }
 
-/// The bare `token` identifier used as an argument (outside string literals).
+/// Whether one identifier (or format-spec word) *names* a credential value.
 ///
-/// An identifier counts when it is `token`, `admin_token` (any `_token`
-/// suffix) or the wire spelling `adminToken` — i.e. when it *names the value*,
-/// not merely mentions the word (`tokens`, `tokenless`).
+/// `token` / `admin_token` / `adminToken` covers the admin token and the device
+/// credentials; `grant` / `bridge_grant` / `bridgeGrant` / `secret` cover the
+/// per-window bridge grant. A mere mention (`tokens`, `tokenless`) does not
+/// count.
+fn names_the_credential(word: &str) -> bool {
+    word == "token"
+        || word.ends_with("_token")
+        || word == "adminToken"
+        || (word.starts_with("token_") && word != "token_redaction_ok")
+        || word == "grant"
+        || word.ends_with("_grant")
+        || word == "bridgeGrant"
+        || word == "secret"
+        || word.ends_with("_secret")
+}
+
+/// The bare credential identifier used as an argument (outside string literals).
+///
+/// An identifier counts when it names the value — see `names_the_credential` —
+/// not merely when it mentions the word.
 fn bare_token_argument(line: &str) -> Option<String> {
     let code = without_string_literals(line);
     for identifier in code.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        let names_the_token = identifier == "token"
-            || identifier.ends_with("_token")
-            || identifier == "adminToken"
-            || identifier.starts_with("token_") && identifier != "token_redaction_ok";
-        if names_the_token {
+        if names_the_credential(identifier) {
             return Some(format!("passes `{identifier}`: {}", code.trim()));
         }
     }
@@ -138,6 +160,16 @@ fn the_scanner_actually_detects_the_shapes_it_is_guarding_against() {
             r#"log::info!("adminToken {}", endpoint.admin_token)"#,
             "named argument",
         ),
+        // Per-window bridge grant shapes (plan 2026-11-10).
+        (
+            r#"log::warn!("bridge: grant {grant} refused")"#,
+            "grant inline capture",
+        ),
+        (
+            r#"log::info!("bridge grant {:?}", bridge_grant)"#,
+            "grant debug capture",
+        ),
+        (r#"log::warn!("minted {}", secret)"#, "secret argument"),
     ] {
         assert!(
             violation(line).is_some(),
@@ -151,6 +183,8 @@ fn the_scanner_actually_detects_the_shapes_it_is_guarding_against() {
         r#"log::info!("tokens exhausted: {}", remaining)"#,
         // An explicit, recorded exception.
         r#"log::info!("token {token}") // token-redaction-ok: test fixture"#,
+        // A literal mention of the concept, never the value.
+        r#"log::warn!("bridge: hello refused; origin and grant did not authorize")"#,
     ] {
         assert!(
             violation(safe).is_none(),

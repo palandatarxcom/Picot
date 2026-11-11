@@ -7,7 +7,12 @@
 // terminal, model picker, and their owner-bootstrap handlers. No Git refresh
 // or model-catalog request may run at landing generation 0.
 
-import { connectHost, HOST_PARAM, watchCredentialInvalid } from "./app/host-connection.js";
+import {
+  connectHost,
+  HOST_PARAM,
+  showBridgeUnsupportedNotice,
+  watchCredentialInvalid,
+} from "./app/host-connection.js";
 import { installHostOriginFetch } from "./app/host-origin.js";
 import { initTransport } from "./app/transport.js";
 import { createAppUpdater } from "./app/updater.js";
@@ -87,6 +92,14 @@ await initI18n();
 
 installHostOriginFetch(window);
 const hostConnection = await connectHost({ env: window });
+if (hostConnection.blocked) {
+  // Same fail-closed rule as the main entry: no grant revision, no socket, no
+  // local fallback. Landing keeps its fixed notice and stops initializing.
+  showBridgeUnsupportedNotice(window);
+  await new Promise(() => {
+    /* never resolves: the rest of this entry module must not initialize */
+  });
+}
 const wsClient = new WebSocketClient(hostConnection.wsUrl, hostConnection.clientOptions);
 // Remote host: landing keeps working, but the surfaces with no remote face
 // (paste offload, community catalog) say so instead of falling back locally.
