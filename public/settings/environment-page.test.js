@@ -12,6 +12,7 @@ const TOOL_NAMES = {
   python3: "Python 3",
   npm: "npm",
   uv: "uv",
+  r: "R",
   officecli: "OfficeCLI",
   dws: "dws",
 };
@@ -41,6 +42,8 @@ function t(key, params = {}) {
     "settings.environment.version": "Version",
     "settings.environment.path": "Path",
     "settings.environment.siteLabel": "Official page",
+    "settings.environment.restartHint": "Installed, restart Picot to use it",
+    "settings.environment.offPathHint": "Installed, but not on Picot's PATH",
     "settings.environment.install": "Install",
     "settings.environment.update": "Update",
     "settings.environment.retry": "Retry",
@@ -191,18 +194,18 @@ describe("Environment page", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the six-tool skeleton without touching the host", () => {
+  it("renders the seven-tool skeleton without touching the host", () => {
     const { root, transport } = setup();
 
     expect(transport.checkEnvironment).not.toHaveBeenCalled();
     expect(transport.getEnvironmentInstall).not.toHaveBeenCalled();
-    expect(rowNames(root)).toEqual(["Git", "Python 3", "npm", "uv", "OfficeCLI", "dws"]);
+    expect(rowNames(root)).toEqual(["Git", "Python 3", "npm", "uv", "R", "OfficeCLI", "dws"]);
     expect(root.querySelector("#environment-status").textContent).toBe("Not checked yet");
     expect(root.querySelector(".env-status .env-fact-value").textContent).toBe("Not checked yet");
     // Level is visible before any probe: red basic rows, yellow optional ones.
-    expect(root.querySelectorAll(".env-tool.env-tool-basic")).toHaveLength(4);
+    expect(root.querySelectorAll(".env-tool.env-tool-basic")).toHaveLength(5);
     expect(root.querySelectorAll(".env-tool.env-tool-optional")).toHaveLength(2);
-    expect(root.querySelectorAll(".env-tier.is-basic")).toHaveLength(4);
+    expect(root.querySelectorAll(".env-tier.is-basic")).toHaveLength(5);
     expect(root.querySelectorAll(".env-tier.is-optional")).toHaveLength(2);
     // Nothing is actionable before a check, and no URL is invented by the page.
     expect(root.querySelectorAll(".env-action")).toHaveLength(0);
@@ -210,12 +213,81 @@ describe("Environment page", () => {
     expect(root.querySelector("#environment-check-btn").textContent).toBe("Check environment");
   });
 
+  it("shows the restart hint only when the run repaired the user Path", async () => {
+    const fallbackProbe = probe({
+      toolId: "r",
+      status: "ready",
+      version: "4.6.2",
+      executablePath: "C:\\Program Files\\R\\R-4.6.2\\bin\\x64\\R.exe",
+      officialUrl: "https://cran.r-project.org/",
+      viaFallbackPath: true,
+    });
+
+    // A plain check only detects: the hint states the fact, it must not
+    // promise a restart because nothing has fixed the user Path yet.
+    const detection = setup({
+      checkEnvironment: vi.fn().mockResolvedValue({ tools: [...PROBES, fallbackProbe] }),
+    });
+    await detection.page.check();
+    expect(detection.row("r").querySelector(".env-restart-hint").textContent).toBe(
+      "Installed, but not on Picot's PATH",
+    );
+    expect(detection.row("git").querySelectorAll(".env-restart-hint")).toHaveLength(0);
+
+    // After a run whose re-check hit the registry fallback AND whose host
+    // write succeeded, the restart promise is real.
+    const maintained = setup({
+      checkEnvironment: vi.fn().mockResolvedValue({ tools: [...PROBES, fallbackProbe] }),
+      startEnvironmentInstall: vi.fn((request) =>
+        Promise.resolve(
+          snapshot({ ...request, phase: "done", probe: fallbackProbe, userPathFixed: true }),
+        ),
+      ),
+      getEnvironmentInstall: vi.fn().mockResolvedValue(
+        snapshot({
+          tool: "r",
+          action: "update",
+          phase: "done",
+          probe: fallbackProbe,
+          userPathFixed: true,
+        }),
+      ),
+    });
+    await maintained.page.check();
+    maintained.row("r").querySelector(".env-action").click();
+    await settle();
+    expect(maintained.row("r").querySelector(".env-restart-hint").textContent).toBe(
+      "Installed, restart Picot to use it",
+    );
+
+    // A run whose Path write failed must not promise the restart either: the
+    // machine-readable outcome, not probe readiness, decides. The failure
+    // itself stays visible as the run's reason.
+    const failedWrite = setup({
+      checkEnvironment: vi.fn().mockResolvedValue({ tools: [...PROBES, fallbackProbe] }),
+      getEnvironmentInstall: vi.fn().mockResolvedValue(
+        snapshot({
+          tool: "r",
+          action: "install",
+          phase: "done",
+          probe: fallbackProbe,
+          reason: "R is ready, but Picot could not add it to the user Path (denied)",
+          userPathFixed: false,
+        }),
+      ),
+    });
+    await failedWrite.page.check();
+    expect(failedWrite.row("r").querySelector(".env-restart-hint").textContent).toBe(
+      "Installed, but not on Picot's PATH",
+    );
+  });
+
   it("renders host probes: order, tiers, facts, links and per-status buttons", async () => {
     const { root, page, row } = setup();
     await page.check();
 
-    expect(rowNames(root)).toEqual(["Git", "Python 3", "npm", "uv", "OfficeCLI", "dws"]);
-    expect(root.querySelector("#environment-status").textContent).toBe(`${READY_COUNT}/6 ready`);
+    expect(rowNames(root)).toEqual(["Git", "Python 3", "npm", "uv", "R", "OfficeCLI", "dws"]);
+    expect(root.querySelector("#environment-status").textContent).toBe(`${READY_COUNT}/7 ready`);
     expect(root.querySelector("#environment-check-btn").textContent).toBe("Check again");
 
     expect(statusOf(row("git"))).toBe("Ready");

@@ -11,6 +11,7 @@ const TOOLS = [
   { id: "python3", tier: "basic" },
   { id: "npm", tier: "basic" },
   { id: "uv", tier: "basic" },
+  { id: "r", tier: "basic" },
   { id: "officecli", tier: "optional" },
   { id: "dws", tier: "optional" },
 ];
@@ -216,6 +217,19 @@ export function setupEnvironmentPage({
       facts.append(renderFact("env-site", t("settings.environment.siteLabel"), link));
     }
     row.append(facts);
+    // The Windows registry fallback can report Ready while R is still outside
+    // this process's PATH. Only a run that actually repaired the user Path
+    // (host write succeeded, `userPathFixed`) may promise that a restart
+    // makes R usable; a plain check or a failed write stays factual and the
+    // failure reason shows in the run block.
+    if (probe?.status === "ready" && probe.viaFallbackPath) {
+      const hostFixedPath =
+        run?.tool === tool.id && run.probe === probe && run.userPathFixed === true;
+      const key = hostFixedPath
+        ? "settings.environment.restartHint"
+        : "settings.environment.offPathHint";
+      row.append(element(root, "p", "env-restart-hint", t(key)));
+    }
 
     const action = ACTIONS[status];
     if (action) {

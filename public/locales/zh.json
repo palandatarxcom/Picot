@@ -1612,6 +1612,8 @@
       "version": "版本",
       "path": "路径",
       "siteLabel": "官方页面",
+      "restartHint": "已安装，但 R 还不在 Picot 的 PATH 上——重启 Picot 后 agent 会话才能使用",
+      "offPathHint": "已安装（注册表发现），但不在 PATH 上——在这里运行「安装/更新」后，Picot 会把它加入用户 PATH",
       "install": "安装",
       "update": "更新",
       "retry": "重试",
@@ -1646,6 +1648,10 @@
         "uv": {
           "name": "uv",
           "purpose": "Python 工具与项目依赖管理"
+        },
+        "r": {
+          "name": "R",
+          "purpose": "R 统计计算运行时（R/Rscript），R 项目与 R 包的依赖；不是 RStudio"
         },
         "officecli": {
           "name": "OfficeCLI",

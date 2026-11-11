@@ -584,11 +584,15 @@ host 用固定命令白名单跑短进程解析版本：`git --version`、`pytho
 
 版本必须来自该工具自己那一行：git 要求 `git version` 前缀、python3 要求 `Python` 前缀、dws 要求 `dws version` 前缀；只读 stdout（python3/officecli 例外，可读 stderr）。错误行里出现的其它版本号（npm 报错提到 Node 版本、连接失败提到 IP）不得被当成该工具版本。
 
+**R（第 7 个工具，基础档）与 Windows 注册表兜底。** R 的探测命令是 `R --version`，须 `R version` 前缀。R 的 Windows 安装器静默装完不写 PATH（R for Windows FAQ），故 Windows 上 PATH 候选全部启动失败后追加注册表兜底：读 `HKLM\Software\R-core\R`（无管理员安装为 HKCU）的 `InstallPath`，用解析出的 `bin\x64\R.exe --version` 复跑、仍要求 `R version` 前缀；通过即 `ready` 且带 `viaFallbackPath: true`——此时 R 仍不在 Picot 进程 PATH 上，agent 会话须重启 Picot 后可用，页面对该情形显示「已安装，重启 Picot 后可用」。注册表只用于定位程序路径，版本一律来自 R 自己的输出行。macOS 无需兜底（官方 pkg 建 `/usr/local/bin` 软链，Homebrew 在 PATH 上）。安装/更新运行的复检判 `ready` 且 `viaFallbackPath` 时，host 用 `pi_path::apply_windows` 把 R 的 bin 目录幂等追加进用户 Path（保留 REG_EXPAND_SZ、广播 `WM_SETTINGCHANGE`），写失败只进运行原因、不改判成功；纯检查不改机器状态。页面提示语由 `userPathFixed` 门控：检查态或写入失败仅陈述「不在 PATH」（失败原因在运行块可见），写入成功才承诺「重启 Picot 后可用」。
+
 ### 安装与更新（交给内嵌 Pi）
 
 用户点安装/更新即授权**当前这一个工具**。host 执行 `<embedded-pi> --no-session -p "<prompt>"`，cwd 为系统临时目录，同时最多一个任务。取消与 app 退出都只 kill 直接子进程：**不保证进程树零逃逸、不做重启后仍可恢复的清理状态、不使用 Windows Job Object**——与「不引入 OS 级沙箱」是同一种已接受的残余风险（见下节）。
 
 prompt 由 host 用探测事实渲染（`environment_prompt.rs` 内联模板：当前工具与动作、官方 URL、验证命令、停止条件），页面「复制 prompt」用的是**同一份字符串**；上下文只有 host 事实，页面无法扩大授权范围。
+
+**R 的镜像选择（仅 R，确定性，不测速）。** `environment_install_start` 在 installer 取锁**之前**、锁外 await：host 拉 `https://cran.r-project.org/CRAN_mirrors.csv`（`environment_mirror.rs`，5s 超时），过滤 `OK==1` 且 `CountryCode==cn`，取第一个官方镜像作为 `downloadUrl` 进 prompt 上下文；拉取/解析失败回退官方根 `https://cran.r-project.org/`。`officialUrl` 恒为官方根，授权边界不变；其他工具上下文不含 `downloadUrl`，也不做任何网络测速。
 
 ### 复检契约
 
@@ -605,7 +609,7 @@ agent 的 exit code 与自然语言都不是成功依据：进程退出后 host 
 | `environment_install_status` | — | `Snapshot \| null` |
 | `environment_install_cancel` | — | `Snapshot \| null` |
 
-`Probe = {toolId, status:"ready"|"missing"|"failed", version?, executablePath?, reason?, officialUrl, tier}`；`Snapshot = {tool, action, phase:"running"|"done"|"failed"|"cancelled", prompt, log, probe?, reason?}`。四个 op 走既有 `host_request` 控制面，不新增 `/api/*` 路由；页面打开不自动探测。不做联网的「最新版本」比较。
+`Probe = {toolId, status:"ready"|"missing"|"failed", version?, executablePath?, reason?, officialUrl, tier, viaFallbackPath}`；`Snapshot = {tool, action, phase:"running"|"done"|"failed"|"cancelled", prompt, log, probe?, reason?, userPathFixed}`（`userPathFixed` 仅 Windows R 兜底复检且 `apply_windows` 成功时为真，页面据此门控「重启后可用」提示）。四个 op 走既有 `host_request` 控制面，不新增 `/api/*` 路由；页面打开不自动探测。不做联网的「最新版本」比较（`environment_install_start` 里 R 的镜像列表拉取是唯一例外，见上节）。
 
 ## Office 文件原生预览（anydoc）
 

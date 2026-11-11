@@ -39,6 +39,11 @@ pub struct Snapshot {
     /// The host's own re-check after the process exited. Never the agent's word.
     pub(crate) probe: Option<Probe>,
     pub(crate) reason: Option<String>,
+    /// Whether this run repaired the user Path: true only when the re-check
+    /// hit the Windows registry fallback and the host's `apply_windows` write
+    /// succeeded (added or already present). The page gates the "restart
+    /// Picot to use it" hint on this, never on probe readiness alone.
+    pub(crate) user_path_fixed: bool,
 }
 
 /// Production re-checks by running the tool's version command; tests inject a
@@ -88,6 +93,7 @@ impl Installer {
         tool: ToolId,
         action: ToolAction,
         probe: &Probe,
+        download_url: &str,
     ) -> Result<Snapshot, String> {
         let mut inner = self
             .inner
@@ -96,7 +102,7 @@ impl Installer {
         if inner.running.is_some() {
             return Err("maintenance_busy: an install is already running".to_string());
         }
-        let prompt = render_prompt(tool, action, probe);
+        let prompt = render_prompt(tool, action, probe, download_url);
         let mut command = Command::new(&self.pi_binary);
         command
             .args(["--no-session", "-p", prompt.as_str()])
@@ -212,6 +218,7 @@ impl Installer {
             running.before.as_deref(),
             &probe,
         );
+        let (reason, user_path_fixed) = fix_r_user_path(&probe, reason);
         Snapshot {
             tool: running.tool,
             action: running.action,
@@ -220,6 +227,7 @@ impl Installer {
             log,
             probe: Some(probe),
             reason,
+            user_path_fixed,
         }
     }
 }
@@ -263,6 +271,61 @@ fn decide(
     (Phase::Done, None)
 }
 
+/// The Windows registry fallback found R ready but off this process's PATH.
+/// The host — not the agent — adds R's bin directory to the user Path
+/// (idempotent, `WM_SETTINGCHANGE` broadcast), so a restarted Picot and its
+/// agent sessions can actually run R. Best effort: the install verdict
+/// stands, a failed write is reported instead of hidden.
+#[cfg(windows)]
+fn fix_r_user_path(probe: &Probe, reason: Option<String>) -> (Option<String>, bool) {
+    if !probe.via_fallback_path {
+        return (reason, false);
+    }
+    let Some(bin_dir) = probe
+        .executable_path
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|exe| exe.parent())
+        .map(|dir| dir.to_string_lossy().into_owned())
+    else {
+        return (
+            reason.or_else(|| {
+                Some(
+                    "R is ready via the registry, but its bin directory could not be located"
+                        .into(),
+                )
+            }),
+            false,
+        );
+    };
+    match crate::pi_path::apply_windows(&bin_dir) {
+        Ok(_) => (
+            reason.or_else(|| {
+                Some("R was found off PATH; Picot added its bin directory to the user Path".into())
+            }),
+            true,
+        ),
+        Err(error) => {
+            let note = format!(
+                "R is ready, but Picot could not add it to the user Path ({error}); a restart may not help until that is fixed"
+            );
+            (
+                Some(match reason {
+                    Some(existing) => format!("{note}; {existing}"),
+                    None => note,
+                }),
+                false,
+            )
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn fix_r_user_path(probe: &Probe, reason: Option<String>) -> (Option<String>, bool) {
+    let _ = probe; // the fallback flag cannot be set off Windows
+    (reason, false)
+}
+
 fn read_into_log(
     pipe: Option<impl Read + Send + 'static>,
     log: Arc<Mutex<String>>,
@@ -293,6 +356,7 @@ impl Running {
             log: self.log.lock().map(|log| log.clone()).unwrap_or_default(),
             probe,
             reason,
+            user_path_fixed: false,
         }
     }
 }
@@ -318,6 +382,7 @@ mod install_tests {
             reason: None,
             official_url: crate::environment_probe::spec(ToolId::Git).official_url,
             tier: ToolTier::Basic,
+            via_fallback_path: false,
         }
     }
 
@@ -402,6 +467,7 @@ mod install_tests {
                 ToolId::Git,
                 ToolAction::Update,
                 &probe(ProbeStatus::Ready, Some("2.46.0")),
+                crate::environment_mirror::CRAN_OFFICIAL_URL,
             )
             .expect("start");
         assert_eq!(started.phase, Phase::Running);

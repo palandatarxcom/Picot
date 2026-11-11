@@ -1612,6 +1612,8 @@
       "version": "バージョン",
       "path": "パス",
       "siteLabel": "公式ページ",
+      "restartHint": "インストール済みですが、R はまだ Picot の PATH にありません。Picot を再起動すると agent セッションで使えます",
+      "offPathHint": "インストール済み（レジストリで検出）ですが PATH にはありません。ここで「インストール/更新」を実行すると Picot がユーザー Path に追加します",
       "install": "インストール",
       "update": "更新",
       "retry": "再試行",
@@ -1646,6 +1648,10 @@
         "uv": {
           "name": "uv",
           "purpose": "Python ツールとプロジェクトの依存関係管理"
+        },
+        "r": {
+          "name": "R",
+          "purpose": "R 統計計算ランタイム（R/Rscript）。R プロジェクトと R パッケージに必要（RStudio ではありません）"
         },
         "officecli": {
           "name": "OfficeCLI",

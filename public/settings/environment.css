@@ -45,9 +45,19 @@
 }
 
 .env-tools {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-3);
+}
+
+/* Two cards per row on desktop. Past the settings panel's own narrow
+   breakpoint the nav collapses to a strip and the content goes full width,
+   so the cards follow it back to one per row. `minmax(0, 1fr)` keeps long
+   paths and URLs truncating inside the card instead of forcing overflow. */
+@media (max-width: 920px) {
+  .env-tools {
+    grid-template-columns: 1fr;
+  }
 }
 
 .env-tool {
@@ -100,6 +110,11 @@
 .env-tool-purpose {
   margin: 0;
   color: var(--text-dim);
+  font-size: var(--font-size-sm);
+}
+.env-restart-hint {
+  margin: 0;
+  color: var(--warning);
   font-size: var(--font-size-sm);
 }
 
