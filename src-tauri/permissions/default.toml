@@ -69,6 +69,14 @@ identifier = "allow-host-status"
 description = "Read a remote host's connection status"
 commands.allow = ["host_status"]
 
+# Per-window bridge grant (2026-11-10 plan T1): the command derives the window
+# identity from the injected WebviewWindow and mints a secret only for that
+# window's own (window, host) binding — never for a self-reported label.
+[[permission]]
+identifier = "allow-host-grant"
+description = "Issue this window's loopback bridge grant for its current host"
+commands.allow = ["host_grant"]
+
 [[permission]]
 identifier = "allow-relay-device-list"
 description = "Read safe paired-device fields from the local daemon"
@@ -96,6 +104,7 @@ permissions = [
   "allow-host-confirm-tofu",
   "allow-host-remove",
   "allow-host-status",
+  "allow-host-grant",
   "allow-relay-device-list",
   "allow-relay-revoke-device",
 ]

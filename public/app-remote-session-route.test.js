@@ -313,7 +313,20 @@ beforeEach(async () => {
     core: {
       invoke: vi.fn(async (command) => {
         if (command === "host_status") {
-          return { wsUrl: "ws://127.0.0.1:55001/v2/ws", bridgeOrigin: PAGE_ORIGIN };
+          return {
+            wsUrl: "ws://127.0.0.1:55001/v2/ws",
+            bridgeOrigin: PAGE_ORIGIN,
+            bridgeGrantVersion: 1,
+          };
+        }
+        if (command === "host_grant") {
+          // A real-shaped bearer grant (bg1_ + 43 base64url chars) bound to the
+          // same endpoint host_status advertised.
+          return {
+            bridgeGrantVersion: 1,
+            wsUrl: "ws://127.0.0.1:55001/v2/ws",
+            bridgeGrant: "bg1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          };
         }
         if (command === "host_list") return [];
         return { ok: true };

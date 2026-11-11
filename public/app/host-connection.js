@@ -27,6 +27,19 @@ const FACES = ["native", "navigation", "git", "terminal", "management"];
  */
 export const TERMINAL_BINDING_REVISION = 1;
 
+/**
+ * The only bridge grant revision this client knows (plan 2026-11-10 §1). A
+ * bridge advertises it from `host_status`; anything else means the app build
+ * and the bridge cannot authorize each other and the entry stays blocked.
+ */
+export const BRIDGE_GRANT_VERSION = 1;
+
+/** `bg1_` plus 43 unpadded base64url characters: 32 random bytes. */
+export const BRIDGE_GRANT_PATTERN = /^bg1_[A-Za-z0-9_-]{43}$/;
+
+/** Fixed, nonsecret failure for every grant refusal. */
+export const GRANT_UNAVAILABLE = "Host grant unavailable";
+
 function locationOf(env) {
   return env?.location || globalThis.location;
 }
@@ -235,6 +248,49 @@ export async function applyLastHostDefault({
   return saved;
 }
 
+/**
+ * Command-backed grant provider for one bridge connection (plan 2026-11-10,
+ * contract 3). Each call is a fresh issuance — reconnects included — and the
+ * command carries only the host id: identity comes from the injected window.
+ * Every failure collapses to one fixed message so a raw IPC reply can never
+ * reach a log line or the DOM.
+ */
+export function bridgeGrantProvider(host, { invoke, wsUrl }) {
+  return async () => {
+    let reply;
+    try {
+      reply = await invoke("host_grant", { serverId: host });
+    } catch {
+      throw new Error(GRANT_UNAVAILABLE);
+    }
+    if (reply?.bridgeGrantVersion !== BRIDGE_GRANT_VERSION) throw new Error(GRANT_UNAVAILABLE);
+    // The grant must belong to the endpoint this attempt dials: a mismatched or
+    // missing wsUrl is a stale bridge, never a reason to try another origin.
+    if (reply?.wsUrl !== wsUrl) throw new Error(GRANT_UNAVAILABLE);
+    const grant = reply?.bridgeGrant;
+    if (typeof grant !== "string" || !BRIDGE_GRANT_PATTERN.test(grant)) {
+      throw new Error(GRANT_UNAVAILABLE);
+    }
+    return grant;
+  };
+}
+
+/**
+ * Fixed full-page notice for a bridge that cannot authorize this window. No
+ * grant, endpoint or IPC text is rendered: the page refuses to run a remote
+ * host it cannot authenticate, and never falls back to the local socket.
+ */
+export function showBridgeUnsupportedNotice(env = globalThis.window || globalThis) {
+  const doc = env?.document;
+  const body = doc?.body;
+  if (!body || typeof doc.createElement !== "function") return;
+  const panel = doc.createElement("div");
+  panel.setAttribute("role", "alert");
+  panel.textContent =
+    "This remote host cannot authorize this Picot window. Update or reload Picot, then reconnect the host.";
+  body.replaceChildren(panel);
+}
+
 function tauriInvoke(env = globalThis.window || globalThis) {
   const host = env || globalThis;
   const invoke = host.__TAURI__?.core?.invoke ?? globalThis.__TAURI__?.core?.invoke;
@@ -266,11 +322,25 @@ export async function connectHost({
   try {
     if (!invoke) throw new Error("Remote host needs the app shell (Tauri IPC unavailable)");
     const status = await invoke("host_status", { serverId: host });
+    // No grant revision: this bridge cannot authorize the window, so the entry
+    // is blocked — no endpoint, no socket, and no downgrade to Origin-only.
+    if (status?.bridgeGrantVersion !== BRIDGE_GRANT_VERSION) {
+      return { host, identity: "bridge", blocked: true };
+    }
+    const wsUrl = resolveWsUrlForHost(
+      { wsUrl: status?.wsUrl, bridgeOrigin: status?.bridgeOrigin },
+      env,
+    );
     const connection = {
       host,
       identity: "bridge",
-      wsUrl: resolveWsUrlForHost({ wsUrl: status?.wsUrl, bridgeOrigin: status?.bridgeOrigin }, env),
-      clientOptions: { identity: "bridge", capabilitiesFromAck: readCapabilities },
+      wsUrl,
+      clientOptions: {
+        identity: "bridge",
+        capabilitiesFromAck: readCapabilities,
+        // The page holds the secret for exactly one hello attempt.
+        bridgeGrantProvider: bridgeGrantProvider(host, { invoke, wsUrl }),
+      },
     };
     try {
       env?.sessionStorage?.removeItem(recoveryMark(host));

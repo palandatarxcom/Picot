@@ -17,7 +17,8 @@ use picot_host::native_pi_manager::NativePiManager;
 use picot_host::relay::client_role::{ClientRoleConfig, ClientRoleSeams};
 use picot_host::relay::e2ee::DaemonIdentity;
 use picot_host::relay::host_bridge::{
-    start_host_bridge_with_seams, BridgeSeams, Credential, HostBridgeHandle, HostBridgeStatus,
+    start_host_bridge_with_seams, BindingRecord, BridgeSeams, Credential, HostBridgeHandle,
+    HostBridgeStatus,
 };
 use picot_host::relay::host_store::DeviceToken;
 use picot_host::relay::transport::{
@@ -64,6 +65,27 @@ fn client_seams() -> (ClientRoleSeams, mpsc::UnboundedReceiver<Backoff>) {
     (seams, rx)
 }
 
+/// Per-window grants for the ad-hoc bridges these tests start. `dial` presents
+/// the grant for the origin it dials, exactly as a real window does after
+/// `host_grant`; a daemon host origin has no entry and needs none.
+fn grants() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static GRANTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    GRANTS.get_or_init(std::sync::Mutex::default)
+}
+/// Binds one window record on `bridge` and mints its grant. The record stays
+/// alive inside the bridge's own binding registry.
+fn authorize_bridge(bridge: &HostBridgeHandle) {
+    let record = BindingRecord::new("host", ORIGIN).unwrap();
+    assert!(bridge.bind(&record));
+    let grant = bridge.mint_grant(&record).unwrap();
+    grants()
+        .lock()
+        .unwrap()
+        .insert(bridge.origin.clone(), grant);
+}
+
 async fn bridge(
     addr: SocketAddr,
     tls: bool,
@@ -88,16 +110,24 @@ async fn bridge(
     .await
     .unwrap();
     assert!(bridge.acquire("window"));
+    authorize_bridge(&bridge);
     bridge
 }
 
-async fn dial(origin: &str, hello: Value) -> Socket {
+async fn dial(origin: &str, mut hello: Value) -> Socket {
     let mut request = (origin.replacen("http://", "ws://", 1) + "/v2/ws")
         .into_client_request()
         .unwrap();
     request
         .headers_mut()
         .insert("Origin", ORIGIN.parse().unwrap());
+    // Every bridge proxy presents its window's grant; a daemon origin has none.
+    if hello.get("bridgeGrant").is_none() {
+        let grant = grants().lock().unwrap().get(origin).cloned();
+        if let Some(grant) = grant {
+            hello["bridgeGrant"] = json!(grant);
+        }
+    }
     let mut socket = tokio_tungstenite::connect_async(request).await.unwrap().0;
     socket.send(Message::Text(hello.to_string())).await.unwrap();
     socket
@@ -478,6 +508,7 @@ async fn connect_once(
     .await
     .unwrap();
     assert!(bridge.acquire("window"));
+    authorize_bridge(&bridge);
     let mut socket = dial(&bridge.origin, hello()).await;
     let ack = wait_kind(&mut socket, "hello_ack", Duration::from_secs(30)).await;
     let start_to_ack = start.elapsed();

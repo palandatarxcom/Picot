@@ -2,6 +2,7 @@
 // ABOUTME: Rewrites hello, sanitizes ack, delegates pairing persistence; last window stops bridge.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,8 +12,11 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::{routing::get, Router};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures_util::{SinkExt, StreamExt};
+use rand::RngCore;
 use serde_json::value::RawValue;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, watch};
 
 use super::client_role::{
@@ -71,17 +75,227 @@ struct Auth {
     credential: Credential,
     pairing_busy: bool,
 }
+
+/// The only grant version this bridge issues and accepts (spec §12, contract 3).
+pub const GRANT_VERSION: u32 = 1;
+/// Fixed, nonsecret failure text: a grant refusal never quotes caller bytes.
+pub const GRANT_UNAVAILABLE: &str = "Host grant unavailable";
+const GRANT_PREFIX: &str = "bg1_";
+const GRANT_BODY_CHARS: usize = 43;
+
+/// An exact page origin: scheme, normalized hostname and effective port. Two
+/// loopback aliases (`localhost` / `127.0.0.1`) are different origins here on
+/// purpose — "exact" means field-for-field equality with the trusted page.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PageOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+impl PageOrigin {
+    /// Parses an Origin header or a captured page origin. Rejects userinfo,
+    /// non-root paths, query/fragment, opaque origins and non-http(s) schemes.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let url = url::Url::parse(raw).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+            return None;
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        Some(Self {
+            scheme: url.scheme().to_owned(),
+            host: url.host_str()?.to_ascii_lowercase(),
+            port: url.port_or_known_default()?,
+        })
+    }
+}
+impl fmt::Debug for PageOrigin {
+    // Origins are metadata, not secrets; still rendered in one canonical shape.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
+/// What the bridge refuses to hand out or admit. Never carries a secret.
+#[derive(Debug)]
+pub struct GrantError;
+
+struct ProxyLease {
+    cancel: Arc<watch::Sender<bool>>,
+    revoked: watch::Receiver<bool>,
+}
+
+/// One window's authorization for one host: the exact page origin captured at
+/// attachment, an `issuable` flag, the current secret and the proxies it owns.
+///
+/// Identity is the `Arc` itself (`Arc::ptr_eq`), never a label: a reopened
+/// window with the same label gets a new record, so a late cleanup that still
+/// holds the old one cannot act on the replacement.
+pub struct BindingRecord {
+    server_id: String,
+    origin: PageOrigin,
+    origin_text: String,
+    state: Mutex<BindingState>,
+}
+#[derive(Default)]
+struct BindingState {
+    issuable: bool,
+    grant: Option<String>,
+    /// One cancellation handle per authorized proxy this binding owns. Revoke
+    /// signals all of them; each proxy removes its own entry when it ends.
+    proxies: Vec<Arc<watch::Sender<bool>>>,
+}
+impl BindingRecord {
+    /// `None` when the captured page origin is not an exact http(s) origin.
+    pub fn new(server_id: impl Into<String>, origin: &str) -> Option<Arc<Self>> {
+        Some(Arc::new(Self {
+            server_id: server_id.into(),
+            origin: PageOrigin::parse(origin)?,
+            origin_text: origin.to_owned(),
+            state: Mutex::new(BindingState {
+                issuable: true,
+                grant: None,
+                proxies: Vec::new(),
+            }),
+        }))
+    }
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+    pub fn origin(&self) -> &str {
+        &self.origin_text
+    }
+    /// False once invalidated: a revoked record never authorizes again, even
+    /// while references to it still exist.
+    pub fn is_issuable(&self) -> bool {
+        self.state.lock().unwrap().issuable
+    }
+    /// Atomically replaces the current secret. Not issuance authority: the
+    /// caller must already have proven it holds this exact live record.
+    fn mint(&self) -> Result<String, GrantError> {
+        let mut state = self.state.lock().unwrap();
+        if !state.issuable {
+            return Err(GrantError);
+        }
+        let secret = random_grant().ok_or(GrantError)?;
+        state.grant = Some(secret.clone());
+        Ok(secret)
+    }
+    /// The authority boundary for admission: sets `issuable = false`, drops the
+    /// secret and signals every proxy this binding owns, all before returning.
+    pub fn revoke(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.issuable = false;
+        state.grant = None;
+        for proxy in std::mem::take(&mut state.proxies) {
+            proxy.send_replace(true);
+        }
+    }
+    /// Admits one proxy for `presented` when the binding is still issuable, the
+    /// secret matches, and the presented origin is this binding's page origin.
+    /// Registers proxy ownership before the caller performs any side effect.
+    fn authorize(&self, presented: &str, origin: &PageOrigin) -> Option<ProxyLease> {
+        let mut state = self.state.lock().unwrap();
+        if !state.issuable || self.origin != *origin {
+            return None;
+        }
+        let current = state.grant.as_deref()?;
+        if !constant_time_eq(current.as_bytes(), presented.as_bytes()) {
+            return None;
+        }
+        let (cancel, revoked) = watch::channel(false);
+        let cancel = Arc::new(cancel);
+        state.proxies.push(cancel.clone());
+        Some(ProxyLease { cancel, revoked })
+    }
+    /// Test seam: the current secret, for assertions that status polling and
+    /// revoke do (not) rotate it. Never compiled into a production build.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn grant_for_tests(&self) -> Option<String> {
+        self.state.lock().unwrap().grant.clone()
+    }
+    fn release_proxy(&self, cancel: &Arc<watch::Sender<bool>>) {
+        self.state
+            .lock()
+            .unwrap()
+            .proxies
+            .retain(|proxy| !Arc::ptr_eq(proxy, cancel));
+    }
+}
+impl fmt::Debug for BindingRecord {
+    // Derived Debug would print the secret; the record never renders itself.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BindingRecord")
+            .field("server_id", &self.server_id)
+            .field("origin", &self.origin)
+            .field("issuable", &self.is_issuable())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 32 cryptographically random bytes as `bg1_` plus 43 unpadded base64url
+/// characters. A failed RNG yields no grant at all: no fallback entropy.
+fn random_grant() -> Option<String> {
+    let mut bytes = [0_u8; 32];
+    rand::rngs::OsRng.try_fill_bytes(&mut bytes).ok()?;
+    Some(format!("{GRANT_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes)))
+}
+
+/// Shape check only: the value is compared against the stored secret later.
+fn grant_shape_ok(grant: &str) -> bool {
+    grant.len() == GRANT_PREFIX.len() + GRANT_BODY_CHARS
+        && grant.starts_with(GRANT_PREFIX)
+        && grant[GRANT_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len() && bool::from(left.ct_eq(right))
+}
+
+/// Test-only side-effect counters: a denied admission must prove zero
+/// credential reads, rewrites and relay dials even while another proxy lives.
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Default)]
+pub struct BridgeCounters {
+    pub credential_reads: std::sync::atomic::AtomicU64,
+    pub rewrites: std::sync::atomic::AtomicU64,
+    pub dials: std::sync::atomic::AtomicU64,
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl BridgeCounters {
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (
+            self.credential_reads.load(SeqCst),
+            self.rewrites.load(SeqCst),
+            self.dials.load(SeqCst),
+        )
+    }
+}
+
 struct Shared {
     cfg: ClientRoleConfig,
     pairing: Option<Arc<dyn PairingSink>>,
     auth: Mutex<Auth>,
     /// Window references: the bridge lives while at least one window holds it.
     windows: Mutex<HashSet<String>>,
+    /// Live binding records registered on THIS bridge instance. Admission
+    /// searches here, so a grant minted for another host (another bridge, or
+    /// this host's previous bridge) authorizes nothing.
+    bindings: Mutex<Vec<Arc<BindingRecord>>>,
     slots: Mutex<Vec<Arc<Slot>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutdown: watch::Sender<bool>,
     status: watch::Sender<HostBridgeStatus>,
     seams: BridgeSeams,
+    #[cfg(any(test, feature = "test-seams"))]
+    counters: Arc<BridgeCounters>,
 }
 impl Shared {
     fn set_status(&self, status: HostBridgeStatus) {
@@ -97,6 +311,29 @@ impl Shared {
             *current = status;
             true
         });
+    }
+    /// Admission lookup: the presented secret and the exact page origin must
+    /// belong to the same live record registered on this bridge instance. The
+    /// origin comparison happens inside the record's own lock, so a concurrent
+    /// revoke can never slip between the two checks.
+    fn authorize(
+        &self,
+        presented: &str,
+        origin: &PageOrigin,
+    ) -> Option<(Arc<BindingRecord>, ProxyLease)> {
+        if *self.shutdown.borrow() {
+            return None;
+        }
+        let bindings = self.bindings.lock().unwrap().clone();
+        for binding in bindings {
+            if binding.server_id() != self.cfg.server_id {
+                continue;
+            }
+            if let Some(lease) = binding.authorize(presented, origin) {
+                return Some((binding, lease));
+            }
+        }
+        None
     }
 }
 
@@ -129,6 +366,86 @@ impl HostBridgeHandle {
     pub async fn stop(self) {
         self.shared.shutdown.send_replace(true);
         let _ = self.task.await;
+    }
+    /// Registers a window binding on this bridge instance. False once the
+    /// bridge has shut down: a stopped bridge never becomes issuable again.
+    pub fn bind(&self, record: &Arc<BindingRecord>) -> bool {
+        if *self.shared.shutdown.borrow() || record.server_id() != self.shared.cfg.server_id {
+            return false;
+        }
+        let mut bindings = self.shared.bindings.lock().unwrap();
+        if !bindings.iter().any(|known| Arc::ptr_eq(known, record)) {
+            bindings.push(record.clone());
+        }
+        true
+    }
+    /// Drops the registration once the window's references are gone. The record
+    /// itself is dropped by its last owner; a delayed unbind cannot remove the
+    /// replacement because it is a different `Arc`.
+    pub fn unbind(&self, record: &Arc<BindingRecord>) {
+        self.shared
+            .bindings
+            .lock()
+            .unwrap()
+            .retain(|known| !Arc::ptr_eq(known, record));
+    }
+    /// Mints the current secret for a record bound to this live bridge. Issuance
+    /// authority only: it never acquires, switches or reconstructs a binding.
+    pub fn mint_grant(&self, record: &Arc<BindingRecord>) -> Result<String, GrantError> {
+        if *self.shared.shutdown.borrow() || record.server_id() != self.shared.cfg.server_id {
+            return Err(GrantError);
+        }
+        let bound = self
+            .shared
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|known| Arc::ptr_eq(known, record));
+        if !bound {
+            return Err(GrantError);
+        }
+        record.mint()
+    }
+    /// Synchronous invalidation: issuance and admission stop and every proxy
+    /// this binding owns is signalled before this returns. Retained (kept for
+    /// redial) slots owned by the record are dropped from the reuse pool and
+    /// stopped asynchronously — the sync boundary only severs authorization.
+    pub fn revoke(&self, record: &Arc<BindingRecord>) {
+        record.revoke();
+        let owned: Vec<Arc<Slot>> = self
+            .shared
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|slot| {
+                slot.owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(owner, record))
+            })
+            .cloned()
+            .collect();
+        if owned.is_empty() {
+            return;
+        }
+        self.shared
+            .slots
+            .lock()
+            .unwrap()
+            .retain(|slot| !owned.iter().any(|mine| Arc::ptr_eq(mine, slot)));
+        tokio::spawn(async move {
+            for slot in owned {
+                slot.stop().await;
+            }
+        });
+    }
+    /// Test seam: side-effect counters for the denial matrix.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn counters_for_tests(&self) -> Arc<BridgeCounters> {
+        self.shared.counters.clone()
     }
     /// Test seam (`test-seams`, same posture as `DaemonIdentity::for_tests`): force a
     /// terminal status so app-side reactions to bridge states need no live relay.
@@ -165,11 +482,14 @@ pub async fn start_host_bridge_with_seams(
             pairing_busy: false,
         }),
         windows: Mutex::new(HashSet::new()),
+        bindings: Mutex::new(Vec::new()),
         slots: Mutex::new(Vec::new()),
         tasks: Mutex::new(Vec::new()),
         shutdown,
         status: status_tx,
         seams,
+        #[cfg(any(test, feature = "test-seams"))]
+        counters: Arc::default(),
     });
     let app = Router::new()
         .route("/v2/ws", get(upgrade))
@@ -208,11 +528,7 @@ async fn upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let origin = headers
-        .get("origin")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
+    let origin = single_origin(&headers);
     ws.max_message_size(WS_PHYSICAL_FRAME_BYTES)
         .max_frame_size(WS_PHYSICAL_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
@@ -273,6 +589,21 @@ struct Slot {
     ready: watch::Sender<Ready>,
     attachment: Mutex<Option<Attachment>>,
     role: Mutex<Option<ClientRoleHandle>>,
+    /// The binding that kept this slot alive (transport drop, session held for
+    /// redial). A retained slot serves its own window's reconnect only; a
+    /// different binding — or a revoked owner — never reuses it.
+    owner: Mutex<Option<Arc<BindingRecord>>>,
+}
+impl Slot {
+    /// True when `binding` is this slot's owner: a kept (reattachable) slot
+    /// only accepts its own window back. Any other binding gets a fresh slot.
+    fn owned_by(&self, binding: &Arc<BindingRecord>) -> bool {
+        self.owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|owner| Arc::ptr_eq(owner, binding))
+    }
 }
 impl Slot {
     async fn stop(&self) {
@@ -313,6 +644,7 @@ impl ClientRoleSink for Slot {
 
 fn attach(
     shared: &Arc<Shared>,
+    binding: &Arc<BindingRecord>,
     frames: mpsc::Sender<String>,
     lost: watch::Sender<bool>,
 ) -> Arc<Slot> {
@@ -320,7 +652,11 @@ fn attach(
     for slot in slots.iter() {
         let mut attachment = slot.attachment.lock().unwrap();
         if attachment.is_none() {
+            if !slot.owned_by(binding) {
+                continue;
+            }
             *attachment = Some(Attachment { frames, lost });
+            *slot.owner.lock().unwrap() = Some(binding.clone());
             return slot.clone();
         }
     }
@@ -333,7 +669,13 @@ fn attach(
         ready,
         attachment: Mutex::new(Some(Attachment { frames, lost })),
         role: Mutex::new(None),
+        owner: Mutex::new(Some(binding.clone())),
     });
+    #[cfg(any(test, feature = "test-seams"))]
+    shared
+        .counters
+        .dials
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *slot.role.lock().unwrap() = Some(ClientRole::start_with_seams(
         shared.cfg.clone(),
         slot.clone(),
@@ -343,36 +685,82 @@ fn attach(
     slot
 }
 
-/// Only the app's own loopback pages may speak to a bridge. With no window
-/// secret left, the handshake Origin is the remaining gate: any page a browser
-/// can load would otherwise present a hello for an already-paired device.
-fn is_app_origin(origin: &str) -> bool {
-    url::Url::parse(origin).is_ok_and(|url| {
-        url.scheme() == "http"
-            && url
-                .host_str()
-                .is_some_and(crate::window_owner::is_loopback_host)
-    })
+/// Exactly one Origin header, or none: duplicate origin headers are a request
+/// shape no browser produces, and picking either one would be a guess.
+fn single_origin(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all("origin").iter();
+    let first = values.next()?.to_str().ok()?.to_owned();
+    values.next().is_none().then_some(first)
 }
 
-async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
+/// Parses a JSON object, rejecting duplicate keys and trailing data: a hello
+/// that repeats `bridgeGrant` (or `type`) is refused outright instead of being
+/// silently resolved to whichever value came last.
+fn parse_object_strict(text: &str) -> Option<Fields> {
+    struct Strict;
+    impl<'de> serde::de::Visitor<'de> for Strict {
+        type Value = Fields;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("one JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut fields = Fields::new();
+            while let Some((key, value)) = access.next_entry::<String, Box<RawValue>>()? {
+                if fields.contains_key(&key) {
+                    return Err(serde::de::Error::custom("duplicate field"));
+                }
+                fields.insert(key, value);
+            }
+            Ok(fields)
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let fields = serde::Deserializer::deserialize_map(&mut deserializer, Strict).ok()?;
+    deserializer.end().ok()?;
+    Some(fields)
+}
+
+/// The admission gate. A correctly shaped secret plus exactly one Origin header
+/// equal to the trusted binding's page origin, for a binding that is still
+/// issuable and registered on this bridge instance. Proxy ownership is
+/// registered before returning, so a racing revoke either finds this proxy or
+/// rejects the admission — never an untracked authorized connection.
+fn authorize_hello(
+    fields: &Fields,
+    origin: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Option<(Arc<BindingRecord>, ProxyLease)> {
+    let presented = string_field(fields, "bridgeGrant")?;
+    if !grant_shape_ok(&presented) {
+        return None;
+    }
+    let origin = PageOrigin::parse(origin?)?;
+    shared.authorize(&presented, &origin)
+}
+
+async fn proxy(mut socket: WebSocket, origin: Option<String>, shared: Arc<Shared>) {
     let first = tokio::time::timeout(shared.seams.first_frame_timeout, socket.next()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
         log::warn!("bridge: no hello frame within the first-frame deadline");
         return;
     };
-    let Ok(fields) = serde_json::from_str::<Fields>(&text) else {
-        log::warn!("bridge: first frame is not a JSON object");
+    let Some(fields) = parse_object_strict(&text) else {
+        log::warn!("bridge: first frame is not a single JSON object");
         return;
     };
     if string_field(&fields, "type").as_deref() != Some("hello") {
         log::warn!("bridge: first frame is not hello");
         return;
     }
-    if !is_app_origin(&origin) {
-        log::warn!("bridge: rejected origin {origin}");
+    // Authorization precedes every side effect: no credential read, no
+    // pairing-state change, no rewrite, no slot attach and no relay dial.
+    let Some((binding, lease)) = authorize_hello(&fields, origin.as_deref(), &shared) else {
+        log::warn!("bridge: hello refused; origin and grant did not authorize");
         return;
-    }
+    };
     let credential = {
         let mut auth = shared.auth.lock().unwrap();
         if matches!(
@@ -397,9 +785,19 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
             }
             auth.pairing_busy = true;
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        shared
+            .counters
+            .credential_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         auth.credential.clone()
     };
     let pairing = matches!(credential, Credential::Pairing { .. });
+    #[cfg(any(test, feature = "test-seams"))]
+    shared
+        .counters
+        .rewrites
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let hello = rewrite(fields, &credential);
     if hello.len() > WS_PHYSICAL_FRAME_BYTES {
         if pairing {
@@ -409,7 +807,7 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     }
     let (frames_tx, mut frames) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
     let (lost_tx, mut lost) = watch::channel(false);
-    let slot = attach(&shared, frames_tx, lost_tx);
+    let slot = attach(&shared, &binding, frames_tx, lost_tx);
     let mut ready = slot.ready.subscribe();
     let mut shutdown = shared.shutdown.subscribe();
     let (mut writer, mut reader) = socket.split();
@@ -422,6 +820,7 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
         }
     };
     let mut generation = None;
+    let mut revoked = lease.revoked.clone();
     let session = async {
         let channel = loop {
             let current = ready.borrow_and_update().clone();
@@ -537,6 +936,7 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     };
     // Wait for whichever end condition fires; only a transport loss keeps the
     // slot alive (see the keep decision below).
+    let mut ended_by_revocation = false;
     let transport_dropped = tokio::select! {
         // A terminal error frame can arrive in the same poll as Offline. Consume
         // the queued explicit rejection before the transport-loss notification.
@@ -545,6 +945,9 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
         _ = lost.changed() => true,
         _ = write => false,
         _ = shutdown.changed() => false,
+        // Revocation signalled this proxy: dropping the session future cancels
+        // dial, ack wait, pairing persistence and forwarding in place.
+        _ = revoked.changed() => { ended_by_revocation = true; false },
     };
     if pairing {
         shared.auth.lock().unwrap().pairing_busy = false;
@@ -558,7 +961,8 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
     // the next hello re-checks the DB on whatever new session carries it.
     // Shutdown stops every slot from the bridge task above.
     let current = slot.ready.borrow().clone();
-    let keep = transport_dropped
+    let keep = !ended_by_revocation
+        && transport_dropped
         && (current.channel.is_none() || generation.is_some_and(|old| old != current.generation));
     if keep {
         *slot.attachment.lock().unwrap() = None;
@@ -570,6 +974,7 @@ async fn proxy(mut socket: WebSocket, origin: String, shared: Arc<Shared>) {
             .unwrap()
             .retain(|candidate| !Arc::ptr_eq(candidate, &slot));
     }
+    binding.release_proxy(&lease.cancel);
 }
 
 #[cfg(test)]
@@ -589,6 +994,7 @@ mod tests {
                 ready,
                 attachment: Mutex::new(Some(Attachment { frames, lost })),
                 role: Mutex::new(None),
+                owner: Mutex::new(None),
             },
             receiver,
             lost_rx,

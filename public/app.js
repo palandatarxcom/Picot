@@ -10,6 +10,7 @@ import { resolveComposerSessionIdentity } from "./app/composer-session-identity.
 import {
   connectHost,
   HOST_PARAM,
+  showBridgeUnsupportedNotice,
   supportsRemoteTerminal,
   watchCredentialInvalid,
 } from "./app/host-connection.js";
@@ -617,6 +618,16 @@ installHostOriginFetch(window);
 // The window's host lives on its URL (`?host=<id>`); the local host resolves
 // to today's origin socket, a remote one to its app-owned bridge socket.
 const hostConnection = await connectHost({ env: window });
+if (hostConnection.blocked) {
+  // Mixed versions (plan 2026-11-10 T2): a bridge that cannot issue a window
+  // grant is never dialed and never downgraded to Origin-only. The notice is
+  // fixed; this module's startup stops here, so no socket and no transport
+  // exist to leak an unauthenticated connection.
+  showBridgeUnsupportedNotice(window);
+  await new Promise(() => {
+    /* never resolves: the rest of this entry module must not initialize */
+  });
+}
 const wsClient = new WebSocketClient(hostConnection.wsUrl, hostConnection.clientOptions);
 // Remote host: no HTTP data plane (contract 2 / T1 inventory), so the surfaces
 // below disable rather than fall back to the local host.
