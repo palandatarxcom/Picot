@@ -22,7 +22,6 @@
     "build:daemon": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --manifest-path src-tauri/Cargo.toml -p picot-daemon",
     "build:daemon:sidecar": "bash scripts/build-daemon-sidecar.sh",
     "fetch:pi": "bun run scripts/fetch-pi-binary.js",
-    "fetch:pi-bolt": "bun run scripts/fetch-pi-bolt.js",
     "fetch:terminal-font": "bun run scripts/fetch-terminal-font.js",
     "fetch:cjk-font": "bun run scripts/fetch-cjk-font.js",
     "smoke:pi-rpc": "bun run scripts/smoke-pi-rpc.js",
