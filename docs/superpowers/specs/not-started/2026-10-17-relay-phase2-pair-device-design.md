@@ -68,7 +68,7 @@ keypair + serverId 存 SQLite `preferences` 表，单键 `relay.daemon.identity`
 
 control socket 重连退避 `min(30s, 1s×尝试次数)`（`relay-transport.ts:338`）、WS ping 周期 10s / 30s stale 强断（`relay-transport.ts:56-57`）、control ready 超时 8s、握手超时 10s、`perMessageDeflate` 关闭、`sync` 对账（control 连上后 relay 推全量 connectionIds，daemon 补开缺失 data socket、关多余）、每 client 独立 data socket + 独立 E2EE 通道 + 15s open 超时（`relay-transport.ts:361`）。URL：`wss://<endpoint>/ws?serverId=&role=server|client&v=2[&connectionId=]`。以上参数不在本 spec 重述理由，实现照抄。
 
-**TLS 后端（评审 R3）**。`Cargo.lock:5752-5762` 的 tokio-tungstenite 0.24.0 不含 TLS 后端，默认构建连不了公司 `wss://`；本地 `ws://` mock 全绿发现不了。修订：
+**TLS 后端（评审 R3）**。`Cargo.lock:5752-5762` 的 tokio-tungstenite 0.24.0 不含 TLS 后端，默认构建连不了公司 `wss://`；本地 `ws://` mock 全绿发现不了。修订： <!-- nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- WSS denotes TLS-protected WebSocket; this is a secure remote endpoint -->
 
 - 依赖改为 `tokio-tungstenite = { version = "0.24", features = ["native-tls"] }`。
 - 选 native-tls 而非 rustls(webpki-roots) 的理由：① picot-host 已因 reqwest 0.12（默认 native-tls）链接同一 TLS 栈，macOS 上走 SecurityFramework、无 OpenSSL vendoring 负担——启用 feature 只是把既有栈接到 WS 客户端，不引入第二套 TLS 实现；② 公司域名的证书链若来自内部 CA，系统信任库装根证书即可用，webpki-roots（Mozilla 集合）在该场景直接失败。若 Dr. Lin 有理由改 webpki-roots（如跨平台 vendored 构建），差异只是一行 feature 声明。

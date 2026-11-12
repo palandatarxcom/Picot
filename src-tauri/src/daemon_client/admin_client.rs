@@ -609,10 +609,11 @@ impl Drop for AdminClient {
     }
 }
 
-/// `ws://host:port/admin` for an `http://host:port` admin origin.
+/// The matching admin WebSocket URL for a loopback HTTP origin.
 pub fn admin_ws_url(admin_origin: &str) -> String {
     format!(
         "{}{}",
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- admin listener is loopback-only
         admin_origin.replacen("http://", "ws://", 1),
         ADMIN_WS_PATH
     )
@@ -1442,6 +1443,7 @@ mod tests {
                 "http://127.0.0.1:5007".to_string(),
             )
             .expect("owner");
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- fixture connects only to its loopback HostServer
         let ws_url = fixture.state.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url)
             .await

@@ -517,6 +517,7 @@ impl WsAdminLink {
     async fn connect(endpoint: &AdminEndpoint) -> Result<AdminSocket, String> {
         let url = format!(
             "{}{}",
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- daemon admin listener is loopback-only
             endpoint.origin.replacen("http://", "ws://", 1),
             picot_host::daemon::admin::ADMIN_WS_PATH
         );

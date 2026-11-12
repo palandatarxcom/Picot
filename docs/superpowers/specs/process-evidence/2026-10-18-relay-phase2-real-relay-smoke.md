@@ -39,7 +39,7 @@ HOME="$ISO/home" src-tauri/target/debug/picot-daemon \
 
 ## 3. admin op 驱动（enable → online → offer）
 
-一次性驱动脚本（bun，内置 WebSocket；完整源码在 `$ISO/evidence/admin-relay-driver.mjs`，要点）：读实例文件拿 adminOrigin/adminToken → `ws://…/admin` → `admin_hello{role:"manager"}` → `owner.create` → `relay.set_enabled{enabled:true}` → 轮询 `relay.status` 至 `online` → `relay.offer{ownerId}`。
+一次性驱动脚本（bun，内置 WebSocket；完整源码在 `$ISO/evidence/admin-relay-driver.mjs`，要点）：读实例文件拿 adminOrigin/adminToken → `ws://…/admin` → `admin_hello{role:"manager"}` → `owner.create` → `relay.set_enabled{enabled:true}` → 轮询 `relay.status` 至 `online` → `relay.offer{ownerId}`。 <!-- nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- admin endpoint is loopback-only -->
 
 实测输出（token/公钥字段脱敏不变——本步输出本身不含 secret）：
 

@@ -51,17 +51,19 @@ describe("resolveWsUrlForHost", () => {
   test("remote points at the bridge origin with the canonical path", () => {
     expect(
       resolveWsUrlForHost({ id: "h1", bridgeOrigin: "http://127.0.0.1:55123" }, localEnv()),
-    ).toBe("ws://127.0.0.1:55123/v2/ws");
+    ).toBe("ws://127.0.0.1:55123/v2/ws"); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- expected loopback bridge URL
   });
 
   test("a host_status wsUrl is used as reported", () => {
+    // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- loopback fixture URL
     expect(resolveWsUrlForHost({ id: "h1", wsUrl: "ws://127.0.0.1:55124/v2/ws" }, localEnv())).toBe(
-      "ws://127.0.0.1:55124/v2/ws",
+      "ws://127.0.0.1:55124/v2/ws", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- expected loopback bridge URL
     );
   });
 
   test("remote without a usable bridge URL is an explicit failure, never local", () => {
     expect(() => resolveWsUrlForHost({ id: "h1" }, localEnv())).toThrow(/bridge/i);
+    // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- rejected malicious endpoint test input, never connected
     expect(() => resolveWsUrlForHost({ id: "h1", wsUrl: "ws://evil/v1/ws" }, localEnv())).toThrow(
       /bridge/i,
     );

@@ -6,7 +6,7 @@ describe("resolveWebSocketUrl", () => {
   test("uses the current HostServer origin and canonical v2 path", () => {
     expect(
       resolveWebSocketUrl({
-        location: { protocol: "https:", host: "studio.local", search: "?brokerWs=ws://evil/ws" },
+        location: { protocol: "https:", host: "studio.local", search: "?brokerWs=ws://evil/ws" }, // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- rejected URL test input, never connected
       }),
     ).toBe("wss://studio.local/v2/ws");
   });

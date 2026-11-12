@@ -1095,6 +1095,7 @@ fn live_bridge<'a>(core: &'a Core, server_id: &str, window: &str) -> Option<&'a 
 }
 
 fn bridge_url(handle: &HostBridgeHandle) -> String {
+    // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- bridge origin is this host's loopback listener
     format!("{}/v2/ws", handle.origin.replacen("http://", "ws://", 1))
 }
 

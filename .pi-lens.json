@@ -1,5 +1,5 @@
 {
-  "ignore": ["src-tauri/target/", "extensions/pi-chat-src/", ".github/workflows/"],
+  "ignore": ["src-tauri/target/", "extensions/pi-chat-src/", ".github/workflows/", ".worktrees/"],
   "rules": {
     "rust-unwrap": {
       "disable": ["rust-unwrap"]

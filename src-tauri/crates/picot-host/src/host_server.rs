@@ -5624,6 +5624,7 @@ mod tests {
             .await
             .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         socket
@@ -5925,6 +5926,7 @@ mod tests {
         .await
         .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         socket
@@ -6120,6 +6122,7 @@ mod tests {
         .await
         .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         socket
@@ -6563,6 +6566,7 @@ mod tests {
         host.set_owner_registry(registry);
         host.runtime_started().expect("generation advances");
         let (mut socket, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -6695,6 +6699,7 @@ mod tests {
         host.set_owner_registry(registry);
         host.runtime_started().expect("generation advances");
         let (mut socket, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -6800,6 +6805,7 @@ mod tests {
             .unwrap();
         host.set_owner_registry(registry);
         let (mut socket, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -7698,6 +7704,7 @@ mod tests {
                 .status();
             let bootstrap_ms = bootstrap_start.elapsed().as_secs_f64() * 1000.0;
             assert!(shell_status.is_success() && bootstrap_status.is_success());
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             let ws_url = host.origin().replacen("http://", "ws://", 1) + "/v2/ws";
             let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
             socket
@@ -7920,6 +7927,7 @@ mod tests {
             reqwest::StatusCode::UNAUTHORIZED
         );
 
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replacen("http://", "ws://", 1) + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         socket
@@ -8073,6 +8081,7 @@ mod tests {
         // Reconnect on same authorized owner, then hydrate from authoritative snapshot.
         let _ = socket.close(None).await;
         let (mut reconnected, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -8614,6 +8623,7 @@ mod tests {
             .await
             .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         socket
@@ -8722,6 +8732,7 @@ mod tests {
             .await
             .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket_a, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
         socket_a
@@ -8896,6 +8907,7 @@ mod tests {
         host.set_owner_registry(registry);
         host.runtime_started().expect("generation advances");
         let (mut socket, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -8995,6 +9007,7 @@ mod tests {
         host.set_owner_registry(registry);
         host.runtime_started().expect("generation advances");
         let (mut socket, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -9126,6 +9139,7 @@ mod tests {
         // The desktop owner mints the pairing token (mobile_pairing_create):
         // the mint records the minting owner (Gate B, spec §2.8).
         let (mut socket, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -9178,6 +9192,7 @@ mod tests {
         // session context resolves the device principal (device + the owner
         // the pairing bound).
         let (mut remote, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -9237,6 +9252,7 @@ mod tests {
             .exchange(&legacy_pairing.token, "legacy-phone", 2)
             .expect("legacy exchange");
         let (mut legacy, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -9337,6 +9353,7 @@ mod tests {
             .expect("owner-stamped exchange");
 
         let (mut remote, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -9472,6 +9489,7 @@ mod tests {
             .exchange(&legacy_pairing.token, "gate-b-legacy", 4)
             .expect("legacy exchange");
         let (mut legacy, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await
@@ -9572,6 +9590,7 @@ mod tests {
             .await
             .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         socket
@@ -9683,6 +9702,7 @@ mod tests {
             .await
             .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         socket
@@ -9841,6 +9861,7 @@ mod tests {
             .await
             .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket_a, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
         let (mut socket_b, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
@@ -10013,6 +10034,7 @@ mod tests {
             .await
             .unwrap();
         host.set_owner_registry(registry);
+        // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
         let ws_url = host.origin().replace("http://", "ws://") + "/v2/ws";
         let (mut socket_b, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
         ws_send(
@@ -10142,6 +10164,7 @@ mod tests {
             .current_workspace_generation(&owner)
             .expect("generation present");
         let (mut socket, _) = tokio_tungstenite::connect_async(
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- test connects only to HostServer's loopback origin
             host.origin().replacen("http://", "ws://", 1) + "/v2/ws",
         )
         .await

@@ -96,7 +96,7 @@ pub enum ConnectionState {
 pub struct RelayConfig {
     /// `host:port` of the relay endpoint (no scheme, no path).
     pub endpoint: String,
-    /// `true` → `wss://` with the native-tls connector; `false` → `ws://`.
+    /// `true` → TLS with the `native-tls` connector; `false` → plaintext.
     pub use_tls: bool,
     /// The daemon identity's serverId (T6 wires them together).
     pub server_id: String,
