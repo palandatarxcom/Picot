@@ -3,9 +3,6 @@
 
 import { t } from "../i18n.js";
 
-const CHEVRON_ICON =
-  '<svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor" aria-hidden="true"><path d="M2 1l4 3-4 3z"/></svg>';
-
 /**
  * Build a collapsed-by-default "Process details" group. Callers append
  * process content (thinking blocks, tool cards) into `body`, then call
@@ -22,7 +19,16 @@ export function createProcessDetailsGroup() {
 
   const chevron = document.createElement("span");
   chevron.className = "chevron";
-  chevron.innerHTML = CHEVRON_ICON;
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("width", "8");
+  icon.setAttribute("height", "8");
+  icon.setAttribute("viewBox", "0 0 8 8");
+  icon.setAttribute("fill", "currentColor");
+  icon.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M2 1l4 3-4 3z");
+  icon.append(path);
+  chevron.append(icon);
 
   const label = document.createElement("span");
   label.className = "process-details-label";
