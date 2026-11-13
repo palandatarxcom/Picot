@@ -13,6 +13,14 @@ const LOCK_STALE_MS: u64 = 10_000;
 const LOCK_RETRY_DELAY_MS: u64 = 20;
 const LOCK_MAX_ATTEMPTS: usize = 750; // ~15s ceiling
 
+/// Attempts to remove the lock directory before giving up on it.
+///
+/// Windows refuses `RemoveDirectory` while any handle is open on it
+/// (`ERROR_SHARING_VIOLATION`): an antivirus scanner or the search indexer
+/// touching the just-created lock directory is enough. Those holds are
+/// short-lived, so a few retries clear almost all of them.
+const LOCK_RELEASE_ATTEMPTS: usize = 10;
+
 /// Trust file inside the Pi agent root (Pi: `ProjectTrustStore.trustPath`).
 fn trust_file(agent_root: &Path) -> PathBuf {
     agent_root.join("trust.json")
@@ -93,6 +101,24 @@ fn write_trust_map(agent_root: &Path, map: &Map<String, Value>) -> Result<(), St
     }
 }
 
+/// Remove the lock directory, retrying the transient failures Windows throws
+/// when a scanner or the indexer holds a handle on it. Returns whether the lock
+/// is gone; callers must report a `false` rather than swallow it.
+fn release_trust_lock(lock_dir: &Path) -> bool {
+    for attempt in 0..LOCK_RELEASE_ATTEMPTS {
+        match fs::remove_dir(lock_dir) {
+            Ok(()) => return true,
+            // Already gone: another holder cleared it, or a stale sweep did.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) if attempt + 1 < LOCK_RELEASE_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(LOCK_RETRY_DELAY_MS));
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// Pi's proper-lockfile protocol, replicated: acquire by `create_dir` on an
 /// empty `trust.json.lock` directory (atomic EEXIST = held), staleness by
 /// directory mtime against a 10s threshold, release by `remove_dir`. No
@@ -104,13 +130,35 @@ fn with_trust_lock<T>(
     fs::create_dir_all(agent_root)
         .map_err(|error| format!("failed to create {}: {error}", agent_root.display()))?;
     let lock_dir = agent_root.join("trust.json.lock");
+    // Diagnostics for the one question this code cannot answer from the test
+    // suite: how long did acquiring actually take on a real machine? A
+    // sub-second trust write that reports seconds here is the lock stall.
+    let waited_from = std::time::Instant::now();
     for _ in 0..LOCK_MAX_ATTEMPTS {
         // create_dir (NOT create_dir_all): the single mkdir must fail with
         // AlreadyExists when another process holds the lock.
         match fs::create_dir(&lock_dir) {
             Ok(()) => {
+                let waited = waited_from.elapsed();
+                if waited >= Duration::from_secs(1) {
+                    log::warn!(
+                        "[picot-native] waited {:.1}s for the trust lock {}",
+                        waited.as_secs_f64(),
+                        lock_dir.display()
+                    );
+                }
                 let result = critical();
-                let _ = fs::remove_dir(&lock_dir);
+                if !release_trust_lock(&lock_dir) {
+                    // Never silent: a lock left behind makes the NEXT trust
+                    // write wait out LOCK_STALE_MS (10s) before it may take
+                    // over, which surfaces as a ten-second stall on an
+                    // otherwise sub-second operation.
+                    log::warn!(
+                        "[picot-native] trust lock {} could not be released; the next trust write may wait up to {}s for it to go stale",
+                        lock_dir.display(),
+                        LOCK_STALE_MS / 1000
+                    );
+                }
                 return result;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -127,8 +175,16 @@ fn with_trust_lock<T>(
                             })
                             .unwrap_or(true);
                         if stale {
-                            // A crashed prior holder: clear and retry.
-                            let _ = fs::remove_dir(&lock_dir);
+                            // A crashed prior holder: clear and retry. A clear
+                            // that keeps failing must be reported, not spun on:
+                            // the loop below would retry the same stuck
+                            // directory until the attempt ceiling.
+                            if !release_trust_lock(&lock_dir) {
+                                return Err(format!(
+                                    "failed to clear stale trust lock {}",
+                                    lock_dir.display()
+                                ));
+                            }
                             continue;
                         }
                     }
@@ -163,6 +219,19 @@ fn with_trust_lock<T>(
 /// the write entirely.
 pub fn trust_project(agent_root: &Path, cwd: &Path) -> Result<(), String> {
     let key = canonical_trust_key(cwd);
+    // Fast path, deliberately OUTSIDE the lock: an entry that is already `true`
+    // needs no write, and this is the common case — every launch re-asserts
+    // trust for its workspace, and "add project" writes twice (workspace.add,
+    // then native_launch_spec). Taking the lock only to discover there is
+    // nothing to do turns any leftover lock into a LOCK_STALE_MS (10s) stall on
+    // a sub-second operation. A concurrent writer can only lose this race in
+    // the safe direction: the locked pass below re-reads and decides again.
+    if read_trust_map(agent_root)
+        .map(|map| map.get(&key).and_then(Value::as_bool) == Some(true))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     with_trust_lock(agent_root, || {
         let mut map = read_trust_map(agent_root)?;
         if map.get(&key).and_then(Value::as_bool) == Some(true) {
@@ -240,6 +309,65 @@ mod tests {
             .expect("backdate age within range");
         file.set_times(fs::FileTimes::new().set_modified(past))
             .expect("backdate mtime");
+    }
+
+    /// Re-asserting trust for a workspace that is already `true` must not touch
+    /// the lock. On Windows a release can fail while an AV scanner or the search
+    /// indexer holds a handle on the lock directory, leaving a FRESH one behind;
+    /// the next acquirer then waits out LOCK_STALE_MS (10s) before it may take
+    /// over. That is the "adding a project takes ten seconds" stall, and the
+    /// repeated-spawn path (every launch re-asserts trust) hits it most.
+    #[test]
+    fn trust_project_skips_the_lock_when_the_entry_is_already_trusted() {
+        let root = agent_root();
+        let ws = workspace_under(root.path(), "proj");
+        fs::write(
+            trust_file(root.path()),
+            format!("{{\n  \"{}\": true\n}}\n", key_of(&ws)),
+        )
+        .expect("seed trusted entry");
+        // A fresh leftover lock: the shape a failed release leaves behind.
+        let lock_dir = root.path().join("trust.json.lock");
+        fs::create_dir(&lock_dir).expect("seed fresh lock");
+
+        let started = std::time::Instant::now();
+        trust_project(root.path(), &ws).expect("already-trusted write");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "an already-trusted entry must not wait for the lock (took {elapsed:?})"
+        );
+        assert!(
+            lock_dir.exists(),
+            "the fast path must not acquire, so it must not clear the lock either"
+        );
+    }
+
+    /// A release that cannot complete must be retried and then reported, never
+    /// silently swallowed: the silent path is what leaves a fresh lock behind
+    /// and becomes the ten-second stall on the next trust write.
+    #[test]
+    fn lock_release_retries_and_reports_a_lock_it_cannot_remove() {
+        let root = agent_root();
+        let lock_dir = root.path().join("trust.json.lock");
+        fs::create_dir(&lock_dir).expect("seed lock");
+        // A non-empty directory cannot be removed. On Windows a held handle
+        // (ERROR_SHARING_VIOLATION) fails remove_dir the same way.
+        let blocker = lock_dir.join("busy");
+        fs::write(&blocker, "x").expect("seed blocker");
+
+        assert!(
+            !release_trust_lock(&lock_dir),
+            "a failed release must be reported"
+        );
+
+        fs::remove_file(&blocker).expect("clear blocker");
+        assert!(
+            release_trust_lock(&lock_dir),
+            "the release must succeed once the blocker is gone"
+        );
+        assert!(!lock_dir.exists());
     }
 
     #[test]
