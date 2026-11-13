@@ -1116,4 +1116,54 @@ describe("startup loading", () => {
       vi.useRealTimers();
     }
   });
+
+  // The host reports an unrecorded Pi session bucket (a workspace whose runtime
+  // has not answered `get_state` yet) as an UNKNOWN count. A number is treated
+  // as authoritative and short-circuits every later refresh, so latching a
+  // placeholder zero here would permanently show an empty workspace — the
+  // cold-start bug the old synchronous post-spawn bucket write prevented.
+  test("an unknown count is not latched and recovers once the bucket lands", async () => {
+    vi.useFakeTimers();
+    try {
+      const rows = [
+        {
+          workspaceId: "uuid-1",
+          canonicalPath: "/work/alpha",
+          displayName: "alpha",
+          pinned: false,
+          lastOpenedAt: null,
+        },
+      ];
+      // null = the host does not know yet, matching a NULL session_bucket row.
+      let sessionCount = null;
+      const { sidebar, transport } = await makeSidebar({
+        rows,
+        fetchRoutes: {
+          instances: [],
+          workspaceSessions: () => ({ sessionCount, sessions: [] }),
+        },
+      });
+      await sidebar.loadSessions({ quiet: true });
+      await vi.advanceTimersByTimeAsync(900);
+
+      expect(
+        sidebar.projects.find((project) => project.workspaceId === "ws:uuid-1")?.sessionCount,
+      ).toBeNull();
+      const callsBefore = transport.workspaceSessions.mock.calls.length;
+
+      // The detached post-spawn bucket write lands and broadcasts
+      // registry_changed; the next warmup must re-read the count instead of
+      // trusting a latched 0.
+      sessionCount = 3;
+      await sidebar.refresh();
+      await vi.advanceTimersByTimeAsync(900);
+
+      expect(transport.workspaceSessions.mock.calls.length).toBeGreaterThan(callsBefore);
+      expect(
+        sidebar.projects.find((project) => project.workspaceId === "ws:uuid-1")?.sessionCount,
+      ).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

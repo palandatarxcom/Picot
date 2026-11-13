@@ -179,7 +179,39 @@ describe("startInWindowNewSession parallel-spawn", () => {
     expect(transport.cancelWorkspaceTransition).toHaveBeenCalledWith(9);
   });
 
-  it("surfaces native preparation errors before showing the swap overlay", async () => {
+  // Native preparation spawns the Pi child and waits for its first
+  // `get_state`: it is the slowest step of the whole flow. The overlay must
+  // already be on screen when it starts, or the wait has no progress
+  // indication at all.
+  it("shows the swap overlay before the native preparation round-trip starts", async () => {
+    const order = [];
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn(async () => {
+      order.push("prepare");
+      return {
+        classification: "same",
+        transitionGeneration: 1,
+        targetOrigin: "http://studio.example.test/workspaces/ws/sessions/s",
+      };
+    });
+
+    const ok = await startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/work",
+      navigate: vi.fn(),
+      onBeforeSwap: () => {
+        order.push("overlay");
+        return vi.fn();
+      },
+      shouldSpawnParallel: () => true,
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(true);
+    expect(order).toEqual(["overlay", "prepare"]);
+  });
+
+  it("dismisses the swap overlay when native preparation fails", async () => {
     const transport = makeTransport();
     transport.prepareWorkspaceTarget.mockRejectedValue(new Error("boom"));
     const dismiss = vi.fn();
@@ -196,7 +228,150 @@ describe("startInWindowNewSession parallel-spawn", () => {
 
     expect(ok).toBe(false);
     expect(renderError).toHaveBeenCalled();
+    expect(dismiss).toHaveBeenCalled();
+  });
+
+  it("dismisses the swap overlay when ephemeral settlement is rejected", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 7,
+      targetOrigin: "http://127.0.0.1:47826/",
+    });
+    const dismiss = vi.fn();
+
+    const ok = await startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/other",
+      navigate: vi.fn(),
+      onBeforeSwap: () => dismiss,
+      shouldSpawnParallel: () => true,
+      beforeWorkspaceTransition: vi.fn().mockResolvedValue(false),
+      onWorkspaceTransitionCancelled: vi.fn(),
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(false);
+    expect(dismiss).toHaveBeenCalled();
+  });
+
+  // Settlement waits for the user (side chat discard confirmation), and it must
+  // stay reachable: it is a native `window.confirm`, which the overlay cannot
+  // cover regardless of z-index. This locks in that the overlay is raised
+  // exactly once for the whole prepare→settle→commit window rather than being
+  // torn down and re-raised around the settlement.
+  it("keeps the swap overlay up across a pending ephemeral settlement", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 7,
+      targetOrigin: "http://127.0.0.1:47826/",
+    });
+    const events = [];
+    let releaseSettlement;
+    const settlementGate = new Promise((resolve) => {
+      releaseSettlement = resolve;
+    });
+    const dismiss = vi.fn(() => events.push("dismiss"));
+    let swapCount = 0;
+
+    const run = startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/other",
+      navigate: vi.fn(),
+      onBeforeSwap: () => {
+        swapCount += 1;
+        events.push(`swap-${swapCount}`);
+        return dismiss;
+      },
+      shouldSpawnParallel: () => true,
+      beforeWorkspaceTransition: async () => {
+        events.push("settlement-open");
+        await settlementGate;
+        events.push("settlement-close");
+        return true;
+      },
+      onWorkspaceTransitionCancelled: vi.fn(),
+      renderError: vi.fn(),
+    });
+
+    await vi.waitFor(() => expect(events).toContain("settlement-open"));
+    // Still covered while the settlement is pending, and raised only once.
     expect(dismiss).not.toHaveBeenCalled();
+    expect(swapCount).toBe(1);
+
+    releaseSettlement();
+    expect(await run).toBe(true);
+    // Success keeps the overlay for the navigation handoff.
+    expect(swapCount).toBe(1);
+    expect(dismiss).not.toHaveBeenCalled();
+  });
+
+  it("dismisses the swap overlay when a preparation error interrupts an attach", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget.mockRejectedValue(new Error("boom"));
+    const dismiss = vi.fn();
+
+    const ok = await openProjectWorkspace({
+      project: { path: "/work/gamma", sessions: [{ cwd: "/work/gamma" }] },
+      transport,
+      navigate: vi.fn(),
+      onBeforeSwap: () => dismiss,
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(false);
+    expect(dismiss).toHaveBeenCalled();
+  });
+
+  it("shows the swap overlay before an attach starts its preparation", async () => {
+    const order = [];
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn(async () => {
+      order.push("prepare");
+      return {
+        classification: "same",
+        transitionGeneration: 1,
+        targetOrigin: "http://studio.example.test/workspaces/ws/sessions/s",
+      };
+    });
+
+    const ok = await openProjectWorkspace({
+      project: { path: "/work/gamma", sessions: [{ cwd: "/work/gamma" }] },
+      transport,
+      navigate: vi.fn(),
+      onBeforeSwap: () => {
+        order.push("overlay");
+        return vi.fn();
+      },
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(true);
+    expect(order).toEqual(["overlay", "prepare"]);
+  });
+
+  it("dismisses the swap overlay when an attach settlement is rejected", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 7,
+      targetOrigin: "http://127.0.0.1:47826/",
+    });
+    const dismiss = vi.fn();
+
+    const ok = await openProjectWorkspace({
+      project: { path: "/work/gamma", sessions: [{ cwd: "/work/gamma" }] },
+      transport,
+      navigate: vi.fn(),
+      onBeforeSwap: () => dismiss,
+      beforeWorkspaceTransition: vi.fn().mockResolvedValue(false),
+      onWorkspaceTransitionCancelled: vi.fn(),
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(false);
+    expect(dismiss).toHaveBeenCalled();
   });
 
   it("starts a fresh native runtime through workspace transition", async () => {

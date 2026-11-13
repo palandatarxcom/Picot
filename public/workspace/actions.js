@@ -60,6 +60,11 @@ async function attachToWorkspace({
   let dismissOverlay = () => {};
   try {
     if (typeof transport.prepareWorkspaceTarget === "function") {
+      // The overlay goes up BEFORE preparation, not after. Preparation spawns
+      // the Pi child and waits for its first `get_state` reply, which is the
+      // slowest step in this flow; raising the overlay afterwards would leave
+      // that entire wait with no on-screen feedback.
+      dismissOverlay = runOnBeforeSwap(onBeforeSwap, "Opening workspace…");
       prepared = await transport.prepareWorkspaceTarget(targetCwd, {
         reuseExisting: true,
       });
@@ -67,6 +72,7 @@ async function attachToWorkspace({
       if (crossWorkspace && typeof beforeWorkspaceTransition === "function") {
         const settled = await beforeWorkspaceTransition(prepared);
         if (!settled) {
+          dismissOverlay();
           onWorkspaceTransitionCancelled?.();
           await transport.cancelWorkspaceTransition(prepared.transitionGeneration).catch(() => {});
           return null;
@@ -75,7 +81,6 @@ async function attachToWorkspace({
       if (typeof prepared?.transitionGeneration !== "number") {
         throw new Error("Workspace transition was not prepared");
       }
-      dismissOverlay = runOnBeforeSwap(onBeforeSwap, "Opening workspace…");
       // The caller invalidates anything bound to the workspace being left
       // *before* the host commits (plan 2026-11-03 §4): the freeze alone still
       // allows the controlled checkpoint, not a lasting binding.
@@ -206,6 +211,9 @@ async function spawnFreshSession({
     if (typeof transport.prepareWorkspaceTarget !== "function") {
       throw new Error("Native workspace transition is unavailable");
     }
+    // Raised before preparation: the spawn plus first `get_state` is the long
+    // pole, so it must happen under the overlay rather than before it.
+    dismissOverlay = runOnBeforeSwap(onBeforeSwap, label);
     prepared = await transport.prepareWorkspaceTarget(targetCwd, {
       forceNewSession: true,
       reuseExisting: false,
@@ -213,6 +221,7 @@ async function spawnFreshSession({
     if (prepared?.classification === "cross" && typeof beforeWorkspaceTransition === "function") {
       const settled = await beforeWorkspaceTransition(prepared);
       if (!settled) {
+        dismissOverlay();
         onWorkspaceTransitionCancelled?.();
         await transport.cancelWorkspaceTransition(prepared.transitionGeneration).catch(() => {});
         return false;
@@ -221,7 +230,6 @@ async function spawnFreshSession({
     if (typeof prepared?.transitionGeneration !== "number") {
       throw new Error("Native workspace transition was not prepared");
     }
-    dismissOverlay = runOnBeforeSwap(onBeforeSwap, label);
     beforeWorkspaceCommit?.();
     await transport.commitWorkspaceTransition(prepared.transitionGeneration);
     console.debug(`[Session route] ${debugTag}:created`, { targetCwd });

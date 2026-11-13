@@ -226,7 +226,12 @@ impl HostDataPlane {
         count_only: bool,
     ) -> WorkspaceSessionBucketResult {
         let Some(bucket) = self.session_bucket_for_workspace(workspace_id) else {
-            return (None, Vec::new(), Some(0), Some(0));
+            // No recorded bucket is UNKNOWN, not zero: Pi has not reported a
+            // session file yet, so nothing has counted this workspace. A zero
+            // here latches in the sidebar (it treats any number as
+            // authoritative and never re-counts), turning a not-yet-recorded
+            // bucket into a permanently empty workspace.
+            return (None, Vec::new(), None, None);
         };
         let workspace = match self.workspace_root(workspace_id) {
             Ok(workspace) => workspace,
@@ -3401,6 +3406,42 @@ mod tests {
                     .map(|name| name.to_string_lossy().into_owned())),
             Some("--another-bucket--".to_string())
         );
+    }
+    /// A workspace whose Pi session bucket has not been recorded yet has an
+    /// UNKNOWN session count, not an empty one. Reporting `Some(0)` here makes
+    /// the sidebar latch a false zero forever (`typeof sessionCount ===
+    /// "number"` short-circuits every later refresh), which is exactly the
+    /// cold-start bug the awaited post-spawn bucket write used to prevent.
+    /// Recording the bucket asynchronously is only safe while this reports
+    /// unknown.
+    #[test]
+    fn unrecorded_session_bucket_reports_unknown_count_not_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let db = temp.path().join("metadata.sqlite3");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let metadata = Arc::new(Mutex::new(MetadataStore::open(&db).unwrap()));
+        let (row, _) = metadata.lock().unwrap().add_workspace(&workspace).unwrap();
+        let data = HostDataPlane::new(metadata).with_session_root(sessions);
+        assert!(
+            data.session_bucket_for_workspace(&row.workspace_id)
+                .is_none(),
+            "fixture must leave the bucket unrecorded"
+        );
+
+        for count_only in [true, false] {
+            let (dir_name, sessions, session_count, hidden_subagent_count) =
+                data.read_workspace_session_bucket(&row.workspace_id, count_only);
+            assert_eq!(dir_name, None);
+            assert!(sessions.is_empty());
+            assert_eq!(
+                session_count, None,
+                "an unrecorded bucket must read as unknown, not zero (count_only={count_only})"
+            );
+            assert_eq!(hidden_subagent_count, None);
+        }
     }
 
     #[test]

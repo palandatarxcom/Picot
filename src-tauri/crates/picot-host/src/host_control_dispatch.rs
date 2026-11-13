@@ -1701,14 +1701,23 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                     generation,
                                     &new_target.instance_id,
                                 );
-                                record_session_bucket_after_spawn(
+                                // Detached, like every other spawn path in this
+                                // dispatcher: this waits on the fresh Pi's first
+                                // `get_state` reply (30s ceiling), and awaiting
+                                // it here put a cold Pi start on the control
+                                // response. Navigation does not need the bucket
+                                // row: `read_workspace_session_bucket` now
+                                // reports an unrecorded bucket as unknown rather
+                                // than zero, so the arriving page shows a pending
+                                // badge and the `registry_changed` broadcast
+                                // fills it in.
+                                tokio::spawn(record_session_bucket_after_spawn(
                                     runtimes.clone(),
                                     metadata.clone(),
                                     host_events.clone(),
                                     new_target.clone(),
                                     Some(owner.clone()),
-                                )
-                                .await;
+                                ));
                                 (new_target, generation)
                             }
                         };
