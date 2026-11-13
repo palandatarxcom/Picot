@@ -30,17 +30,17 @@ import sys
 import subprocess
 import time
 from datetime import UTC, datetime
-from http.client import HTTPException
+from http.client import HTTPException, IncompleteRead
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 COMMUNITY_OUTPUT = REPOSITORY_ROOT / "community-extensions.json"
 WORKER_PACKAGES_URL = "https://pi-packages-api.shixin.workers.dev/packages"
-WORKER_PAGE_SIZE = 250
+WORKER_PAGE_SIZE = 100
 USER_AGENT = "picot-extension-catalog/1.0"
 REQUEST_RETRY_DELAYS_SECONDS = (1, 3, 9)
 
@@ -51,32 +51,45 @@ PACKAGE_FIELDS = ("name", "description", "author", "types", "downloads", "date")
 LINK_FIELDS = ("npm", "repository", "homepage")
 
 
+def fetch_via_curl(url: str) -> Any:
+    # curl's HTTP/TLS stack survives middleboxes that deterministically cut
+    # python urllib's connections mid-body (IncompleteRead on this network);
+    # its own retry flags cover flaky links.
+    # pi-lens-ignore: S603,S607
+    out = subprocess.run(
+        ["curl", "--silent", "--show-error", "--fail", "--max-time", "120",
+         "--retry", "3", "--retry-all-errors",
+         "--header", "Accept: application/json",
+         "--header", f"User-Agent: {USER_AGENT}",
+         url],
+        check=True, capture_output=True, text=True, timeout=180,
+    ).stdout
+    return json.loads(out)
+
+
 def fetch_json(url: str) -> Any:
     if urlparse(url).scheme != "https":
         raise RuntimeError(f"refusing to open non-https url: {url}")
     # pi-lens-ignore: S310
     request = Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+    # Bypass macOS system proxies: this is a direct public read and local
+    # proxies add a failure layer without benefit here.
+    direct_opener = build_opener(ProxyHandler({}))
     for attempt, delay in enumerate((*REQUEST_RETRY_DELAYS_SECONDS, None), start=1):
         # pi-lens-ignore: S310
         try:
-            with urlopen(request, timeout=60) as response:
+            with direct_opener.open(request, timeout=60) as response:
                 return json.load(response)
         except (HTTPError, HTTPException, URLError, TimeoutError, json.JSONDecodeError) as error:
+            if isinstance(error, IncompleteRead):
+                # Body truncation on this link is deterministic per-client:
+                # python TLS connections get cut mid-body, curl does not.
+                # Retrying urllib just burns backoff delays before curl wins.
+                print(f"urllib truncated; switching to curl for {url}", file=sys.stderr)
+                return fetch_via_curl(url)
             if delay is None:
-                # Cloudflare truncates/challenges responses from some Python
-                # TLS fingerprints (urllib gets IncompleteRead where curl
-                # succeeds), so fall back to curl before giving up.
                 try:
-                    # pi-lens-ignore: S603,S607
-                    out = subprocess.run(
-                        ["curl", "--silent", "--show-error", "--fail", "--max-time", "120",
-                         "--retry", "3", "--retry-all-errors",
-                         "--header", "Accept: application/json",
-                         "--header", f"User-Agent: {USER_AGENT}",
-                         url],
-                        check=True, capture_output=True, text=True, timeout=180,
-                    ).stdout
-                    return json.loads(out)
+                    return fetch_via_curl(url)
                 except (subprocess.SubprocessError, json.JSONDecodeError) as curl_error:
                     raise RuntimeError(
                         f"request failed for {url}: {error}; curl fallback: {curl_error}"
