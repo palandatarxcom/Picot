@@ -598,3 +598,130 @@ describe("renderError i18n safety", () => {
     expect(badErrorLabels).toEqual([]);
   });
 });
+
+describe("in-place adoption tail", () => {
+  it("adopts the prepared target in place instead of navigating", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 5,
+      targetWorkspaceId: "ws-2",
+      targetSessionId: "s-2",
+      targetOrigin: "http://studio.example.test/workspaces/ws-2/sessions/s-2",
+    });
+    transport.commitWorkspaceTransition = vi.fn().mockResolvedValue({
+      targetOrigin: "http://studio.example.test/workspaces/ws-2/sessions/s-2",
+      workspaceGeneration: 9,
+    });
+    const adoptPrepared = vi.fn().mockResolvedValue(undefined);
+    const navigate = vi.fn();
+
+    const ok = await startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/work",
+      navigate,
+      adoptPrepared,
+      onBeforeSwap: vi.fn(),
+      shouldSpawnParallel: () => true,
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(true);
+    expect(adoptPrepared).toHaveBeenCalledTimes(1);
+    expect(adoptPrepared).toHaveBeenCalledWith(
+      expect.objectContaining({ transitionGeneration: 5, targetSessionId: "s-2" }),
+      expect.objectContaining({ targetCwd: "/work", workspaceGeneration: 9 }),
+    );
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("releases the swap overlay after a successful in-place adoption", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 5,
+      targetWorkspaceId: "ws-2",
+      targetSessionId: "s-2",
+      targetOrigin: "http://studio.example.test/workspaces/ws-2/sessions/s-2",
+    });
+    transport.commitWorkspaceTransition = vi.fn().mockResolvedValue({ workspaceGeneration: 9 });
+    const dismiss = vi.fn();
+    const onBeforeSwap = vi.fn(() => dismiss);
+    const adoptPrepared = vi.fn().mockResolvedValue(undefined);
+
+    const ok = await startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/work",
+      navigate: vi.fn(),
+      adoptPrepared,
+      onBeforeSwap,
+      shouldSpawnParallel: () => true,
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(true);
+    // No new page boots to clear the overlay anymore; the success path owns it.
+    expect(dismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("dismisses the overlay and reports failure when in-place adoption rejects", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 5,
+      targetWorkspaceId: "ws-2",
+      targetSessionId: "s-2",
+      targetOrigin: "http://studio.example.test/workspaces/ws-2/sessions/s-2",
+    });
+    transport.commitWorkspaceTransition = vi.fn().mockResolvedValue({ workspaceGeneration: 9 });
+    const dismiss = vi.fn();
+    const onBeforeSwap = vi.fn(() => dismiss);
+    const renderError = vi.fn();
+    const adoptPrepared = vi.fn().mockRejectedValue(new Error("adoption failed"));
+
+    const ok = await startInWindowNewSession({
+      transport,
+      getCurrentCwd: () => "/work",
+      navigate: vi.fn(),
+      adoptPrepared,
+      onBeforeSwap,
+      shouldSpawnParallel: () => true,
+      renderError,
+    });
+
+    expect(ok).toBe(false);
+    expect(dismiss).toHaveBeenCalledTimes(1);
+    expect(renderError).toHaveBeenCalled();
+    expect(String(renderError.mock.calls[0][0])).toContain("adoption failed");
+  });
+
+  it("attaches to an existing workspace in place via adoptPrepared", async () => {
+    const transport = makeTransport();
+    transport.prepareWorkspaceTarget = vi.fn().mockResolvedValue({
+      classification: "cross",
+      transitionGeneration: 3,
+      targetWorkspaceId: "ws-9",
+      targetSessionId: "s-9",
+      targetOrigin: "http://studio.example.test/workspaces/ws-9/sessions/s-9",
+    });
+    transport.commitWorkspaceTransition = vi.fn().mockResolvedValue({ workspaceGeneration: 4 });
+    const adoptPrepared = vi.fn().mockResolvedValue(undefined);
+    const navigate = vi.fn();
+
+    const ok = await openProjectWorkspace({
+      project: { path: "/target", sessions: [] },
+      transport,
+      navigate,
+      adoptPrepared,
+      onBeforeSwap: vi.fn(),
+      renderError: vi.fn(),
+    });
+
+    expect(ok).toBe(true);
+    expect(adoptPrepared).toHaveBeenCalledWith(
+      expect.objectContaining({ targetSessionId: "s-9" }),
+      expect.objectContaining({ targetCwd: "/target", workspaceGeneration: 4 }),
+    );
+    expect(navigate).not.toHaveBeenCalled();
+  });
+});

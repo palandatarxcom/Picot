@@ -2831,6 +2831,38 @@ fn current_registered_context(state: &HostState, context: &HostClientContext) ->
     )
 }
 
+/// The desktop owner's CURRENT registry binding names `workspace_id`.
+/// Dynamic on purpose: the hello-time ctx snapshot goes stale after an
+/// in-place workspace adoption (same socket, new workspace), and comparing
+/// against the snapshot there would reject every data op of the adopted
+/// workspace until the page reconnected. A stale socket still cannot read a
+/// workspace the owner left — the frame must name the owner's current wid.
+fn owner_currently_registered_to(
+    state: &HostState,
+    context: &HostClientContext,
+    workspace_id: Option<&str>,
+) -> bool {
+    let Some(owner) = context.owner_id.as_ref() else {
+        return false;
+    };
+    let Some(workspace_id) = workspace_id else {
+        return false;
+    };
+    state
+        .owner_registry
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .map(|registry| {
+            matches!(
+                registry.owner_current_workspace(owner),
+                crate::window_owner::OwnerWorkspaceSnapshot::Registered { wid, .. }
+                    if wid == workspace_id
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Authority snapshot captured at admission for a long-running preview: the
 /// workspace binding may be revoked (transition committed) while the request
 /// waits for a permit or converts.
@@ -4280,11 +4312,11 @@ async fn dispatch(
                 // the view re-read makes a device navigation land on the next
                 // frame.
                 match ctx.kind {
-                    crate::host_router::ClientKind::Desktop => {
-                        current_registered_context(state, ctx)
-                            && ctx.workspace_id.as_deref()
-                                == frame.get("workspaceId").and_then(Value::as_str)
-                    }
+                    crate::host_router::ClientKind::Desktop => owner_currently_registered_to(
+                        state,
+                        ctx,
+                        frame.get("workspaceId").and_then(Value::as_str),
+                    ),
                     // A device's data plane is its owner's: any workspace the
                     // client names is in scope once the owner matches. The
                     // binding still proves the device is attached to this host.
@@ -7262,6 +7294,64 @@ mod tests {
         assert_eq!(reply["type"], "error", "{reply:?}");
         assert_eq!(reply["error"]["code"], "unauthorized_target");
         assert!(!temp.join("workspace/escape.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn data_ops_follow_an_in_place_workspace_adoption() {
+        let (host, mut harness, _temp) = desktop_harness("data-adopt", None).await;
+        // In-place adoption: the registry moves this owner to another
+        // workspace while the socket (and its hello-time ctx snapshot) stays
+        // on the old one.
+        let registry = host.owner_registry_for_tests().expect("registry");
+        let owner = crate::window_owner::OwnerId::from_string(harness.owner_id.clone());
+        let (generation, _permit) = registry
+            .prepare_navigation_with_permit(
+                &owner,
+                3002,
+                std::path::PathBuf::from("/adopted"),
+                "http://127.0.0.1:3002/workspaces/adopted/sessions/s1".to_string(),
+                Duration::from_secs(30),
+            )
+            .expect("permit");
+        registry
+            .commit_workspace_transition_with_workspace(
+                &owner,
+                generation,
+                "http://127.0.0.1:3002/workspaces/adopted/sessions/s1".to_string(),
+                Some("adopted-wid".to_string()),
+                crate::window_owner::TemporaryKind::DefaultStartup,
+            )
+            .expect("commit");
+
+        // The adopted workspace passes admission; this test registers no such
+        // metadata row, so the reply's failure must be workspace resolution,
+        // never admission.
+        let adopted = json!({
+            "operation": "list_files",
+            "workspaceId": "adopted-wid",
+            "path": "",
+        });
+        let reply = send_data_request_body(
+            &mut harness,
+            "adopt-1",
+            adopted.as_object().cloned().unwrap(),
+        )
+        .await;
+        assert_eq!(reply["type"], "error", "{reply:?}");
+        assert_ne!(reply["error"]["code"], "unauthorized_target", "{reply:?}");
+
+        // The socket's stale snapshot cannot read the workspace the owner
+        // left: the old wid must stay rejected.
+        let stale = json!({
+            "operation": "list_files",
+            "workspaceId": harness.workspace_id,
+            "path": "",
+        });
+        let reply =
+            send_data_request_body(&mut harness, "adopt-2", stale.as_object().cloned().unwrap())
+                .await;
+        assert_eq!(reply["type"], "error", "{reply:?}");
+        assert_eq!(reply["error"]["code"], "unauthorized_target", "{reply:?}");
     }
 
     #[tokio::test]

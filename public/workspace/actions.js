@@ -14,11 +14,10 @@ import { t } from "../i18n.js";
 //
 // "Start a new session" entry points (header "+ New Session" and sidebar
 // project tile "start new chat") both use the same pattern: spawn a fresh
-// HEADLESS pi for the target cwd and navigate THIS window's WebView to
-// the new host runtime. The previously-attached Pi process keeps running in
-// the background and is reachable via the running-instances list / launcher /
-// sidebar. Net effect: no new OS window, no interruption of any previously-
-// running session.
+// HEADLESS pi for the target cwd, then hand the prepared target to the
+// caller's tail. The default tail navigates THIS window's WebView (full
+// reload); callers that pass `adoptPrepared` adopt the runtime in place
+// instead — no page reload, no interruption of a previously-running session.
 //
 // "Open project" / "Open folder" entry points still attach to an existing
 // pi instance for the same cwd when one exists — those actions are about
@@ -50,6 +49,7 @@ async function attachToWorkspace({
   targetCwd,
   transport,
   navigate,
+  adoptPrepared,
   onBeforeSwap,
   beforeWorkspaceCommit,
   beforeWorkspaceTransition,
@@ -85,8 +85,15 @@ async function attachToWorkspace({
       // *before* the host commits (plan 2026-11-03 §4): the freeze alone still
       // allows the controlled checkpoint, not a lasting binding.
       beforeWorkspaceCommit?.();
-      await transport.commitWorkspaceTransition(prepared.transitionGeneration);
-      navigate(prepared.targetOrigin, { targetCwd });
+      const committed = await transport.commitWorkspaceTransition(prepared.transitionGeneration);
+      if (typeof adoptPrepared === "function") {
+        await adoptPrepared(prepared, {
+          targetCwd,
+          workspaceGeneration: committed?.workspaceGeneration,
+        });
+      } else {
+        navigate(prepared.targetOrigin, { targetCwd });
+      }
       return { samePort: false, targetOrigin: prepared.targetOrigin };
     }
 
@@ -109,6 +116,7 @@ export async function startRegisteredWorkspaceSession({
   targetCwd,
   transport,
   navigate,
+  adoptPrepared,
   onBeforeSwap,
   beforeWorkspaceCommit,
   beforeWorkspaceTransition,
@@ -127,6 +135,7 @@ export async function startRegisteredWorkspaceSession({
     targetCwd,
     transport,
     navigate,
+    adoptPrepared,
     onBeforeSwap,
     beforeWorkspaceCommit,
     beforeWorkspaceTransition,
@@ -141,6 +150,7 @@ export async function startInWindowNewSession({
   transport,
   getCurrentCwd,
   navigate,
+  adoptPrepared,
   onBeforeSwap,
   beforeWorkspaceCommit,
   beforeWorkspaceTransition,
@@ -179,6 +189,7 @@ export async function startInWindowNewSession({
     targetCwd,
     transport,
     navigate,
+    adoptPrepared,
     onBeforeSwap,
     beforeWorkspaceCommit,
     beforeWorkspaceTransition,
@@ -196,6 +207,7 @@ async function spawnFreshSession({
   targetCwd,
   transport,
   navigate,
+  adoptPrepared,
   onBeforeSwap,
   beforeWorkspaceCommit,
   beforeWorkspaceTransition,
@@ -231,9 +243,19 @@ async function spawnFreshSession({
       throw new Error("Native workspace transition was not prepared");
     }
     beforeWorkspaceCommit?.();
-    await transport.commitWorkspaceTransition(prepared.transitionGeneration);
+    const committed = await transport.commitWorkspaceTransition(prepared.transitionGeneration);
     console.debug(`[Session route] ${debugTag}:created`, { targetCwd });
-    navigate(prepared.targetOrigin, { targetCwd });
+    if (typeof adoptPrepared === "function") {
+      // In-place adoption: the document survives, so the overlay raised before
+      // prepare must come down here — no new page boots to clear it.
+      await adoptPrepared(prepared, {
+        targetCwd,
+        workspaceGeneration: committed?.workspaceGeneration,
+      });
+      dismissOverlay();
+    } else {
+      navigate(prepared.targetOrigin, { targetCwd });
+    }
     return true;
   } catch (e) {
     dismissOverlay();
@@ -263,6 +285,7 @@ export async function startNewProjectChat({
   getCurrentCwd,
   shouldSpawnParallel,
   navigate,
+  adoptPrepared,
   onBeforeSwap,
   beforeWorkspaceCommit,
   beforeWorkspaceTransition,
@@ -301,6 +324,7 @@ export async function startNewProjectChat({
       targetCwd,
       transport,
       navigate,
+      adoptPrepared,
       onBeforeSwap,
       beforeWorkspaceCommit,
       beforeWorkspaceTransition,
@@ -317,6 +341,7 @@ export async function startNewProjectChat({
       targetCwd,
       transport,
       navigate,
+      adoptPrepared,
       onBeforeSwap,
       beforeWorkspaceCommit,
       beforeWorkspaceTransition,
@@ -330,6 +355,7 @@ export async function startNewProjectChat({
     targetCwd,
     transport,
     navigate,
+    adoptPrepared,
     onBeforeSwap,
     beforeWorkspaceCommit,
     beforeWorkspaceTransition,
@@ -349,6 +375,7 @@ export async function openProjectWorkspace({
   project,
   transport,
   navigate,
+  adoptPrepared,
   onBeforeSwap,
   beforeWorkspaceCommit,
   beforeWorkspaceTransition,
@@ -372,6 +399,7 @@ export async function openProjectWorkspace({
       transport,
       onBeforeSwap,
       navigate,
+      adoptPrepared,
       beforeWorkspaceCommit,
       beforeWorkspaceTransition,
       onWorkspaceTransitionCancelled,
@@ -387,6 +415,7 @@ export async function openProjectWorkspace({
 export async function openFolderAsWorkspace({
   transport,
   navigate,
+  adoptPrepared,
   onBeforeSwap,
   beforeWorkspaceCommit,
   beforeWorkspaceTransition,
@@ -414,6 +443,7 @@ export async function openFolderAsWorkspace({
       targetCwd,
       transport,
       navigate,
+      adoptPrepared,
       onBeforeSwap,
       beforeWorkspaceCommit,
       beforeWorkspaceTransition,

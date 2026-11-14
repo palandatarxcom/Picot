@@ -18,9 +18,6 @@ const HOST_ID = "943be80c-4bb1-448c-bd66-870efec36dee";
 // service), so navigating there is the bug this file pins.
 const REMOTE_TARGET_ORIGIN =
   "http://127.0.0.1:62465/workspaces/9a51a0d7-400f-4df3-bacb-356d7d52c182/sessions/01a022fa-abcd-7385-9eac-93c8a2337b1f";
-const REMOTE_TARGET_PATH =
-  "/workspaces/9a51a0d7-400f-4df3-bacb-356d7d52c182/sessions/01a022fa-abcd-7385-9eac-93c8a2337b1f";
-
 const REMOTE_WS_PATH = "/Users/linyong/tmp/PI/picot-corp-v3";
 const REMOTE_SESSION_FILE =
   "/Users/linyong/.pi/agent/sessions/--bucket--/2026-08-21T06-20-48-461Z_01a022fa-abcd-7385-9eac-93c8a2337b1f.jsonl";
@@ -154,7 +151,18 @@ class FakeWebSocket extends EventTarget {
     if (envelope.type === "host_request") {
       let response = null;
       if (envelope.operation === "workspace.list") response = { workspaces: [], removed: [] };
-      else if (envelope.operation === "runtime_instances") response = { instances: [] };
+      else if (envelope.operation === "runtime_instances")
+        response = {
+          instances: [
+            {
+              workspaceId: "9a51a0d7-400f-4df3-bacb-356d7d52c182",
+              sessionId: "01a022fa-abcd-7385-9eac-93c8a2337b1f",
+              instanceId: "instance-remote-2",
+              sessionFile: REMOTE_SESSION_FILE,
+              streaming: false,
+            },
+          ],
+        };
       else if (envelope.operation === "workspace_target_prepare") {
         response = prepareResponse ?? {
           classification: "cross",
@@ -178,7 +186,7 @@ class FakeWebSocket extends EventTarget {
           });
           return;
         }
-        response = {};
+        response = { workspaceGeneration: 8 };
       }
       if (response) {
         this.reply({ type: "host_response", requestId: envelope.requestId, ok: true, response });
@@ -249,6 +257,7 @@ class FakeWebSocket extends EventTarget {
 /** jsdom's window.location is configurable as a whole (landing.test.js's
  * pattern): swap it for the remote-host page URL and record every navigation. */
 const locationDescriptor = Object.getOwnPropertyDescriptor(window, "location");
+const historyDescriptor = Object.getOwnPropertyDescriptor(window, "history");
 function installRemoteHostPage(href = PAGE_HREF) {
   navigation.assigns.length = 0;
   navigation.replaces.length = 0;
@@ -273,10 +282,35 @@ function installRemoteHostPage(href = PAGE_HREF) {
       reload: () => {},
     },
   });
+  // jsdom's native history.pushState cross-checks the document URL (not the
+  // mocked location above) and throws a SecurityError DOMException on the
+  // mismatch, so in-place adoption's pushState needs a history that updates
+  // the mock instead.
+  Object.defineProperty(window, "history", {
+    configurable: true,
+    value: {
+      state: null,
+      length: 1,
+      pushState(_state, _title, url) {
+        const resolved = new URL(url, currentHref);
+        currentHref = resolved.toString();
+        const location = window.location;
+        location.href = currentHref;
+        location.pathname = resolved.pathname;
+        location.search = resolved.search;
+        location.searchParams = resolved.searchParams;
+      },
+      replaceState() {},
+      back() {},
+      forward() {},
+      go() {},
+    },
+  });
 }
 
 function restoreLocation() {
   if (locationDescriptor) Object.defineProperty(window, "location", locationDescriptor);
+  if (historyDescriptor) Object.defineProperty(window, "history", historyDescriptor);
 }
 
 beforeEach(async () => {
@@ -423,7 +457,7 @@ function hostRequests(ws, operation) {
   return ws.sent.filter((f) => f.type === "host_request" && f.operation === operation);
 }
 
-test("cross-workspace select on a remote host navigates within the page origin", async () => {
+test("cross-workspace select on a remote host adopts in place without navigation", async () => {
   await import("./app.js?remote-route-cross-origin");
   const ws = wsInstances.at(-1);
   await settle();
@@ -438,19 +472,23 @@ test("cross-workspace select on a remote host navigates within the page origin",
   expect(hostRequests(ws, "workspace_target_prepare")).toHaveLength(1);
   expect(hostRequests(ws, "workspace_transition_commit")).toHaveLength(1);
 
-  // The navigation must leave: same page origin (the local daemon serves this
-  // page; the remote's 127.0.0.1:62465 is a different machine's port), the
-  // remote route path, and the host param that keeps the window remote.
-  expect(navigation.assigns).toHaveLength(1);
-  const target = new URL(navigation.assigns[0]);
-  expect(`${target.protocol}//${target.host}`).toBe(PAGE_ORIGIN);
-  expect(target.pathname).toBe(REMOTE_TARGET_PATH);
-  expect(target.searchParams.get("host")).toBe(HOST_ID);
-  // Explicitly not the remote daemon's loopback origin.
-  expect(target.port).not.toBe("62465");
+  // No navigation leaves the page: the prepared target is adopted in place.
+  // The runtime channel re-targets to the remote target on this same socket.
+  expect(navigation.assigns).toHaveLength(0);
+  // The pushed route must keep the host param: it is what keeps this window
+  // on the remote host across reloads and in-app links (the guard the old
+  // navigation assertions protected, now on the pushState surface).
+  expect(window.location.searchParams.get("host")).toBe(HOST_ID);
+  const subscribed = ws.sent.some(
+    (frame) =>
+      frame.type === "runtime_subscribe" &&
+      frame.target?.sessionId === "01a022fa-abcd-7385-9eac-93c8a2337b1f" &&
+      frame.target?.instanceId === "instance-remote-2",
+  );
+  expect(subscribed).toBe(true);
 });
 
-test("a target on a foreign hostname is still rejected (guard unchanged)", async () => {
+test("a target on a foreign hostname is still rejected (no cross-origin surface)", async () => {
   prepareResponse = {
     classification: "cross",
     transitionGeneration: 3,
@@ -470,8 +508,9 @@ test("a target on a foreign hostname is still rejected (guard unchanged)", async
   await settle();
 
   expect(hostRequests(ws, "workspace_target_prepare")).toHaveLength(1);
-  // The existing cross-origin guard must keep refusing foreign hostnames; the
-  // remote-host fix may only retarget same-host loopback ports, never weaken it.
+  // In-place adoption pushes a same-origin route and never consumes the
+  // prepared targetOrigin, so a foreign origin cannot reach any navigation
+  // surface; the failed adoption must simply render an error on this page.
   expect(navigation.assigns).toHaveLength(0);
 });
 
@@ -803,7 +842,7 @@ test("a cross-workspace select freezes input, checkpoints, and invalidates befor
   // Nothing was committed while the checkpoint was outstanding.
   expect(hostRequests(ws, "workspace_transition_commit")).toHaveLength(0);
 
-  // The checkpoint lands: the commit proceeds and the page navigates.
+  // The checkpoint lands: the commit proceeds and adoption re-attaches.
   const held = heldTerminalReplies;
   heldTerminalReplies = null;
   for (const frame of held) ws.replyTerminal(frame);
@@ -811,12 +850,12 @@ test("a cross-workspace select freezes input, checkpoints, and invalidates befor
   await settle();
 
   expect(hostRequests(ws, "workspace_transition_commit")).toHaveLength(1);
-  expect(navigation.assigns).toHaveLength(1);
-  // The old binding was invalidated before the host committed.
-  expect(globalThis.__picotRemoteTerminal.state()).toBe("disconnected");
-  const afterCommit = terminalFrames(ws).length;
-  keyboard.fire("still frozen");
-  expect(terminalFrames(ws).length).toBe(afterCommit);
+  expect(navigation.assigns).toHaveLength(0);
+  // The invalidated binding was replaced: the attachment is live again under
+  // the adopted workspace, and input reaches the host once more.
+  expect(globalThis.__picotRemoteTerminal.state()).toBe("ready");
+  keyboard.fire("reattached");
+  expect(terminalPayloads(ws, "terminal_input").length).toBeGreaterThan(0);
 });
 
 test("a failed commit re-attaches instead of leaving the terminal dead (R3)", async () => {
@@ -1008,15 +1047,23 @@ test("a desktop cross-workspace transition stays frozen through the host commit 
   newTab().click();
   expect(terminalPayloads(ws, "terminal_create")).toHaveLength(1);
 
-  // The commit lands; the page navigates and never unfroze before that.
+  // The commit lands; adoption keeps this page and re-attaches the panel.
   const [commit] = heldCommit;
   heldCommit = null;
-  ws.reply({ type: "host_response", requestId: commit.requestId, ok: true, response: {} });
+  ws.reply({
+    type: "host_response",
+    requestId: commit.requestId,
+    ok: true,
+    response: { workspaceGeneration: 8 },
+  });
   await selecting;
   await settle();
-  expect(navigation.assigns).toHaveLength(1);
+  expect(navigation.assigns).toHaveLength(0);
+  // The panel lock released with the reattachment: a new tab reaches the host
+  // under the adopted workspace's generation.
   newTab().click();
-  expect(terminalPayloads(ws, "terminal_create")).toHaveLength(1);
+  expect(terminalPayloads(ws, "terminal_create")).toHaveLength(2);
+  expect(terminalFrames(ws).at(-1).workspaceGeneration).toBe(8);
 });
 
 test("an unavailable terminal opens from the toggle so its reason and action are reachable (R6)", async () => {

@@ -2010,8 +2010,13 @@ wsClient.addEventListener("ownerBootstrap", async (event) => {
     void gitPanel.refresh();
     if (terminalPanel.toggleEl) terminalClient.requestList();
   }
+  await rebindEphemeralFromBootstrap(event.detail?.instances);
+});
+// Fetch the owner's live ephemeral descriptors and rebind the side/quick chat
+// surfaces. Shared by the owner_bootstrap greet and in-place workspace
+// adoption, which gets no greet of its own (the socket stays open).
+async function rebindEphemeralFromBootstrap(advertised = null) {
   try {
-    const advertised = event.detail?.instances;
     const instances = Array.isArray(advertised)
       ? advertised
       : (await transport.getEphemeralBootstrap()) || [];
@@ -2021,7 +2026,7 @@ wsClient.addEventListener("ownerBootstrap", async (event) => {
   } catch (err) {
     console.warn("[ephemeral] bootstrap fetch failed:", err);
   }
-});
+}
 // Unified generation guard: every async Git response (status, AI, commit, diff,
 // confirmation, failure, and write acknowledgement) must match the current
 // workspace generation. A late response from a previous workspace is silently
@@ -5993,12 +5998,11 @@ async function resetUiForNewSession() {
 
 async function newSession() {
   if (nativeAvailable()) {
-    // Always create the new chat in-place on the current pi process: pi's
-    // `new_session` RPC aborts/settles any active stream safely (it persists
-    // the aborted turn to the old session before switching), so there is no
-    // need to spawn a dedicated process while streaming. Spawning a parallel
-    // process would force a full page navigation and white flash, which we
-    // deliberately avoid.
+    // Spawn a fresh headless pi for the current cwd and adopt it in place.
+    // One pi process drives one active session (multi-task model), so a new
+    // task needs its own process; the previously-attached runtime keeps
+    // running in the background. In-place adoption replaces the old
+    // full-page navigation: no white flash, no extension re-initialization.
     await startInWindowNewSession({
       transport,
       getCurrentCwd: () =>
@@ -6007,6 +6011,7 @@ async function newSession() {
         sidebar.projects.find((project) => project.source === "registry")?.path ||
         "",
       navigate: navigateInWindow,
+      adoptPrepared: adoptSpawnedSessionInPlace,
       onBeforeSwap: onBeforeInstanceSwap,
       renderError: (message) => messageRenderer.renderError(message),
     });
@@ -6069,6 +6074,7 @@ async function handleNewProjectChat(project) {
       getCurrentCwd: getCurrentWorkspacePath,
       shouldSpawnParallel: () => mobileClientMode,
       navigate: navigateInWindow,
+      adoptPrepared: adoptSpawnedSessionInPlace,
       onBeforeSwap: onBeforeInstanceSwap,
       beforeWorkspaceCommit: () => commitTerminalTransition(),
       beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
@@ -6156,8 +6162,9 @@ async function handleSessionSelectImpl(session, project) {
     if (!filePreviewPanel.hasPersistedTabs?.(selectedWorkspacePath)) {
       filePreviewPanel.hidePanel();
     }
-    // A workspace switch changes the HTTP origin that serves the file API.
-    // Navigate before any branch can fall through to an in-process switch.
+    // Cross-workspace selection keeps this document, same as the
+    // same-workspace branch below: the workspace route shares this host's
+    // origin, so prepare → commit → adopt in place replaces the navigation.
     try {
       const prepared = await transport.prepareWorkspaceTarget(selectedWorkspacePath, {
         sessionPath: session.filePath,
@@ -6173,15 +6180,29 @@ async function handleSessionSelectImpl(session, project) {
       if (typeof prepared?.transitionGeneration !== "number") {
         throw new Error("Workspace transition was not prepared");
       }
+      // Cross-workspace commits revoke the prior generation's grants (side
+      // chats, exports, terminal). Settle their interaction before the
+      // commit — the navigation path used to rely on page teardown instead.
+      const settled = await prepareEphemeralWorkspaceTransition();
+      if (!settled) {
+        await transport.cancelWorkspaceTransition(prepared.transitionGeneration).catch(() => {});
+        return;
+      }
       await beginTerminalTransition();
       commitTerminalTransition();
-      await transport.commitWorkspaceTransition(prepared.transitionGeneration);
-      snapshotUiStateForNavigation();
-      navigateInWindow(prepared.targetOrigin, { targetCwd: selectedWorkspacePath });
+      const committed = await transport.commitWorkspaceTransition(prepared.transitionGeneration);
+      await adoptPreparedRuntimeInDocument(prepared, {
+        sessionFile: session.filePath,
+        selectedWorkspacePath,
+        workspaceGeneration: committed?.workspaceGeneration,
+      });
+      void settleEphemeralForAdoptedWorkspace();
+      sidebar.refresh({ workspacePath: selectedWorkspacePath });
       return;
     } catch (error) {
       console.error("[Session route] workspace transition failed:", error);
       cancelTerminalTransition();
+      cancelEphemeralWorkspaceTransition();
       messageRenderer.renderError(t("errors.failedToSwitchSession", { error }));
       return;
     }
@@ -6234,32 +6255,10 @@ async function handleSessionSelectImpl(session, project) {
       await beginTerminalTransition();
       commitTerminalTransition();
       await transport.commitWorkspaceTransition(prepared.transitionGeneration);
-      const instances = (await transport.runtimeInstances())?.instances || [];
-      const target = resolvePreparedRuntimeTarget(instances, prepared);
-      if (!target) throw new Error("Prepared session runtime is unavailable");
-      wsClient.setRoutingContext(target);
-      // Keep reload and browser navigation anchored to the adopted runtime.
-      // The target comes from host prepare/commit, never sidebar input.
-      const targetRoute = new URL(
-        `/workspaces/${encodeURIComponent(target.workspaceId)}/sessions/${encodeURIComponent(target.sessionId)}`,
-        window.location.href,
-      );
-      history.pushState(
-        null,
-        "",
-        withFocusParam(selectedWorkspacePath, currentFocusProject, targetRoute).toString(),
-      );
-      mirrorActiveSessionFile = session.filePath;
-      pendingMirrorSessionFile = session.filePath;
-      viewingActiveSession = true;
-      updateMirrorInputState();
-      wsClient.subscribeRuntimeTarget(target);
-      wsClient.requestRuntimeSnapshot(target);
-      // Upstream switch hydration: fetch the session file in parallel with
-      // the snapshot; whichever lands first paints, and the snapshot render
-      // then chooses between the two sources.
-      void fetchDiskHistory(target, session.filePath);
-      finishTerminalTransition({ reattach: true });
+      await adoptPreparedRuntimeInDocument(prepared, {
+        sessionFile: session.filePath,
+        selectedWorkspacePath,
+      });
     } catch (error) {
       console.error("[Session route] runtime transition failed:", error);
       cancelTerminalTransition();
@@ -6276,6 +6275,92 @@ async function handleSessionSelectImpl(session, project) {
     sidebarEl.classList.add("collapsed");
     sidebarOverlay.classList.remove("visible");
   }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// In-place runtime adoption
+// ──────────────────────────────────────────────────────────────────────
+// Both session-select branches converge here after prepare → commit: the
+// prepared runtime triple replaces the routing context, the canonical route
+// moves via pushState, and the runtime channel re-subscribes. The document
+// never reloads. `workspaceGeneration` is set on cross-workspace adoption:
+// the owner_bootstrap greet fires once per socket, so the terminal/Git
+// generation clients must rebind from the commit reply instead.
+async function adoptPreparedRuntimeInDocument(
+  prepared,
+  { sessionFile = null, selectedWorkspacePath = "", workspaceGeneration = null } = {},
+) {
+  const instances = (await transport.runtimeInstances())?.instances || [];
+  const target = resolvePreparedRuntimeTarget(instances, prepared);
+  if (!target) throw new Error("Prepared session runtime is unavailable");
+  // Keep reload and browser navigation anchored to the adopted runtime.
+  // The target comes from host prepare/commit, never sidebar input.
+  const targetRoute = new URL(
+    `/workspaces/${encodeURIComponent(target.workspaceId)}/sessions/${encodeURIComponent(target.sessionId)}`,
+    window.location.href,
+  );
+  // The host lives on this window's URL, not in the daemon's target origin
+  // (same contract as navigateInWindow): dropping it here would bounce a
+  // remote page back to the local host on the next reload or in-app link.
+  const hostParam = new URLSearchParams(window.location.search).get(HOST_PARAM);
+  if (hostParam) targetRoute.searchParams.set(HOST_PARAM, hostParam);
+  if (mobileClientMode) targetRoute.searchParams.set("mobile", "1");
+  history.pushState(
+    null,
+    "",
+    withFocusParam(selectedWorkspacePath, currentFocusProject, targetRoute).toString(),
+  );
+  if (typeof workspaceGeneration === "number") {
+    terminalClient.setWorkspaceGeneration(workspaceGeneration);
+    gitClient.setWorkspaceGeneration(workspaceGeneration);
+    if (terminalPanel.toggleEl) terminalClient.requestList();
+  }
+  wsClient.setRoutingContext(target);
+  mirrorActiveSessionFile = sessionFile;
+  pendingMirrorSessionFile = sessionFile;
+  viewingActiveSession = true;
+  updateMirrorInputState();
+  wsClient.subscribeRuntimeTarget(target);
+  wsClient.requestRuntimeSnapshot(target);
+  // Upstream switch hydration: fetch the session file in parallel with the
+  // snapshot; whichever lands first paints, and the snapshot render then
+  // chooses between the two sources.
+  if (sessionFile) void fetchDiskHistory(target, sessionFile);
+  finishTerminalTransition({ reattach: true });
+}
+
+// Release the ephemeral interaction locks raised for a cross-workspace commit
+// and rebuild this workspace's ephemeral surfaces. The full-page navigation
+// path never needed this — the next page booted unlocked — but in-place
+// adoption keeps this document, so it must unlock itself.
+async function settleEphemeralForAdoptedWorkspace() {
+  sideChatManager.setInteractionLocked(false);
+  quickChatDialog.setInteractionLocked(false);
+  filePreviewPanel.setInteractionLocked(false);
+  await rebindEphemeralFromBootstrap();
+}
+
+// Spawn-tail adapter for workspace/actions.js: adopt the freshly spawned
+// runtime in place and reset the chat surface for the brand-new session.
+// The swap overlay raised before prepare comes down in actions.js on success.
+async function adoptSpawnedSessionInPlace(prepared, { targetCwd, workspaceGeneration } = {}) {
+  if (targetCwd) foregroundWorkspacePath = targetCwd;
+  updateWorkspaceIndicator(targetCwd || foregroundWorkspacePath);
+  if (targetCwd && !filePreviewPanel.hasPersistedTabs?.(targetCwd)) {
+    filePreviewPanel.hidePanel();
+  }
+  widgetMirrorRegistry.handleSessionSwitch([]);
+  await adoptPreparedRuntimeInDocument(prepared, {
+    selectedWorkspacePath: targetCwd || "",
+    workspaceGeneration,
+  });
+  await resetUiForNewSession();
+  if (targetCwd) sidebar.refresh({ workspacePath: targetCwd });
+  // The spawn entries lock ephemeral interaction for a cross-workspace
+  // commit via beforeWorkspaceTransition (workspace/actions.js); the page
+  // that used to unlock them by being destroyed no longer exists, so this
+  // adapter owns the release and rebind, same as the select branch.
+  void settleEphemeralForAdoptedWorkspace();
 }
 
 // ═══════════════════════════════════════
@@ -6349,6 +6434,7 @@ function handleMirrorSync(data) {
     pendingSessionMatches ||
     (!currentTarget && Boolean(receivedSessionFile));
   if (appliedForegroundSession && receivedSessionFile) {
+    const previousMirrorFile = mirrorActiveSessionFile;
     mirrorActiveSessionFile = receivedSessionFile;
     // Follow-ups queued before the first snapshot sit in the anonymous
     // bucket; adopt them into the session's bucket or they would never
@@ -6362,6 +6448,17 @@ function handleMirrorSync(data) {
     sidebar.setActive(receivedSessionFile);
     restoreSessionUiState(receivedSessionFile);
     resolveAndApplyFocus();
+    // An in-place switch keeps this document, so nothing re-fires the Info
+    // tab's loaders the way a full-page reload's tab restore did. Refresh it
+    // when the foreground session actually changed and the tab is visible.
+    if (
+      previousMirrorFile !== receivedSessionFile &&
+      infoPanel &&
+      !infoPanelEl.classList.contains("hidden")
+    ) {
+      taskAnalysis?.refresh();
+      void refreshInfoTree();
+    }
   }
   if (!appliedForegroundSession) {
     logSessionRoute("mirrorSync:ignored-background", {
@@ -8661,6 +8758,7 @@ function handleRegisteredWorkspace(targetCwd) {
     targetCwd,
     transport,
     navigate: navigateInWindow,
+    adoptPrepared: adoptSpawnedSessionInPlace,
     onBeforeSwap: onBeforeInstanceSwap,
     beforeWorkspaceCommit: () => commitTerminalTransition(),
     beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
@@ -8680,6 +8778,7 @@ async function handleOpenFolder() {
     await openFolderAsWorkspace({
       transport,
       navigate: navigateInWindow,
+      adoptPrepared: adoptSpawnedSessionInPlace,
       onBeforeSwap: onBeforeInstanceSwap,
       beforeWorkspaceCommit: () => commitTerminalTransition(),
       beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,

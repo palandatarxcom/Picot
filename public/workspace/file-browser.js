@@ -210,6 +210,10 @@ export class FileBrowser {
   }
 
   recordListingFailure(relativePath, code) {
+    // The machine code is the only signal that distinguishes admission
+    // rejections (workspace scope) from IO failures; surface it or field
+    // debugging has nothing to go on.
+    console.error("[Files] listing failed:", { path: relativePath, code });
     const transient = code === "temporarily_unavailable";
     const previous = this.directoryListings.get(relativePath);
     if (relativePath !== ROOT_PATH) {
