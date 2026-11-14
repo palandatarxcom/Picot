@@ -321,6 +321,7 @@ impl Drop for Local {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn unreachable_at_add_is_offline_retries_on_curve_and_local_still_works() {
     tokio::time::timeout(BUDGET, async {
         let local = Local::start().await;
@@ -359,6 +360,7 @@ async fn unreachable_at_add_is_offline_retries_on_curve_and_local_still_works() 
 // Bun supplies real network WebSocket + browser EventTarget; only Origin is
 // injected because a CLI has no document origin. Reconnect/hello/subscribe are production JS.
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn client_tls_trusts_fixture_ca_but_production_default_rejects_unknown_ca() {
     tokio::time::timeout(BUDGET, async {
         let cert = tokio::task::spawn_blocking(mock_relay::test_certificate)
@@ -621,6 +623,7 @@ async fn production_chain_connect_stage_timings_one_and_five_clients() {
 /// dial: the production client's first `e2ee_hello` arrives before the daemon
 /// has a data pipe, so the relay drops it. A later resend must recover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn early_hello_before_the_data_dial_is_dropped_and_a_resend_recovers() {
     tokio::time::timeout(BUDGET, async {
         let local = Local::start().await;
@@ -681,6 +684,7 @@ async fn early_hello_before_the_data_dial_is_dropped_and_a_resend_recovers() {
 /// holder is released inside the server budget, so the fifth completes the
 /// E2EE handshake and the server then meets its own queued plaintext hellos.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn four_held_handshakes_queue_the_fifth_production_client() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let local = Local::start().await;
@@ -755,6 +759,7 @@ async fn four_held_handshakes_queue_the_fifth_production_client() {
 /// Timing difference from production: the server handshake budget is shrunk to
 /// 1.5 s so the case is deterministic; the production value is 10 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn a_fifth_client_times_out_inside_the_permit_wait_and_the_next_one_connects() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let local = Local::start().await;

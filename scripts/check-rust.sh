@@ -37,6 +37,20 @@ cargo check --manifest-path "$MANIFEST" --workspace --all-targets
 echo "==> cargo clippy (workspace, warnings as errors)"
 cargo clippy --manifest-path "$MANIFEST" --workspace --all-targets -- -D warnings
 
+echo "==> cargo test (timing-sensitive relay suites, serial)"
+# relay_client_degradation / relay_control_transport assert wall-clock budgets
+# (handshake permits, eviction deadlines). Under the workspace sweep they run
+# alongside every other crate's tests and the CPU contention alone trips their
+# deadlines — three different suites failed this way, each passing when run
+# alone. They are marked #[ignore], so the sweep below skips them; this serial
+# pass is their authoritative gate.
+if ! cargo test --manifest-path "$MANIFEST" -p picot-host \
+        --test relay_client_degradation --test relay_control_transport \
+        --quiet -- --ignored; then
+    echo "    timing-sensitive relay tests failed" >&2
+    exit 1
+fi
+
 echo "==> cargo test (workspace, unit)"
 if ! cargo test --manifest-path "$MANIFEST" --workspace --quiet; then
     echo "    unit tests failed" >&2

@@ -230,6 +230,7 @@ async fn until(what: &str, check: impl Fn() -> bool) {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn control_connects_reports_online_and_no_sessions_without_events() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -269,6 +270,7 @@ async fn control_connects_reports_online_and_no_sessions_without_events() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn sync_connected_disconnected_route_to_sink() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -315,6 +317,7 @@ async fn sync_connected_disconnected_route_to_sink() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn oversized_control_frame_drops_connection_and_reconnects() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -352,6 +355,7 @@ async fn oversized_control_frame_drops_connection_and_reconnects() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn oversized_sync_list_drops_control() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -387,6 +391,7 @@ async fn oversized_sync_list_drops_control() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn reconnect_backoff_is_linear_capped_and_resets_on_success() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -454,6 +459,7 @@ async fn reconnect_backoff_is_linear_capped_and_resets_on_success() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn silent_relay_after_sync_is_stale_force_closed() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -486,6 +492,7 @@ async fn silent_relay_after_sync_is_stale_force_closed() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn relay_silent_before_first_frame_hits_ready_timeout() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -520,6 +527,7 @@ async fn relay_silent_before_first_frame_hits_ready_timeout() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn stop_closes_locally_without_reconnect() {
     let relay = MockRelay::start().await;
     let (state_tx, mut states) = mpsc::unbounded_channel();
@@ -551,6 +559,7 @@ async fn stop_closes_locally_without_reconnect() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn data_socket_dials_with_v2_contract_and_round_trips_frames() {
     let relay = MockRelay::start().await;
     let (sink, mut states, mut opens, _closes) = echo_sink();
@@ -596,6 +605,7 @@ async fn data_socket_dials_with_v2_contract_and_round_trips_frames() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn client_disconnect_closes_the_data_session() {
     let relay = MockRelay::start().await;
     let (sink, mut states, _opens, mut closes) = echo_sink();
@@ -620,6 +630,7 @@ async fn client_disconnect_closes_the_data_session() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn sync_removal_closes_only_that_data_socket() {
     let relay = MockRelay::start().await;
     let (sink, mut states, mut opens, mut closes) = echo_sink();
@@ -649,6 +660,7 @@ async fn sync_removal_closes_only_that_data_socket() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn slow_consumer_is_evicted_without_touching_control_or_peers() {
     let relay = MockRelay::start().await;
     let (sink, mut states, mut opens, mut closes) = echo_sink();
@@ -703,6 +715,7 @@ async fn slow_consumer_is_evicted_without_touching_control_or_peers() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn inbound_plaintext_length_bound_closes_connection_beyond_limit() {
     let relay = MockRelay::start().await;
     let (sink, mut states, mut opens, mut closes) = echo_sink();
@@ -759,6 +772,7 @@ async fn inbound_plaintext_length_bound_closes_connection_beyond_limit() {
 //   same self-signed chain before any WS upgrade and backs off per §2.5.
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn tls_dial_with_fixture_ca_connector_reaches_online() {
     let cert = mock_relay::test_certificate();
     let relay = mock_relay::TlsMockRelay::start(&cert).await;
@@ -801,6 +815,7 @@ async fn tls_dial_with_fixture_ca_connector_reaches_online() {
 }
 
 #[tokio::test]
+#[ignore = "timing-sensitive: run serially via scripts/check-rust.sh"]
 async fn tls_dial_with_default_connector_is_rejected_and_backs_off() {
     let cert = mock_relay::test_certificate();
     let relay = mock_relay::TlsMockRelay::start(&cert).await;
