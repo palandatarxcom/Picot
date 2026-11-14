@@ -20,13 +20,7 @@
     "steeringMode",
     "thinkingLevel"
   ],
-  "commandSources": [
-    "extension",
-    "prompt",
-    "skill"
-  ],
-  "eventTypes": [
-    "extension_ui_request"
-  ],
+  "commandSources": ["extension", "prompt", "skill"],
+  "eventTypes": ["extension_ui_request"],
   "promptAcceptance": true
 }
