@@ -1731,6 +1731,13 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                             ),
                             "targetWorkspaceId": target.workspace_id,
                             "targetSessionId": target.session_id,
+                            // The full runtime triple: a freshly spawned
+                            // runtime stays invisible to
+                            // runtime_instance_summaries until Pi's first
+                            // get_state lands (a session-<uuid> id never
+                            // matches a persisted JSONL header), so the
+                            // adopting page must not depend on that summary.
+                            "targetInstanceId": target.instance_id,
                             "settleRequired": !same_cwd,
                         }))
                     }

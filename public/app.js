@@ -6728,6 +6728,12 @@ globalThis.__picotSessionView = {
     fileBrowserWorkspacePath = path;
   },
 };
+// Test seam for the registry mutation flows (remove/re-add) whose entry
+// points live inside SessionSidebar but need the full app object graph.
+globalThis.__picotSidebar = {
+  removeWorkspace: (workspace) => sidebar.removeFromList(workspace),
+  addProjectViaPicker: () => sidebar.addProjectViaPicker(),
+};
 // Remote terminal attachment inspection: the state machine's own state plus the
 // panel's rendered availability (no DOM scraping in tests).
 globalThis.__picotRemoteTerminal = remoteTerminal
@@ -7850,10 +7856,11 @@ void updater.initUpdaterUI();
 // App-global registry changed on the host (any window or prune). Refresh the
 // sidebar everywhere so all native windows stay in sync.
 wsClient.addEventListener("registryChanged", () => {
-  // The initiating window is already navigating to the new owner-bound
-  // session; refreshing its old page here would render an empty workspace
-  // before Pi has prepared the session. Other windows still refresh normally.
-  if (workspaceLaunchInProgress) return;
+  // No launch guard: workspace switches adopt in place (this page IS the
+  // destination), and the session-bucket record's broadcast can land while
+  // the launch is still in flight — swallowing it there hides a re-added
+  // workspace's history rows until some later refresh. The extra refresh is
+  // idempotent; the sidebar's own state preserves expansion and scroll.
   void sidebar.refresh();
 });
 
