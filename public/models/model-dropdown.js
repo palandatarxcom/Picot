@@ -104,14 +104,21 @@ export function openModelDropdownMenu({
         star.setAttribute("aria-label", t(isScoped ? "models.removeScoped" : "models.addScoped"));
         star.addEventListener("click", async (event) => {
           event.stopPropagation();
-          const response = await configGateway.call("set_scoped_model", {
-            provider: model.provider,
-            modelId: model.id,
-            enabled: !isScoped,
-          });
-          if (response?.ok && Array.isArray(response.data?.modelIds)) {
-            scopedModelIds = response.data.modelIds;
-            renderItems(search.value);
+          try {
+            const response = await configGateway.call("set_scoped_model", {
+              provider: model.provider,
+              modelId: model.id,
+              enabled: !isScoped,
+            });
+            if (response?.ok && Array.isArray(response.data?.modelIds)) {
+              scopedModelIds = response.data.modelIds;
+              renderItems(search.value);
+            } else {
+              console.warn("[Models] set_scoped_model rejected:", response?.error ?? response);
+            }
+          } catch (error) {
+            // A swallowed rejection here reads as a dead star button; surface it.
+            console.warn("[Models] set_scoped_model failed:", error);
           }
         });
         el.appendChild(star);
@@ -155,8 +162,9 @@ export function openModelDropdownMenu({
       if (response?.ok && Array.isArray(response.data?.modelIds)) {
         scopedModelIds = response.data.modelIds;
       }
-    } catch {
+    } catch (error) {
       // An unavailable config bridge degrades to the unscoped enabled list.
+      console.warn("[Models] list_scoped_models failed:", error);
     }
     renderItems(search.value);
   };

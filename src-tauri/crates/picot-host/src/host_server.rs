@@ -3320,19 +3320,23 @@ fn operation_scope(
         "unauthorized_target",
         "Registered desktop owner required".into(),
     ))?;
-    let workspace = context.workspace_id.as_ref().ok_or((
+    // The request's routing triple names the scope, and the registry supplies
+    // the generation. The hello-time ctx snapshot must not: it goes stale the
+    // moment an in-place workspace adoption re-points the same socket at
+    // another workspace, and a snapshot-derived workspace_id here fails
+    // request_scoped_receipt's scope==target check for every runtime command
+    // of the adopted workspace. Callers already ran authorize_target (or the
+    // dynamic data-plane admission), which re-reads this same binding, so the
+    // requested workspace_id equals the registered one by the time we run.
+    let binding = window_registered_binding(state, context).ok_or((
         "not_registered",
-        "Temporary workspace has no registered target".into(),
-    ))?;
-    let generation = context.workspace_generation.ok_or((
-        "stale_generation",
-        "Workspace generation is unavailable".into(),
+        "Registered workspace binding is unavailable".into(),
     ))?;
     Ok(crate::operation_registry::OperationScope::new(
         owner.as_str(),
-        workspace,
+        workspace_id,
         session_id,
-        generation,
+        binding.generation,
     ))
 }
 
@@ -7294,6 +7298,98 @@ mod tests {
         assert_eq!(reply["type"], "error", "{reply:?}");
         assert_eq!(reply["error"]["code"], "unauthorized_target");
         assert!(!temp.join("workspace/escape.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn runtime_ops_follow_an_in_place_workspace_adoption() {
+        use tokio_tungstenite::tungstenite::Message;
+        let (host, mut harness, _temp) = desktop_harness("runtime-adopt", None).await;
+        // In-place adoption: the registry moves this owner to another
+        // workspace while the socket (and its hello-time ctx snapshot) stays
+        // on the old one. Every runtime command of the adopted workspace must
+        // still be admitted — the operation scope must follow the owner's
+        // current binding, not the stale hello snapshot.
+        let registry = host.owner_registry_for_tests().expect("registry");
+        let owner = crate::window_owner::OwnerId::from_string(harness.owner_id.clone());
+        let (generation, _permit) = registry
+            .prepare_navigation_with_permit(
+                &owner,
+                3002,
+                std::path::PathBuf::from("/adopted"),
+                "http://127.0.0.1:3002/workspaces/adopted/sessions/s1".to_string(),
+                Duration::from_secs(30),
+            )
+            .expect("permit");
+        registry
+            .commit_workspace_transition_with_workspace(
+                &owner,
+                generation,
+                "http://127.0.0.1:3002/workspaces/adopted/sessions/s1".to_string(),
+                Some("adopted-wid".to_string()),
+                crate::window_owner::TemporaryKind::DefaultStartup,
+            )
+            .expect("commit");
+
+        // The adopted session's live runtime, owned by this owner at the
+        // post-commit generation (authorize_target's binding).
+        let adopted = crate::runtime_coordinator::RuntimeTarget::with_owner(
+            "adopted-wid",
+            "session-b",
+            "instance-b",
+            harness.owner_id.as_str(),
+            generation,
+        );
+        let mut fake = host
+            .native_manager()
+            .register_in_memory(adopted.clone())
+            .unwrap();
+
+        harness
+            .socket
+            .send(Message::Text(
+                json!({
+                    "type": "runtime_request", "protocolVersion": 2,
+                    "requestId": "rr-adopt-1",
+                    "target": {
+                        "workspaceId": "adopted-wid",
+                        "sessionId": "session-b",
+                        "instanceId": "instance-b"
+                    },
+                    "command": { "type": "get_state" },
+                    "idempotencyKey": "rr-adopt-key-1"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // The command must reach the runtime (not die in a scope mismatch).
+        let forwarded = tokio::time::timeout(Duration::from_secs(5), fake.read_request())
+            .await
+            .expect("runtime_request must be forwarded after in-place adoption")
+            .expect("runtime request");
+        assert_eq!(forwarded["type"], "get_state", "{forwarded}");
+        fake.write_frame(json!({
+            "id": forwarded["id"],
+            "type": "response",
+            "success": true,
+            "data": { "model": { "provider": "p", "id": "m" } }
+        }))
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = harness.socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                if frame["requestId"] == "rr-adopt-1" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("runtime_response within 5s");
+        assert_eq!(reply["type"], "runtime_response", "{reply}");
+        host.stop();
     }
 
     #[tokio::test]
