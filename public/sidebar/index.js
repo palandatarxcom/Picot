@@ -592,7 +592,24 @@ export class SessionSidebar {
           throw new Error("Host workspace sessions unavailable");
         }
         const data = await this.transport.workspaceSessions(hostWorkspaceId);
-        if (loadGeneration !== this._registrySessionLoadGeneration) return;
+        if (loadGeneration !== this._registrySessionLoadGeneration) {
+          // The answer straddled a registry refresh (generation bump): the
+          // payload is stale, but the refresh's own re-ensure was blocked by
+          // THIS in-flight request, so nobody else will re-fetch — without a
+          // retry here the expanded row stays blank until the user collapses
+          // and re-expands it (cold-boot field defect). Fire-and-forget under
+          // the current generation; consecutive refreshes merely queue a few
+          // more retries, each of which lands or retries again.
+          // Resolve the CURRENT row object: a refresh may have replaced the
+          // projects array while this request was in flight, and writing the
+          // retry's answer into the stale closure object would leave the
+          // rendered (new) row blank.
+          const current =
+            this.projects.find((candidate) => candidate.workspaceId === project.workspaceId) ||
+            project;
+          this.ensureWorkspaceSessions(current, { force: true }).catch(() => {});
+          return;
+        }
         const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
         this.workspaceSessionsCache.set(cacheKey, sessions);
         project.dirName = data?.dirName ?? null;

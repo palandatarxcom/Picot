@@ -1167,3 +1167,43 @@ describe("startup loading", () => {
     }
   });
 });
+
+test("an expansion straddling a registry refresh still lands its sessions", async () => {
+  // Cold-boot race: the user expands a row (request A in flight), a
+  // registry_changed broadcast runs refresh() (generation bump; its own
+  // re-ensure is blocked by A still being in flight), then A answers into
+  // the newer generation and is dropped — leaving the expanded row blank
+  // until the user collapses and re-expands.
+  const sessionsPayload = [{ filePath: "/sessions/a.jsonl", name: "A" }];
+  const { sidebar, transport } = await makeSidebar({
+    rows: REGISTRY_ROWS,
+    fetchRoutes: { instances: [] },
+  });
+  await sidebar.loadSessions();
+
+  let releaseFirst;
+  const firstCall = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const calls = [];
+  transport.workspaceSessions.mockImplementation(async () => {
+    calls.push(Date.now());
+    if (calls.length === 1) {
+      await firstCall; // hold the expansion's request open
+      return { path: "/work/beta", dirName: "beta", sessions: sessionsPayload, sessionCount: 1 };
+    }
+    return { path: "/work/beta", dirName: "beta", sessions: sessionsPayload, sessionCount: 1 };
+  });
+
+  const beta = sidebar.projects.find((project) => project.registryId === "uuid-2");
+  sidebar.setWorkspaceExpanded(beta, true); // request A goes out, held open
+  await Promise.resolve();
+  await sidebar.refresh(); // generation bump; re-ensure blocked by in-flight A
+  expect(transport.workspaceSessions.mock.calls.length).toBe(1);
+
+  releaseFirst(); // A answers into the newer generation
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const item = document.querySelector(".session-item[data-file-path='/sessions/a.jsonl']");
+  expect(item).not.toBeNull();
+});
