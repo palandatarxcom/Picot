@@ -167,6 +167,7 @@ import { createTriggerRouter } from "./ui/composer-triggers.js";
 import { repaintContextViz, setupContextViz } from "./ui/context-viz.js";
 import { createConversationNav } from "./ui/conversation-nav.js";
 import { DialogHandler } from "./ui/dialogs.js";
+import { showDomConfirm } from "./ui/dom-confirm.js";
 import { createFollowUpQueue } from "./ui/follow-up-queue.js";
 import { createHeaderStatusBar } from "./ui/header-status-bar.js";
 import { disconnectGateAutoReveal, observeGateAutoReveal } from "./ui/history-gate-auto-reveal.js";
@@ -207,7 +208,6 @@ import {
   cacheSidebarProjects,
   consumeNavState,
   readCachedSidebarProjects,
-  snapshotNavState,
 } from "./workspace/nav-state-cache.js";
 import { normalizeLocalPath } from "./workspace/path-utils.js";
 import {
@@ -521,52 +521,14 @@ function resolveAndApplyFocus() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Instance-swap overlay
+// Instance-swap overlay (landing → workspace only)
 // ──────────────────────────────────────────────────────────────────────
-// `+ New Session`, `start new chat`, `Open Project`, and `Open Folder`
-// all end with a host-origin workspace route,
-// which is a full-page navigation and would otherwise show a 1–2s
-// freeze (while pi spawns) and then a white flash (while the WebView
-// reloads). To make this look like a single smooth transition we:
-//
-//   1. Open a fullscreen spinner overlay BEFORE awaiting openWorkspace.
-//   2. Persist a sessionStorage flag so the new page boots into the
-//      same overlay (see <head> bootstrap script in index.html).
-//   3. After the new page's WebSocket first connects, fade out.
-//
-// Returns a `dismiss` function that rolls back the overlay if the
-// swap fails before navigation (e.g. openWorkspace rejects).
-// Snapshot ephemeral UI state before ANY in-window navigation. The new page
-// boots fresh; consumeNavState() restores scroll, sidebar expansion, search,
-// and the input draft so session/workspace switches feel continuous.
-function snapshotUiStateForNavigation() {
-  flushDraftNow(); // a pending debounce timer is not a saved draft (C4)
-  try {
-    snapshotNavState({
-      messageScroll: messagesContainer ? messagesContainer.scrollTop : null,
-      sidebarScroll: sidebarEl ? sidebarEl.scrollTop : null,
-      inputDraft: messageInput ? messageInput.value : "",
-      expandedWorkspaces: sidebar ? sidebar.expandedWorkspaces : [],
-      searchQuery: sidebar ? sidebar.searchQuery : "",
-    });
-  } catch {
-    /* snapshot is best-effort */
-  }
-}
-
-function showSwapOverlay(label) {
-  snapshotUiStateForNavigation();
-  try {
-    sessionStorage.setItem("pi-studio:swapping-instance", "1");
-  } catch {}
-  document.body.classList.add("swapping-instance");
-  const overlay = document.getElementById("instance-swap-overlay");
-  if (overlay) overlay.setAttribute("data-visible", "true");
-  const labelEl = document.getElementById("instance-swap-overlay-label");
-  if (labelEl && typeof label === "string" && label) labelEl.textContent = label;
-  return hideSwapOverlay;
-}
-
+// Workspace entries inside this document adopt their runtime in place, so
+// app.js never raises the overlay anymore. It survives for the one flow
+// that still full-page navigates: landing boots a different module graph,
+// so landing's enterWorkspace raises it (landing.js) and THIS page may boot
+// into it after that navigation — dismissBootSwapOverlayWhenReady below
+// clears it once the socket connects.
 function hideSwapOverlay() {
   try {
     sessionStorage.removeItem("pi-studio:swapping-instance");
@@ -575,12 +537,6 @@ function hideSwapOverlay() {
   const overlay = document.getElementById("instance-swap-overlay");
   if (overlay) overlay.setAttribute("data-visible", "false");
 }
-
-// Returned to workspace/actions.js — they call this BEFORE openWorkspace
-// (so the overlay covers spawn latency) and the returned dismiss is only
-// invoked on error (success path lets the overlay persist across the
-// navigation boundary).
-const onBeforeInstanceSwap = (label) => showSwapOverlay(label);
 
 // If the page booted into the overlay (because we just navigated from
 // a previous instance), fade it out as soon as the WebSocket reaches
@@ -1160,6 +1116,11 @@ let mirrorActiveSessionFile = null; // The live session file path from the TUI
 let viewingActiveSession = true; // Whether we're viewing the live session or a historical one
 let isMirrorMode = false; // Set when mirror_sync received
 let workspaceLaunchInProgress = false;
+// True while an in-place session launch (Cmd+T, sidebar new chat, workspace
+// registration, Open Folder) is awaiting its spawned runtime. The composer
+// must refuse input so a prompt cannot race the adoption into the outgoing
+// runtime; no full-screen swap overlay — the page is not going anywhere.
+let sessionLaunchBusy = false;
 // When true, the next foreground message lifecycle events should reload the
 // sidebar until the newly persisted session file appears in the list.
 let pendingNewSessionRefresh = false;
@@ -1527,11 +1488,19 @@ const filePreviewFollow = createFilePreviewFollow({
 function confirmEphemeralDiscard(_risks, _reason) {
   // Minimal confirmation; the full localized summary dialog lives in the close
   // coordinator for window close. Per-chat close uses this lightweight gate.
-  return Promise.resolve(window.confirm(t("ephemeral.confirmDiscard")) ? "discard" : "cancel");
+  // A DOM modal, never window.confirm: the Tauri WebView has no native
+  // confirm bridge, so window.confirm resolves false without any UI and the
+  // whole workspace transition cancels silently (field-verified as the
+  // "first add of a fresh workspace does nothing" defect).
+  return showDomConfirm(t("ephemeral.confirmDiscard"), { danger: true }).then((confirmed) =>
+    confirmed ? "discard" : "cancel",
+  );
 }
 
 function showCloseSummaryDialog(_risk) {
-  return Promise.resolve(window.confirm(t("ephemeral.confirmCloseSummary")) ? "discard" : "cancel");
+  return showDomConfirm(t("ephemeral.confirmCloseSummary"), { danger: true }).then((confirmed) =>
+    confirmed ? "discard" : "cancel",
+  );
 }
 
 const createEphemeralView = (runtime) =>
@@ -5996,6 +5965,24 @@ async function resetUiForNewSession() {
   markPendingNewSessionRefresh();
 }
 
+/** Run one in-place session launch with light feedback: the composer locks
+ * with a starting hint while the spawned runtime is awaited. Shared by every
+ * in-place launch entry (Cmd+T, sidebar new chat, workspace registration,
+ * Open Folder) so none of them raises the full-screen swap overlay — the
+ * page never leaves. Re-entry while a launch is in flight is refused. */
+async function withSessionLaunchBusy(launch) {
+  if (sessionLaunchBusy) return null;
+  sessionLaunchBusy = true;
+  updateUI();
+  try {
+    return await launch();
+  } finally {
+    sessionLaunchBusy = false;
+    updateUI();
+    if (!isMobile()) messageInput.focus();
+  }
+}
+
 async function newSession() {
   if (nativeAvailable()) {
     // Spawn a fresh headless pi for the current cwd and adopt it in place.
@@ -6003,18 +5990,19 @@ async function newSession() {
     // task needs its own process; the previously-attached runtime keeps
     // running in the background. In-place adoption replaces the old
     // full-page navigation: no white flash, no extension re-initialization.
-    await startInWindowNewSession({
-      transport,
-      getCurrentCwd: () =>
-        getCurrentWorkspacePath() ||
-        sidebar.projects.find((project) => project.path === foregroundWorkspacePath)?.path ||
-        sidebar.projects.find((project) => project.source === "registry")?.path ||
-        "",
-      navigate: navigateInWindow,
-      adoptPrepared: adoptSpawnedSessionInPlace,
-      onBeforeSwap: onBeforeInstanceSwap,
-      renderError: (message) => messageRenderer.renderError(message),
-    });
+    await withSessionLaunchBusy(() =>
+      startInWindowNewSession({
+        transport,
+        getCurrentCwd: () =>
+          getCurrentWorkspacePath() ||
+          sidebar.projects.find((project) => project.path === foregroundWorkspacePath)?.path ||
+          sidebar.projects.find((project) => project.source === "registry")?.path ||
+          "",
+        navigate: navigateInWindow,
+        adoptPrepared: adoptSpawnedSessionInPlace,
+        renderError: (message) => messageRenderer.renderError(message),
+      }),
+    );
     return;
   }
 
@@ -6068,19 +6056,20 @@ async function handleNewProjectChat(project) {
     // even while streaming (pi's new_session RPC aborts/settles the active
     // turn safely). Only mobile mode keeps the spawn path (its window model
     // cannot reuse the current process).
-    const launched = await startNewProjectChat({
-      project,
-      transport,
-      getCurrentCwd: getCurrentWorkspacePath,
-      shouldSpawnParallel: () => mobileClientMode,
-      navigate: navigateInWindow,
-      adoptPrepared: adoptSpawnedSessionInPlace,
-      onBeforeSwap: onBeforeInstanceSwap,
-      beforeWorkspaceCommit: () => commitTerminalTransition(),
-      beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
-      onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
-      renderError: (message) => messageRenderer.renderError(message),
-    });
+    const launched = await withSessionLaunchBusy(() =>
+      startNewProjectChat({
+        project,
+        transport,
+        getCurrentCwd: getCurrentWorkspacePath,
+        shouldSpawnParallel: () => mobileClientMode,
+        navigate: navigateInWindow,
+        adoptPrepared: adoptSpawnedSessionInPlace,
+        beforeWorkspaceCommit: () => commitTerminalTransition(),
+        beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
+        onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
+        renderError: (message) => messageRenderer.renderError(message),
+      }),
+    );
     if (!launched) return;
 
     if (isMobile()) {
@@ -6355,6 +6344,21 @@ async function adoptSpawnedSessionInPlace(prepared, { targetCwd, workspaceGenera
     workspaceGeneration,
   });
   await resetUiForNewSession();
+  // The full-page boot used to show a provisional "New Session" row via
+  // refreshInitialSidebar; in-place adoption owns that now. The row rides
+  // the pending state and materializes on the refresh below (or the next
+  // one), then rebinds to the real JSONL once Pi writes it.
+  const spawnTarget = wsClient.getRuntimeTarget();
+  if (shouldShowProvisionalSession({ runtimeTarget: spawnTarget })) {
+    sidebar.setProvisionalSession({
+      workspaceId: spawnTarget.workspaceId,
+      sessionId: spawnTarget.sessionId,
+    });
+  }
+  console.debug("[Session route] spawnAdopt:done", {
+    targetCwd,
+    runtimeTarget: spawnTarget?.sessionId,
+  });
   if (targetCwd) sidebar.refresh({ workspacePath: targetCwd });
   // The spawn entries lock ephemeral interaction for a cross-workspace
   // commit via beforeWorkspaceTransition (workspace/actions.js); the page
@@ -6733,6 +6737,8 @@ globalThis.__picotSessionView = {
 globalThis.__picotSidebar = {
   removeWorkspace: (workspace) => sidebar.removeFromList(workspace),
   addProjectViaPicker: () => sidebar.addProjectViaPicker(),
+  // Whether a spawned-but-unpersisted session row is pending materialization.
+  isProvisionalPending: () => Boolean(sidebar.provisionalSession),
 };
 // Remote terminal attachment inspection: the state machine's own state plus the
 // panel's rendered availability (no DOM scraping in tests).
@@ -6833,8 +6839,10 @@ function updateMirrorInputState() {
 
   const inputArea = document.querySelector(".input-area");
   if (viewingActiveSession) {
-    messageInput.disabled = false;
-    messageInput.placeholder = t("input.messagePlaceholder");
+    messageInput.disabled = sessionLaunchBusy;
+    messageInput.placeholder = sessionLaunchBusy
+      ? t("status.startingNewSession")
+      : t("input.messagePlaceholder");
     inputArea?.classList.remove("mirror-readonly");
   } else {
     messageInput.disabled = true;
@@ -7610,9 +7618,12 @@ function updateUI() {
     statusText.textContent = t("status.connected");
   }
 
-  messageInput.disabled = !onboarding.canType || sessionStopped;
+  messageInput.disabled = sessionLaunchBusy || !onboarding.canType || sessionStopped;
   sendBtn.disabled =
-    !onboarding.canQuery || sessionStopped || promptDelivery.hasAwaiting(composerIdentity());
+    sessionLaunchBusy ||
+    !onboarding.canQuery ||
+    sessionStopped ||
+    promptDelivery.hasAwaiting(composerIdentity());
   inputAreaEl.classList.toggle("session-stopped", sessionStopped);
 
   if (isStreaming) {
@@ -7627,7 +7638,9 @@ function updateUI() {
     sendCaretBtn.classList.add("hidden");
   }
 
-  if (sessionStopped) {
+  if (sessionLaunchBusy) {
+    messageInput.placeholder = t("status.startingNewSession");
+  } else if (sessionStopped) {
     messageInput.placeholder = t("input.stoppedSession");
   } else if (onboarding.canQuery) {
     messageInput.placeholder = `${t("input.typeMessage")}${t("input.typeMessageFollowUpHint")}`;
@@ -8761,17 +8774,18 @@ document.querySelector(".mode-link:first-child")?.addEventListener("click", () =
 // ═══════════════════════════════════════
 
 function handleRegisteredWorkspace(targetCwd) {
-  return startRegisteredWorkspaceSession({
-    targetCwd,
-    transport,
-    navigate: navigateInWindow,
-    adoptPrepared: adoptSpawnedSessionInPlace,
-    onBeforeSwap: onBeforeInstanceSwap,
-    beforeWorkspaceCommit: () => commitTerminalTransition(),
-    beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
-    onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
-    renderError: (message) => messageRenderer.renderError(message),
-  });
+  return withSessionLaunchBusy(() =>
+    startRegisteredWorkspaceSession({
+      targetCwd,
+      transport,
+      navigate: navigateInWindow,
+      adoptPrepared: adoptSpawnedSessionInPlace,
+      beforeWorkspaceCommit: () => commitTerminalTransition(),
+      beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
+      onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
+      renderError: (message) => messageRenderer.renderError(message),
+    }),
+  );
 }
 
 // ═══════════════════════════════════════
@@ -8782,16 +8796,17 @@ async function handleOpenFolder() {
   if (workspaceLaunchInProgress) return;
   setWorkspaceLaunchInProgress(true);
   try {
-    await openFolderAsWorkspace({
-      transport,
-      navigate: navigateInWindow,
-      adoptPrepared: adoptSpawnedSessionInPlace,
-      onBeforeSwap: onBeforeInstanceSwap,
-      beforeWorkspaceCommit: () => commitTerminalTransition(),
-      beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
-      onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
-      renderError: (message) => messageRenderer.renderError(message),
-    });
+    await withSessionLaunchBusy(() =>
+      openFolderAsWorkspace({
+        transport,
+        navigate: navigateInWindow,
+        adoptPrepared: adoptSpawnedSessionInPlace,
+        beforeWorkspaceCommit: () => commitTerminalTransition(),
+        beforeWorkspaceTransition: prepareEphemeralWorkspaceTransition,
+        onWorkspaceTransitionCancelled: cancelEphemeralWorkspaceTransition,
+        renderError: (message) => messageRenderer.renderError(message),
+      }),
+    );
   } finally {
     setWorkspaceLaunchInProgress(false);
   }

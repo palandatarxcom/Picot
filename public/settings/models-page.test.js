@@ -312,7 +312,9 @@ describe("models provider editor", () => {
     const logoutBtn = document.querySelector(".api-key-row-oauth-action");
     expect(logoutBtn).not.toBeNull();
     logoutBtn.click();
-    expect(confirm).toHaveBeenCalled();
+    // The confirm is now a DOM modal (the Tauri WebView has no native
+    // confirm bridge); answer it to release the logout call.
+    document.querySelector(".sidebar-confirm-yes")?.click();
     // Logout rides the oauth gateway's v3 command surface (`oauth_logout`).
     await vi.waitFor(() =>
       expect(logoutOauth.mock.calls.some(([frame]) => frame?.type === "oauth_logout")).toBe(true),

@@ -242,9 +242,14 @@ test("a spawned new session adopts in place and releases the ephemeral locks", a
 
   // Cmd+T drives the header "+ New Session" path: spawnFreshSession with
   // forceNewSession, then the in-place adoption tail.
+  const input = document.getElementById("message-input");
   document.dispatchEvent(
     new KeyboardEvent("keydown", { key: "t", metaKey: true, bubbles: true, cancelable: true }),
   );
+  // The launch is light: no full-screen swap overlay, but the composer is
+  // busy so a prompt cannot race the adoption into the outgoing runtime.
+  expect(document.body.classList.contains("swapping-instance")).toBe(false);
+  expect(input.disabled).toBe(true);
   await settle(200);
 
   const prepare = ws.sent.find(
@@ -266,6 +271,10 @@ test("a spawned new session adopts in place and releases the ephemeral locks", a
     (frame) => frame.type === "host_request" && frame.operation === "ephemeral_bootstrap",
   );
   expect(ephemeralBootstraps.length).toBeGreaterThanOrEqual(1);
+  // The composer is live again and the spawned session has a pending
+  // provisional row (the old boot-time placeholder, now owned by adoption).
+  expect(input.disabled).toBe(false);
+  expect(globalThis.__picotSidebar.isProvisionalPending()).toBe(true);
 });
 
 test("adding a workspace via the picker spawns and adopts in place", async () => {
@@ -288,8 +297,11 @@ test("adding a workspace via the picker spawns and adopts in place", async () =>
   expect(control("workspace.remove").length).toBeGreaterThanOrEqual(1);
 
   // 2. Re-add it via the picker: pick_folder → workspace.add (new uuid) →
-  //    prepare(spawn) → commit → in-place adoption.
-  await globalThis.__picotSidebar.addProjectViaPicker();
+  //    prepare(spawn) → commit → in-place adoption. The launch is light:
+  //    no full-screen swap overlay covers the page while it runs.
+  const pickerPromise = globalThis.__picotSidebar.addProjectViaPicker();
+  expect(document.body.classList.contains("swapping-instance")).toBe(false);
+  await pickerPromise;
   await settle(200);
 
   expect(control("pick_folder").length).toBeGreaterThanOrEqual(1);

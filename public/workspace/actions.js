@@ -230,12 +230,20 @@ async function spawnFreshSession({
       forceNewSession: true,
       reuseExisting: false,
     });
+    console.debug(`[Session route] ${debugTag}:prepared`, {
+      targetCwd,
+      classification: prepared?.classification,
+      transitionGeneration: prepared?.transitionGeneration,
+      targetSessionId: prepared?.targetSessionId,
+    });
     if (prepared?.classification === "cross" && typeof beforeWorkspaceTransition === "function") {
       const settled = await beforeWorkspaceTransition(prepared);
+      console.debug(`[Session route] ${debugTag}:settled`, { settled });
       if (!settled) {
         dismissOverlay();
         onWorkspaceTransitionCancelled?.();
         await transport.cancelWorkspaceTransition(prepared.transitionGeneration).catch(() => {});
+        console.warn(`[Session route] ${debugTag}:cancelled-by-settle`, { targetCwd });
         return false;
       }
     }
@@ -244,7 +252,10 @@ async function spawnFreshSession({
     }
     beforeWorkspaceCommit?.();
     const committed = await transport.commitWorkspaceTransition(prepared.transitionGeneration);
-    console.debug(`[Session route] ${debugTag}:created`, { targetCwd });
+    console.debug(`[Session route] ${debugTag}:committed`, {
+      targetCwd,
+      workspaceGeneration: committed?.workspaceGeneration,
+    });
     if (typeof adoptPrepared === "function") {
       // In-place adoption: the document survives, so the overlay raised before
       // prepare must come down here — no new page boots to clear it.
@@ -252,6 +263,7 @@ async function spawnFreshSession({
         targetCwd,
         workspaceGeneration: committed?.workspaceGeneration,
       });
+      console.debug(`[Session route] ${debugTag}:adopted`, { targetCwd });
       dismissOverlay();
     } else {
       navigate(prepared.targetOrigin, { targetCwd });
@@ -259,6 +271,11 @@ async function spawnFreshSession({
     return true;
   } catch (e) {
     dismissOverlay();
+    console.warn(`[Session route] ${debugTag}:failed`, {
+      targetCwd,
+      error: String(e?.message || e),
+      stage: prepared ? "post-prepare" : "prepare",
+    });
     if (prepared?.transitionGeneration != null) {
       onWorkspaceTransitionCancelled?.();
       await transport.cancelWorkspaceTransition(prepared.transitionGeneration).catch(() => {});

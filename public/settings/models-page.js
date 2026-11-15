@@ -2,6 +2,7 @@
 // ABOUTME: Refreshes the active model catalog after successful model configuration mutations.
 
 import { onLocaleChange, t } from "../i18n.js";
+import { showDomConfirm } from "../ui/dom-confirm.js";
 import { createModelsOAuthLoginDialog } from "./models-oauth-login.js";
 import {
   clearSettingsSaveMessage as clearSettingsSaveMessageGlobal,
@@ -937,8 +938,9 @@ export function setupModelsPage({
   }
 
   async function removeApiKey(p) {
-    const ok = confirm(
+    const ok = await showDomConfirm(
       t("settings.apiKeys.removeConfirm", { provider: p.displayName || p.provider }),
+      { danger: true },
     );
     if (!ok) return;
     const resp = await call("remove_api_key", { provider: p.provider }).catch(() => null);
@@ -949,8 +951,9 @@ export function setupModelsPage({
   }
 
   async function logoutCodex(p) {
-    const ok = confirm(
+    const ok = await showDomConfirm(
       t("settings.models.oauth.logoutConfirm", { provider: p.displayName || p.provider }),
+      { danger: true },
     );
     if (!ok) return;
     // The bridge op is `oauth_logout`; the retired host control name
@@ -1226,11 +1229,17 @@ export function setupModelsPage({
     remove.className = "ui-button ui-button--danger ui-button--sm";
     remove.textContent = t("settings.providers.delete");
     remove.addEventListener("click", () => {
-      if (!confirm(t("settings.providers.deleteProviderConfirm", { provider: providerName })))
-        return;
-      update(() => {
-        delete config.providers[providerName];
-        selectedModelsConfigItem = null;
+      void showDomConfirm(
+        t("settings.providers.deleteProviderConfirm", { provider: providerName }),
+        {
+          danger: true,
+        },
+      ).then((ok) => {
+        if (!ok) return;
+        update(() => {
+          delete config.providers[providerName];
+          selectedModelsConfigItem = null;
+        });
       });
     });
     header.append(eyebrow, remove);
