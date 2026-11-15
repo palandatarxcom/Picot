@@ -59,6 +59,30 @@ function appendHighlightedText(container, text, query) {
   if (cursor < source.length) container.appendChild(document.createTextNode(source.slice(cursor)));
 }
 
+/**
+ * Reconcile a container's children to the desired sequence by node
+ * reference: a child already in place is never touched, so unchanged DOM
+ * subtrees keep the WebView's layout cache across re-renders. Moves are
+ * normalized by a final pass that drops any node absent from `desired`.
+ */
+function reconcileChildren(container, desired) {
+  for (let index = 0; index < desired.length; index += 1) {
+    if (container.children[index] === desired[index]) continue;
+    if (index >= container.children.length) {
+      container.appendChild(desired[index]);
+    } else {
+      container.insertBefore(desired[index], container.children[index]);
+    }
+  }
+  while (container.children.length > desired.length) {
+    container.lastElementChild.remove();
+  }
+  const keep = new Set(desired);
+  for (const child of [...container.children]) {
+    if (!keep.has(child)) child.remove();
+  }
+}
+
 export class SessionSidebar {
   constructor(container, onSessionSelect, onNewChat, options = {}) {
     this.projectSessionInitialLimit = 5;
@@ -2240,38 +2264,85 @@ export class SessionSidebar {
       this.onFocusRefresh();
       return;
     }
-    this.container.replaceChildren();
-
-    this.renderPinnedSection();
-
     const projectRows = this.projects.filter(
       (project) => project.source !== "registry" || !project.pinned,
     );
-    const { section: projectsSection, sessionsContainer: projectsGroup } = buildSidebarSection({
-      region: "projects",
-      titleKey: "sidebar.projects",
-      count: projectRows.length,
-      expanded: !this.projectsCollapsed,
-      onToggle: (expanded) => {
-        this.projectsCollapsed = !expanded;
-      },
-    });
-    projectsSection.className = `projects-group ${projectsSection.className}`;
+    // Structural reflow budget: the projects section is a persistent
+    // skeleton — a steady-state render touches only the title/count text
+    // and the collapsed classes, and row groups reconcile by node
+    // reference. A full-tree replaceChildren on every mirror_sync used to
+    // drop the WebView's layout cache for the whole sidebar, which read as
+    // a visible stall when a workspace with 100+ sessions expanded.
+    let section;
+    if (!this._projectsSectionEl) {
+      const built = buildSidebarSection({
+        region: "projects",
+        titleKey: "sidebar.projects",
+        count: projectRows.length,
+        expanded: !this.projectsCollapsed,
+        onToggle: (expanded) => {
+          this.projectsCollapsed = !expanded;
+        },
+      });
+      section = built.section;
+      section.className = `projects-group ${section.className}`;
+      this._projectsSectionEl = section;
+      this._projectsGroupEl = built.sessionsContainer;
+      this._projectsSectionHeaderEl = built.header;
+    } else {
+      section = this._projectsSectionEl;
+      // Skeleton updates: locale may change the title, the count tracks the
+      // registry, and the collapsed flag follows this.projectsCollapsed.
+      const titleEl = section.querySelector(".sidebar-section-title");
+      if (titleEl) titleEl.textContent = t("sidebar.projects");
+      const countEl = section.querySelector(".sidebar-section-count");
+      if (countEl) countEl.textContent = String(projectRows.length);
+      this._projectsSectionHeaderEl.classList.toggle("collapsed", this.projectsCollapsed);
+      this._projectsGroupEl.classList.toggle("collapsed", this.projectsCollapsed);
+      this._projectsSectionHeaderEl.setAttribute("aria-expanded", String(!this.projectsCollapsed));
+    }
     const seenRowKeys = new Set();
+    const desiredGroups = [];
     for (const project of projectRows) {
       seenRowKeys.add(project.workspaceId);
       const { group } = this.projectRowNode(project);
-      projectsGroup.appendChild(group);
+      desiredGroups.push(group);
     }
     // Drop cached nodes for rows that disappeared (removed live rows, etc.)
     for (const cacheKey of [...this._projectRowCache.keys()]) {
       if (!seenRowKeys.has(cacheKey)) this._projectRowCache.delete(cacheKey);
     }
-    this.container.appendChild(projectsSection);
+    reconcileChildren(this._projectsGroupEl, desiredGroups);
+
+    // Pinned rows keep no per-row cache, so their section rebuilds each
+    // render — but it swaps within its own slot, leaving the persistent
+    // projects section (and its layout cache) untouched.
+    const previousPinned = this.container.querySelector(":scope > .pinned-group");
+    const pinnedMount = document.createDocumentFragment();
+    const realContainer = this.container;
+    this.container = pinnedMount;
+    try {
+      this.renderPinnedSection();
+    } finally {
+      this.container = realContainer;
+    }
+    if (!realContainer.contains(section)) realContainer.appendChild(section);
+    const pinnedSection = pinnedMount.firstElementChild;
+    if (pinnedSection) {
+      if (previousPinned && previousPinned !== pinnedSection) {
+        realContainer.replaceChild(pinnedSection, previousPinned);
+      } else if (!previousPinned) {
+        realContainer.insertBefore(pinnedSection, section);
+      }
+    } else if (previousPinned) {
+      previousPinned.remove();
+    }
 
     const pinState = this.getRenderablePinState();
     if (this.projects.length === 0 && pinState.workspaces.length === 0) {
       this.renderEmptyState({ append: true });
+    } else {
+      this.container.querySelector(".session-empty-state")?.remove();
     }
     for (const [cacheKey, cached] of this._projectRowCache) {
       if (!this.projects.some((project) => project.workspaceId === cacheKey)) {

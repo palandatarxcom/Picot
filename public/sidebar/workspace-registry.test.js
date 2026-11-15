@@ -1207,3 +1207,46 @@ test("an expansion straddling a registry refresh still lands its sessions", asyn
   const item = document.querySelector(".session-item[data-file-path='/sessions/a.jsonl']");
   expect(item).not.toBeNull();
 });
+
+test("a steady-state render reuses row nodes instead of rebuilding the tree", async () => {
+  // The 100+-session expand stall was structural: every render ran
+  // replaceChildren over the whole sidebar, dropping the WebView's layout
+  // cache. Unchanged rows must now keep their exact DOM nodes.
+  const sessionsPayload = Array.from({ length: 130 }, (_, i) => ({
+    filePath: `/sessions/s-${i}.jsonl`,
+    name: `S ${i}`,
+  }));
+  const { sidebar } = await makeSidebar({
+    rows: REGISTRY_ROWS,
+    fetchRoutes: {
+      instances: [],
+      workspaceSessions: () => ({
+        path: "/work/beta",
+        dirName: "beta",
+        sessions: sessionsPayload,
+        sessionCount: sessionsPayload.length,
+      }),
+    },
+  });
+  await sidebar.loadSessions();
+  const beta = sidebar.projects.find((project) => project.registryId === "uuid-2");
+  sidebar.setWorkspaceExpanded(beta, true);
+  await sidebar.ensureWorkspaceSessions(beta);
+
+  const sectionBefore = document.querySelector(".projects-group");
+  const groupBefore = document.querySelector(
+    ".projects-group .workspace-group, .projects-group > div",
+  );
+  const itemsBefore = [...document.querySelectorAll(".session-item")];
+  sidebar.render();
+  sidebar.render();
+
+  const sectionAfter = document.querySelector(".projects-group");
+  expect(sectionAfter).toBe(sectionBefore);
+  const itemsAfter = [...document.querySelectorAll(".session-item")];
+  expect(itemsAfter.length).toBe(itemsBefore.length);
+  for (let index = 0; index < itemsAfter.length; index += 1) {
+    expect(itemsAfter[index]).toBe(itemsBefore[index]);
+  }
+  expect(groupBefore).toBeTruthy();
+});
