@@ -1614,13 +1614,17 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                         canonical_target.clone(),
                                         0,
                                     )?;
-                                    owner_registry.prepare_navigation(
+                                    if let Err(error) = owner_registry.prepare_navigation(
                                         &owner,
                                         0,
                                         canonical_target.clone(),
                                         target_url.clone(),
                                         std::time::Duration::from_secs(30),
-                                    )?;
+                                    ) {
+                                        let _ =
+                                            owner_registry.cancel_workspace_transition(&owner, gen);
+                                        return Err(error);
+                                    }
                                     gen
                                 };
                                 // Reattach (T7): the runtime the app reclaimed
@@ -1636,6 +1640,8 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                             &existing.session_id,
                                             generation,
                                         ) {
+                                            let _ = owner_registry
+                                                .cancel_workspace_transition(&owner, generation);
                                             return Err(
                                                 "the reclaimed session runtime could not be reattached"
                                                     .to_string(),
@@ -1672,20 +1678,31 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                         canonical_target.clone(),
                                         0,
                                     )?;
-                                    owner_registry.prepare_navigation(
+                                    if let Err(error) = owner_registry.prepare_navigation(
                                         &owner,
                                         0,
                                         canonical_target.clone(),
                                         target_url.clone(),
                                         std::time::Duration::from_secs(30),
-                                    )?;
+                                    ) {
+                                        let _ =
+                                            owner_registry.cancel_workspace_transition(&owner, gen);
+                                        return Err(error);
+                                    }
                                     gen
                                 };
-                                let launch = pi_launch::native_launch_spec(
+                                let launch = match pi_launch::native_launch_spec(
                                     &static_dir,
                                     &canonical_target.to_string_lossy(),
                                     session_path.as_deref(),
-                                )?;
+                                ) {
+                                    Ok(spec) => spec,
+                                    Err(error) => {
+                                        let _ = owner_registry
+                                            .cancel_workspace_transition(&owner, generation);
+                                        return Err(error);
+                                    }
+                                };
                                 let new_target = RuntimeTarget::with_owner(
                                     workspace_id.clone(),
                                     session_id,
@@ -1693,7 +1710,11 @@ pub fn host_control_dispatch(state: Arc<DaemonState>) -> ControlHandler {
                                     owner.as_str(),
                                     generation,
                                 );
-                                runtimes.spawn(new_target.clone(), launch)?;
+                                if let Err(error) = runtimes.spawn(new_target.clone(), launch) {
+                                    let _ = owner_registry
+                                        .cancel_workspace_transition(&owner, generation);
+                                    return Err(error);
+                                }
                                 // Cancel may only stop what this transition
                                 // created; a reused runtime stays anonymous.
                                 owner_registry.record_pending_created_instance(

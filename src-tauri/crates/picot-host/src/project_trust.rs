@@ -10,6 +10,9 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 const LOCK_STALE_MS: u64 = 10_000;
+/// A trust write holds the lock for milliseconds; a lock directory older
+/// than this after Picot killed a Pi process is a corpse, not a live writer.
+const LOCK_LOCK_SWEEP_MIN_AGE_MS: u64 = 500;
 const LOCK_RETRY_DELAY_MS: u64 = 20;
 const LOCK_MAX_ATTEMPTS: usize = 750; // ~15s ceiling
 
@@ -24,6 +27,14 @@ const LOCK_RELEASE_ATTEMPTS: usize = 10;
 /// Trust file inside the Pi agent root (Pi: `ProjectTrustStore.trustPath`).
 fn trust_file(agent_root: &Path) -> PathBuf {
     agent_root.join("trust.json")
+}
+/// Owner marker beside (never inside — an extra file would break the
+/// proper-lockfile `rmdir` release) the lock directory. Picot writes its pid
+/// here while holding the lock; a marker naming a dead process means the lock
+/// is a corpse this host may reap immediately instead of waiting out the 10s
+/// mtime staleness. Pi never reads or writes this file.
+fn lock_owner_file(agent_root: &Path) -> PathBuf {
+    agent_root.join("trust.json.lock.owner")
 }
 
 /// Pi's `normalizeCwd`: `realpathSync` with a graceful fallback to the input
@@ -118,6 +129,75 @@ fn release_trust_lock(lock_dir: &Path) -> bool {
     }
     false
 }
+/// True when `pid` is not a live process. Unix-only fast probe (`kill -0`);
+/// on other platforms the mtime staleness path stays the authority, and a
+/// recycled pid simply reads as alive — the conservative direction (wait,
+/// never tear a live holder's lock).
+fn pid_is_dead(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Whether the lock directory is a corpse reapable right now: its Picot owner
+/// marker names a dead process, or (Pi-held locks carry no marker) the
+/// directory's mtime has passed the staleness window. A marker naming a LIVE
+/// process is authoritative that the lock is held — the mtime path must not
+/// override it either.
+fn lock_is_reapable(agent_root: &Path, lock_dir: &Path) -> bool {
+    if let Ok(text) = fs::read_to_string(lock_owner_file(agent_root)) {
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            return pid_is_dead(pid);
+        }
+    }
+    fs::metadata(lock_dir)
+        .and_then(|metadata| metadata.modified())
+        .map(|mtime| {
+            SystemTime::now()
+                .duration_since(mtime)
+                .unwrap_or(Duration::ZERO)
+                >= Duration::from_millis(LOCK_STALE_MS)
+        })
+        .unwrap_or(true)
+}
+
+/// Remove a leftover lock plus its owner marker. Callers only invoke this on
+/// a reaped (dead) lock.
+fn reap_lock(agent_root: &Path, lock_dir: &Path) -> bool {
+    let gone = release_trust_lock(lock_dir);
+    let _ = fs::remove_file(lock_owner_file(agent_root));
+    gone
+}
+
+/// After Picot kills a Pi process, sweep a trust lock the victim may have
+/// died holding. The mtime guard is the safety margin: a live writer holds
+/// the lock for milliseconds, so anything older than half a second is a
+/// corpse, and removing it spares the next trust write (often Pi's own
+/// startup read) the full 10s staleness wait.
+pub fn sweep_lock_after_pi_kill() {
+    let agent_root = match pi_launch::resolve_pi_agent_root() {
+        Ok(root) => root,
+        Err(_) => return,
+    };
+    let lock_dir = agent_root.join("trust.json.lock");
+    let Ok(metadata) = fs::metadata(&lock_dir) else {
+        return;
+    };
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .unwrap_or(Duration::ZERO);
+    if age >= Duration::from_millis(LOCK_LOCK_SWEEP_MIN_AGE_MS) {
+        reap_lock(&agent_root, &lock_dir);
+    }
+}
 
 /// Pi's proper-lockfile protocol, replicated: acquire by `create_dir` on an
 /// empty `trust.json.lock` directory (atomic EEXIST = held), staleness by
@@ -147,8 +227,14 @@ fn with_trust_lock<T>(
                         lock_dir.display()
                     );
                 }
+                // Marker beside (never inside) the lock: a future waiter can
+                // reap THIS lock instantly if Picot dies holding it, instead
+                // of waiting out the mtime staleness window.
+                let _ = fs::write(lock_owner_file(agent_root), std::process::id().to_string());
                 let result = critical();
-                if !release_trust_lock(&lock_dir) {
+                let released = release_trust_lock(&lock_dir);
+                let _ = fs::remove_file(lock_owner_file(agent_root));
+                if !released {
                     // Never silent: a lock left behind makes the NEXT trust
                     // write wait out LOCK_STALE_MS (10s) before it may take
                     // over, which surfaces as a ten-second stall on an
@@ -163,23 +249,15 @@ fn with_trust_lock<T>(
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 match fs::metadata(&lock_dir) {
-                    Ok(metadata) => {
-                        let stale = metadata
-                            .modified()
-                            .ok()
-                            .map(|mtime| {
-                                SystemTime::now()
-                                    .duration_since(mtime)
-                                    .unwrap_or(Duration::ZERO)
-                                    >= Duration::from_millis(LOCK_STALE_MS)
-                            })
-                            .unwrap_or(true);
-                        if stale {
-                            // A crashed prior holder: clear and retry. A clear
-                            // that keeps failing must be reported, not spun on:
-                            // the loop below would retry the same stuck
-                            // directory until the attempt ceiling.
-                            if !release_trust_lock(&lock_dir) {
+                    Ok(_) => {
+                        // Corpse detection: a Picot owner marker naming a dead
+                        // process (or a Pi lock past its staleness window) is
+                        // reapable now instead of after LOCK_STALE_MS.
+                        if lock_is_reapable(agent_root, &lock_dir) {
+                            // A clear that keeps failing must be reported, not
+                            // spun on: the loop below would retry the same
+                            // stuck directory until the attempt ceiling.
+                            if !reap_lock(agent_root, &lock_dir) {
                                 return Err(format!(
                                     "failed to clear stale trust lock {}",
                                     lock_dir.display()
@@ -470,5 +548,82 @@ mod tests {
             canonical_trust_key(Path::new(r"\\?\C:\workspace")),
             r"C:\workspace".to_string()
         );
+    }
+    #[test]
+    fn a_dead_owner_marker_makes_the_lock_reapable_immediately() {
+        let root = agent_root();
+        let lock_dir = root.path().join("trust.json.lock");
+        fs::create_dir(&lock_dir).expect("seed leftover lock");
+        // A pid far beyond the host's pid_max: kill(pid, 0) answers ESRCH.
+        fs::write(lock_owner_file(root.path()), "400000").expect("seed dead owner");
+
+        assert!(lock_is_reapable(root.path(), &lock_dir));
+        // The whole acquire path must not wait out the 10s staleness: a
+        // reaping acquire finishes immediately.
+        let started = std::time::Instant::now();
+        let result = with_trust_lock(root.path(), || Ok("held"));
+        assert_eq!(result.expect("acquire reaps the corpse"), "held");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dead-owner reaping must be immediate, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !lock_dir.exists(),
+            "lock released after the critical section"
+        );
+        assert!(
+            !lock_owner_file(root.path()).exists(),
+            "owner marker removed with the lock"
+        );
+    }
+
+    #[test]
+    fn a_live_owner_marker_protects_a_held_lock_from_reaping() {
+        let root = agent_root();
+        let lock_dir = root.path().join("trust.json.lock");
+        fs::create_dir(&lock_dir).expect("seed held lock");
+        // This test process is alive by definition.
+        fs::write(lock_owner_file(root.path()), std::process::id().to_string())
+            .expect("seed live owner");
+
+        // Live owner is authoritative even past the mtime staleness window:
+        // a live holder must never be torn.
+        backdate_mtime(&lock_dir, Duration::from_secs(30));
+        assert!(!lock_is_reapable(root.path(), &lock_dir));
+    }
+
+    #[test]
+    fn sweep_after_pi_kill_only_takes_an_aged_lock() {
+        let root = agent_root();
+        let lock_dir = root.path().join("trust.json.lock");
+        fs::create_dir(&lock_dir).expect("seed leftover lock");
+
+        // Fresh: a live writer may hold it — the mtime guard leaves it alone.
+        let metadata = fs::metadata(&lock_dir).expect("lock metadata");
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            age < Duration::from_millis(LOCK_LOCK_SWEEP_MIN_AGE_MS),
+            "precondition: seeded lock is fresh"
+        );
+
+        // Aged: a corpse from a killed Pi — the sweep's own guard takes it.
+        backdate_mtime(&lock_dir, Duration::from_secs(2));
+        // The pub sweep resolves the REAL agent root; test the same guard +
+        // reap pair it applies.
+        let aged = fs::metadata(&lock_dir)
+            .expect("lock metadata")
+            .modified()
+            .ok()
+            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+            .unwrap_or(Duration::ZERO)
+            >= Duration::from_millis(LOCK_LOCK_SWEEP_MIN_AGE_MS);
+        assert!(aged, "precondition: backdated lock is aged");
+        assert!(reap_lock(root.path(), &lock_dir));
+        assert!(!lock_dir.exists());
     }
 }

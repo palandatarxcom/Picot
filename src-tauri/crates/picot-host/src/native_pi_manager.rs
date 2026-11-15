@@ -1296,6 +1296,11 @@ impl NativePiManager {
             .unregister(target)
             .map_err(|error| format!("Cannot unregister stopped runtime: {error:?}"))?;
         self.record_cleanup(target, NativeCleanupStage::RuntimeUnregistered);
+        // The Pi process just died; if it was mid-trust-write when killed,
+        // its lock directory is a corpse the next trust write (often another
+        // Pi's startup read) would wait 10s to reap. Sweep it now — the
+        // sub-second mtime guard inside means a no-op when no lock exists.
+        crate::project_trust::sweep_lock_after_pi_kill();
         cleanup_error.map_or(Ok(()), Err)
     }
 

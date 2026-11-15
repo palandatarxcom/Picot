@@ -329,3 +329,127 @@ async fn prepare_serves_a_readded_workspace_whose_old_runtime_survives() {
         "the orphan survived the transition: {running:?}"
     );
 }
+
+/// A prepare that fails after `begin_workspace_transition` (here: the Pi
+/// binary cannot execute) must not strand the transition — the sidebar's
+/// pattern is "click again on failure", and a stranded transition turns
+/// every retry into "a workspace transition is already in progress" until
+/// something else clears it. Field symptom: the 3rd/4th workspace needing
+/// two clicks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_prepare_does_not_strand_the_transition() {
+    let fixture = Fixture::boot().await;
+
+    let readd_raw = fixture._temp.path().join("readd");
+    std::fs::create_dir_all(&readd_raw).expect("re-add dir");
+    let readd_dir = readd_raw.canonicalize().expect("canonical re-add dir");
+    fixture
+        .state
+        .metadata
+        .lock()
+        .expect("metadata lock")
+        .add_workspace(&readd_dir)
+        .expect("second workspace registers");
+
+    let owner = fixture.live_owner("native-workspace-a");
+
+    // Break the stub Pi so `runtimes.spawn` fails AFTER the transition began.
+    let stub = fixture._temp.path().join("pi").join("pi");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o000))
+            .expect("stub breaks");
+    }
+
+    let first = fixture
+        .dispatch_as(
+            &owner,
+            "workspace_target_prepare",
+            json!({
+                "targetCwd": readd_dir.to_string_lossy(),
+                "forceNewSession": true,
+                "reuseExisting": false,
+            }),
+        )
+        .await;
+    assert!(first.is_err(), "the broken stub fails the spawn: {first:?}");
+
+    // Restore the stub: the immediate retry must succeed. With a stranded
+    // transition it would answer "already in progress" instead.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("stub restored");
+    }
+    let second = fixture
+        .dispatch_as(
+            &owner,
+            "workspace_target_prepare",
+            json!({
+                "targetCwd": readd_dir.to_string_lossy(),
+                "forceNewSession": true,
+                "reuseExisting": false,
+            }),
+        )
+        .await
+        .expect("the retry prepares instead of hitting a stranded transition");
+    let generation = second["transitionGeneration"].as_u64().expect("generation");
+    fixture
+        .dispatch_as(
+            &owner,
+            "workspace_transition_commit",
+            json!({ "transitionGeneration": generation }),
+        )
+        .await
+        .expect("commit succeeds after the compensated failure");
+}
+
+/// The field regression sequence: adding several FRESH workspaces back to
+/// back (add → prepare → commit each). Every launch must succeed first-try;
+/// a transition left behind by any path turns every later add into two
+/// clicks ("a workspace transition is already in progress").
+#[tokio::test(flavor = "multi_thread")]
+async fn adding_several_fresh_workspaces_succeeds_first_try_each_time() {
+    let fixture = Fixture::boot().await;
+    let owner = fixture.live_owner("native-workspace-a");
+
+    for index in 1..=3 {
+        let dir_raw = fixture._temp.path().join(format!("fresh-{index}"));
+        std::fs::create_dir_all(&dir_raw).expect("fresh dir");
+        let dir = dir_raw.canonicalize().expect("canonical fresh dir");
+
+        fixture
+            .dispatch_as(
+                &owner,
+                "workspace.add",
+                json!({ "path": dir.to_string_lossy() }),
+            )
+            .await
+            .expect("add succeeds");
+        let prepared = fixture
+            .dispatch_as(
+                &owner,
+                "workspace_target_prepare",
+                json!({
+                    "targetCwd": dir.to_string_lossy(),
+                    "forceNewSession": true,
+                    "reuseExisting": false,
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("prepare #{index} failed: {error}"));
+        let generation = prepared["transitionGeneration"]
+            .as_u64()
+            .expect("generation");
+        fixture
+            .dispatch_as(
+                &owner,
+                "workspace_transition_commit",
+                json!({ "transitionGeneration": generation }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("commit #{index} failed: {error}"));
+    }
+}
