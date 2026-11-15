@@ -6673,7 +6673,16 @@ function handleMirrorSync(data) {
   // sync. Live growth after load streams via message events, not syncs; the
   // snapshot serves only when no disk history exists (brand-new session).
   const diskMatches = diskHistory && diskHistory.sessionId === authoritativeSessionId;
-  const useDisk = Boolean(diskMatches) && diskHistory.messages.length > 0;
+  // A truncated disk read is NOT the whole session: the host cut it at its
+  // byte budget (very long sessions exceed the transport frame ceiling), so
+  // the snapshot wins when it has content — otherwise the transcript would
+  // silently start mid-conversation. When the snapshot is empty too (the
+  // same session can overflow the runtime frame), the truncated tail still
+  // beats an empty view.
+  const useDisk =
+    Boolean(diskMatches) &&
+    diskHistory.messages.length > 0 &&
+    (!diskHistory.truncated || snapshotEntries.length === 0);
   if (useDisk) {
     sessionDebug.hydrate = {
       source: "disk-fallback",
@@ -6831,12 +6840,29 @@ async function fetchDiskHistory(target, sessionFile = null) {
       };
       return;
     }
-    diskHistory = { sessionId: target.sessionId, messages };
+    // A truncated read carries only the newest turns (the host bounds the
+    // reply to stay inside the transport frame ceiling). Painting that as
+    // the whole session would silently hide the earlier history, so the
+    // snapshot stays the source of truth for such sessions.
+    diskHistory = { sessionId: target.sessionId, messages, truncated: Boolean(data?.truncated) };
     // The user may have switched sessions while the fetch was in flight.
     const current = wsClient.getRuntimeTarget();
     if (current?.sessionId !== target.sessionId) {
       sessionDebug.diskFetch = {
         status: "stale-skipped",
+        messages: messages.length,
+        session: target.sessionId,
+        at: Date.now(),
+      };
+      return;
+    }
+    // A truncated read holds only the newest turns: painting it now would
+    // replace a complete transcript with a mid-conversation tail. The
+    // snapshot renders the session properly; the truncated tail is kept for
+    // the arbitration above (used only when the snapshot has nothing).
+    if (data?.truncated) {
+      sessionDebug.diskFetch = {
+        status: "truncated",
         messages: messages.length,
         session: target.sessionId,
         at: Date.now(),

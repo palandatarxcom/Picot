@@ -382,15 +382,34 @@ impl HostDataPlane {
         session_id: &str,
         session_path: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, HostDataError> {
+        Ok(self
+            .read_session_messages_bounded(workspace_id, session_id, session_path)?
+            .0)
+    }
+
+    /// Disk transcript read with a byte budget. A long session's active chain
+    /// can serialize past the transport's outbound frame ceiling (real
+    /// sessions reach tens of MB), which used to fail the WHOLE reply with
+    /// "Outbound payload exceeds protocol limit" and left the transcript
+    /// empty. The budget keeps the newest turns — the ones the user is
+    /// looking at — and reports the cut so the caller can prefer the
+    /// runtime snapshot instead of painting a partial history as if it were
+    /// the whole session.
+    pub fn read_session_messages_bounded(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        session_path: Option<&str>,
+    ) -> Result<(Vec<serde_json::Value>, bool), HostDataError> {
         let path = self
             .resolve_session_file(workspace_id, session_id, session_path)
             .ok_or_else(|| HostDataError::Io(format!("session {session_id} not found")))?;
         let file = std::fs::File::open(&path).map_err(|e| HostDataError::Io(e.to_string()))?;
         let lines = parse_session_lines(file);
         let Some((chain, _)) = active_chain(&lines) else {
-            return Ok(vec![]);
+            return Ok((vec![], false));
         };
-        Ok(chain
+        let messages: Vec<serde_json::Value> = chain
             .iter()
             .filter(|&&i| lines[i].is_message)
             .filter_map(|&i| {
@@ -400,7 +419,26 @@ impl HostDataPlane {
                     .cloned()
                     .map(|m| message_with_entry_id(m, &lines[i].id))
             })
-            .collect())
+            .collect();
+        let mut size = 0usize;
+        let mut kept_from = messages.len();
+        // Walk from the newest message backwards until the budget is spent.
+        // The newest message is always kept — a single oversized turn must
+        // not empty the transcript — and the cut is reported so the caller
+        // can prefer the runtime snapshot.
+        for (index, message) in messages.iter().enumerate().rev() {
+            let length = serde_json::to_string(message)
+                .map(|text| text.len())
+                .unwrap_or(0);
+            let already_kept = kept_from < messages.len();
+            if already_kept && size + length > SESSION_MESSAGES_BYTES_BUDGET {
+                break;
+            }
+            size += length;
+            kept_from = index;
+        }
+        let truncated = kept_from > 0;
+        Ok((messages[kept_from..].to_vec(), truncated))
     }
 
     /// Flat session-tree snapshot for the Info panel (upstream data-plane
@@ -1465,6 +1503,14 @@ fn message_with_entry_id(mut message: serde_json::Value, entry_id: &str) -> serd
     message
 }
 
+/// Byte budget for one disk-transcript reply. The transport's outbound frame
+/// ceiling is 16 MiB; a session's whole active chain regularly exceeds it
+/// (real files reach tens of MB). Budgeting the read keeps the reply
+/// sendable and bounds the work, while the newest turns — the ones on
+/// screen — always survive.
+pub const SESSION_MESSAGES_BYTES_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Legacy `sessionActivityTime`: mtime, else parsed timestamp, else ctime.
 /// Legacy `sessionActivityTime`: mtime, else parsed timestamp, else ctime.
 fn session_activity_time(entry: &serde_json::Value) -> f64 {
     if let Some(modified) = entry.get("mtime").and_then(serde_json::Value::as_f64) {
@@ -2339,7 +2385,7 @@ fn safe_join(root: &Path, relative_path: &str) -> Result<PathBuf, HostDataError>
 mod tests {
     use super::{
         classify_mention_body_for_platform, should_project_sidebar_file, FileKind, HostDataError,
-        HostDataPlane, SidebarFileClassification,
+        HostDataPlane, SidebarFileClassification, SESSION_MESSAGES_BYTES_BUDGET,
     };
     use crate::metadata_store::MetadataStore;
     use std::fs;
@@ -2645,6 +2691,65 @@ mod tests {
         ));
 
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    /// A session whose active chain exceeds the reply budget must still
+    /// answer: the newest turns survive and the cut is reported, so the
+    /// caller can prefer the runtime snapshot instead of painting a
+    /// mid-conversation transcript as the whole session (the 16 MiB outbound
+    /// frame failure this replaced).
+    #[test]
+    fn read_session_messages_bounded_truncates_to_the_newest_turns() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("picot-host-msgs-big-{nonce}"));
+        let workspace = temp.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let (data, workspace_id) = test_data(&workspace);
+        let data = data.with_session_root(temp.join("sessions"));
+        let bucket_dir = data
+            .session_bucket_for_workspace(&workspace_id)
+            .expect("persisted session bucket");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let cwd = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
+        // Each message carries a payload bigger than the budget on its own.
+        let filler = "x".repeat(SESSION_MESSAGES_BYTES_BUDGET);
+        let mut lines: Vec<String> = vec![
+            format!("{{\"type\":\"session\",\"id\":\"session-big\",\"timestamp\":\"2026-01-01\",\"cwd\":{cwd}}}"),
+        ];
+        // A real chain: each turn parents the previous one, so
+        // active_chain walks all four.
+        for index in 0..4 {
+            let parent = if index == 0 {
+                "null".to_string()
+            } else {
+                format!("\"m{}\"", index - 1)
+            };
+            lines.push(format!(
+                "{{\"type\":\"message\",\"id\":\"m{index}\",\"parentId\":{parent},\"message\":{{\"role\":\"user\",\"content\":\"{filler}\"}}}}"
+            ));
+        }
+        fs::write(
+            bucket_dir.join("2026-01-01T00-00-00-000Z_session-big.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+
+        let (messages, truncated) = data
+            .read_session_messages_bounded(&workspace_id, "session-big", None)
+            .expect("the bounded read answers");
+        assert!(truncated, "the budget cut the chain");
+        assert!(!messages.is_empty(), "the newest turns survive the cut");
+        assert!(
+            messages.len() < 4,
+            "older turns were dropped, kept {}",
+            messages.len()
+        );
+        // The kept slice is the TAIL of the chain (the newest messages).
+        let last = messages.last().expect("at least one message");
+        assert_eq!(last["content"], filler.as_str());
     }
 
     #[test]

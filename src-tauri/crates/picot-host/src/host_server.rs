@@ -4442,15 +4442,19 @@ async fn dispatch(
                     // and matches its header id before use, else falls back to
                     // the id lookup — authorization is unchanged.
                     let session_file = frame.get("sessionFile").and_then(Value::as_str);
-                    let messages = state
+                    let (messages, truncated) = state
                         .data
-                        .read_session_messages(workspace_id, session_id, session_file)
+                        .read_session_messages_bounded(workspace_id, session_id, session_file)
                         .map_err(host_data_error)?;
                     Ok(json!({
                         "type": "data_response",
                         "requestId": request_id,
                         "operation": "read_session_messages",
                         "messages": messages,
+                        // The read hit its byte budget: the reply carries the
+                        // newest turns only, so the client must not treat it
+                        // as the whole transcript.
+                        "truncated": truncated,
                     }))
                 }
                 Some("read_session_tree") => {

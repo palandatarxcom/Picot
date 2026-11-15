@@ -69,6 +69,7 @@ class FakeWebSocket extends EventTarget {
   static suppressSnapshot = false;
   // Test fixture: disk transcript served for read_session_messages requests.
   static diskMessages = null;
+  static diskTruncated = false;
   // Test fixture: tree served for read_session_tree requests.
   static treeData = null;
   // Test fixture: payload for runtime get_entries requests. "fail" forces
@@ -198,6 +199,7 @@ class FakeWebSocket extends EventTarget {
           requestId: frame.requestId,
           ok: true,
           messages: FakeWebSocket.diskMessages,
+          truncated: FakeWebSocket.diskTruncated === true,
         });
         return;
       }
@@ -421,6 +423,27 @@ test("disk upgrade re-renders the transcript with entry-id anchors", async () =>
     expect(anchorIds).not.toContain("d2");
   } finally {
     FakeWebSocket.diskMessages = null;
+  }
+});
+
+test("a truncated disk read does not paint as the whole session", async () => {
+  // A very long session's disk read hits the host's byte budget and comes
+  // back with the newest turns only. Painting that as the whole transcript
+  // would silently start mid-conversation, so the snapshot must win.
+  FakeWebSocket.diskMessages = [
+    { role: "user", entryId: "x1", content: [{ type: "text", text: "truncated disk tail" }] },
+  ];
+  FakeWebSocket.diskTruncated = true;
+  try {
+    await import("./app.js?disk-truncated");
+    // The snapshot stays on screen: the truncated tail never replaces it.
+    await vi.waitFor(() => {
+      expect(document.getElementById("messages").textContent).toContain("hello from snapshot");
+    });
+    expect(document.getElementById("messages").textContent).not.toContain("truncated disk tail");
+  } finally {
+    FakeWebSocket.diskMessages = null;
+    FakeWebSocket.diskTruncated = false;
   }
 });
 
