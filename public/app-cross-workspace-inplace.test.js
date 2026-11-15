@@ -76,6 +76,21 @@ class FakeWebSocket extends EventTarget {
       return;
     }
     if (envelope.type === "data_request") {
+      if (envelope.operation === "workspace_sessions") {
+        const first = envelope.workspaceId === "w1-uuid";
+        this.reply({
+          type: "data_response",
+          requestId: envelope.requestId,
+          ok: true,
+          path: first ? "/w1" : "/w2",
+          dirName: first ? "w1" : "w2",
+          sessions: first
+            ? [{ filePath: "/sessions/h1.jsonl", name: "H1" }]
+            : [{ filePath: "/sessions/h2.jsonl", name: "H2" }],
+          sessionCount: 1,
+        });
+        return;
+      }
       this.reply({ type: "data_response", requestId: envelope.requestId, ok: true, messages: [] });
       return;
     }
@@ -91,21 +106,39 @@ class FakeWebSocket extends EventTarget {
     if (envelope.type === "host_request") {
       let response = null;
       if (envelope.operation === "workspace.list")
-        response = { workspaces: [{ canonicalPath: "/w1" }], removed: [] };
+        response = {
+          workspaces: [
+            { workspaceId: "w1-uuid", canonicalPath: "/w1" },
+            { workspaceId: "w2-uuid", canonicalPath: "/w2" },
+          ],
+          removed: [],
+        };
       else if (envelope.operation === "runtime_instances") {
         // Production timing: a freshly spawned runtime stays invisible to
         // this summary until Pi's first get_state lands (a session-<uuid>
         // id never matches a JSONL header), so spawn races see an empty list.
         response = { instances: [] };
       } else if (envelope.operation === "workspace_target_prepare") {
-        response = {
-          classification: "cross",
-          transitionGeneration: 7,
-          targetWorkspaceId: "w2",
-          targetSessionId: "s2",
-          targetInstanceId: "instance-2",
-          targetOrigin: `${globalThis.location.origin}/workspaces/w2/sessions/s2`,
-        };
+        // Same-workspace spawns (Cmd+T on the current cwd) answer "same"
+        // with the workspace's own target; everything else is a cross add.
+        const same = envelope.args?.targetCwd === "/w1";
+        response = same
+          ? {
+              classification: "same",
+              transitionGeneration: 7,
+              targetWorkspaceId: "w1-uuid",
+              targetSessionId: "s1-new",
+              targetInstanceId: "instance-new",
+              targetOrigin: `${globalThis.location.origin}/workspaces/w1-uuid/sessions/s1-new`,
+            }
+          : {
+              classification: "cross",
+              transitionGeneration: 7,
+              targetWorkspaceId: "w2",
+              targetSessionId: "s2",
+              targetInstanceId: "instance-2",
+              targetOrigin: `${globalThis.location.origin}/workspaces/w2/sessions/s2`,
+            };
       } else if (envelope.operation === "workspace_transition_commit") {
         response = {
           targetOrigin: `${globalThis.location.origin}/workspaces/w2/sessions/s2`,
@@ -256,13 +289,14 @@ test("a spawned new session adopts in place and releases the ephemeral locks", a
     (frame) => frame.type === "host_request" && frame.operation === "workspace_target_prepare",
   );
   expect(prepare?.args?.forceNewSession).toBe(true);
-  // The document survived: the route moved to the spawned runtime.
-  expect(window.location.pathname).toBe("/workspaces/w2/sessions/s2");
+  // The document survived: the route moved to the spawned runtime (Cmd+T
+  // targets the current cwd, so this mock answers the same-workspace arm).
+  expect(window.location.pathname).toBe("/workspaces/w1-uuid/sessions/s1-new");
   const subscribed = ws.sent.some(
     (frame) =>
       frame.type === "runtime_subscribe" &&
-      frame.target?.sessionId === "s2" &&
-      frame.target?.instanceId === "instance-2",
+      frame.target?.sessionId === "s1-new" &&
+      frame.target?.instanceId === "instance-new",
   );
   expect(subscribed).toBe(true);
   // The adoption released the ephemeral surfaces: the rebind pulled the
@@ -283,7 +317,11 @@ test("adding a workspace via the picker spawns and adopts in place", async () =>
   await settle();
 
   const control = (operation) =>
-    ws.sent.filter((frame) => frame.type === "host_request" && frame.operation === operation);
+    ws.sent.filter(
+      (frame) =>
+        (frame.type === "host_request" || frame.type === "data_request") &&
+        frame.operation === operation,
+    );
 
   // 1. Remove workspace w2 from the registry (the context-menu entry). Its
   //    old live runtime, if any, stays bound to the deleted uuid.
@@ -319,7 +357,11 @@ test("a registry_changed arriving mid-launch still refreshes the sidebar", async
   await settle();
 
   const control = (operation) =>
-    ws.sent.filter((frame) => frame.type === "host_request" && frame.operation === operation);
+    ws.sent.filter(
+      (frame) =>
+        (frame.type === "host_request" || frame.type === "data_request") &&
+        frame.operation === operation,
+    );
 
   // The host broadcasts registry_changed twice around a spawn: the add
   // itself, and the session-bucket record once Pi's first get_state lands.
@@ -372,4 +414,60 @@ test("a registry_changed arriving mid-launch still refreshes the sidebar", async
   }
   ws.send = originalSend;
   await new Promise((resolve) => setTimeout(resolve, 400));
+});
+
+test("a same-workspace spawn keeps the loaded history on screen", async () => {
+  await import("./app.js?same-spawn-history");
+  const ws = wsInstances.at(-1);
+  await settle();
+
+  // The registry row carries an id so its history can load, and the
+  // sessions op answers one persisted session.
+  const control = (operation) =>
+    ws.sent.filter(
+      (frame) =>
+        (frame.type === "host_request" || frame.type === "data_request") &&
+        frame.operation === operation,
+    );
+  const expanded = await globalThis.__picotSidebar.expandWorkspace("w1-uuid");
+  expect(expanded).toBe(true);
+  await settle();
+  const historyItem = document.querySelector(".session-item[data-file-path='/sessions/h1.jsonl']");
+  expect(historyItem).not.toBeNull();
+
+  const listCalls = control("workspace.list").length;
+  const sessionCalls = control("workspace_sessions").length;
+
+  // Cmd+T spawns into the SAME workspace: the history list is unchanged
+  // and must stay on screen — no blanking, no re-fetch round trip.
+  document.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "t", metaKey: true, bubbles: true, cancelable: true }),
+  );
+  await settle(200);
+
+  expect(
+    document.querySelector(".session-item[data-file-path='/sessions/h1.jsonl']"),
+  ).not.toBeNull();
+  expect(globalThis.__picotSidebar.hasLoadedSessions("w1-uuid")).toBe(true);
+  expect(control("workspace.list").length).toBe(listCalls);
+  expect(control("workspace_sessions").length).toBe(sessionCalls);
+});
+
+test("expanding ANOTHER workspace right after a same-workspace spawn", async () => {
+  await import("./app.js?same-spawn-then-expand");
+  await settle();
+
+  // 1. Same-workspace spawn (the "+" button path).
+  document.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "t", metaKey: true, bubbles: true, cancelable: true }),
+  );
+  await settle(200);
+
+  // 2. Expand the OTHER workspace: its history must appear on first click.
+  const expanded = await globalThis.__picotSidebar.expandWorkspace("w2-uuid");
+  expect(expanded).toBe(true);
+  await settle(200);
+
+  const item = document.querySelector(".session-item[data-file-path='/sessions/h2.jsonl']");
+  expect(item).not.toBeNull();
 });

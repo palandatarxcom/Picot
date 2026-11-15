@@ -617,6 +617,11 @@ export class SessionSidebar {
         }
         const data = await this.transport.workspaceSessions(hostWorkspaceId);
         if (loadGeneration !== this._registrySessionLoadGeneration) {
+          console.debug("[Sidebar] session load dropped (generation moved)", {
+            workspaceId: project.workspaceId,
+            capturedGeneration: loadGeneration,
+            currentGeneration: this._registrySessionLoadGeneration,
+          });
           // The answer straddled a registry refresh (generation bump): the
           // payload is stale, but the refresh's own re-ensure was blocked by
           // THIS in-flight request, so nobody else will re-fetch — without a
@@ -631,6 +636,9 @@ export class SessionSidebar {
           const current =
             this.projects.find((candidate) => candidate.workspaceId === project.workspaceId) ||
             project;
+          console.debug("[Sidebar] session load retrying under current generation", {
+            workspaceId: project.workspaceId,
+          });
           this.ensureWorkspaceSessions(current, { force: true }).catch(() => {});
           return;
         }
@@ -2275,6 +2283,11 @@ export class SessionSidebar {
     // a visible stall when a workspace with 100+ sessions expanded.
     let section;
     if (!this._projectsSectionEl) {
+      // First render: clear whatever the static shell left in the container
+      // (index.html's "loading sessions…" placeholder, or a skeleton). The
+      // steady-state path below never clears, so this one-shot sweep is what
+      // retires the placeholder (field regression from render stabilization).
+      this.container.replaceChildren();
       const built = buildSidebarSection({
         region: "projects",
         titleKey: "sidebar.projects",

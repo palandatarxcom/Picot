@@ -6359,7 +6359,17 @@ async function adoptSpawnedSessionInPlace(prepared, { targetCwd, workspaceGenera
     targetCwd,
     runtimeTarget: spawnTarget?.sessionId,
   });
-  if (targetCwd) sidebar.refresh({ workspacePath: targetCwd });
+  if (prepared?.classification === "same") {
+    // A same-workspace spawn changed nothing about the workspace's history:
+    // the loaded list stays, and the provisional row simply joins it. A
+    // full refresh here used to blank the list (invalidate clears
+    // project.sessions), show only the "New chat" row, then stall on two
+    // serial RPCs before history returned (field defect).
+    sidebar.applyProvisionalSession();
+    sidebar.render();
+  } else if (targetCwd) {
+    sidebar.refresh({ workspacePath: targetCwd });
+  }
   // The spawn entries lock ephemeral interaction for a cross-workspace
   // commit via beforeWorkspaceTransition (workspace/actions.js); the page
   // that used to unlock them by being destroyed no longer exists, so this
@@ -6739,6 +6749,18 @@ globalThis.__picotSidebar = {
   addProjectViaPicker: () => sidebar.addProjectViaPicker(),
   // Whether a spawned-but-unpersisted session row is pending materialization.
   isProvisionalPending: () => Boolean(sidebar.provisionalSession),
+  // Expand one workspace row and load its history (the picker/expand path).
+  expandWorkspace: (workspaceId) => {
+    const project = sidebar.projects.find((item) => item.registryId === workspaceId);
+    if (!project) return Promise.resolve(false);
+    sidebar.setWorkspaceExpanded(project, true);
+    return sidebar.ensureWorkspaceSessions(project).then(() => true);
+  },
+  // Whether one workspace's loaded history survived in memory.
+  hasLoadedSessions: (workspaceId) => {
+    const project = sidebar.projects.find((item) => item.registryId === workspaceId);
+    return Array.isArray(project?.sessions) && project.sessions.length > 0;
+  },
 };
 // Remote terminal attachment inspection: the state machine's own state plus the
 // panel's rendered availability (no DOM scraping in tests).

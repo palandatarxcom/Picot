@@ -1208,6 +1208,23 @@ test("an expansion straddling a registry refresh still lands its sessions", asyn
   expect(item).not.toBeNull();
 });
 
+test("the static loading placeholder is retired on first render", async () => {
+  // index.html ships a "Loading sessions..." div inside #session-list; the
+  // render's first pass must sweep it (the steady-state path never clears
+  // the container, so nothing else would).
+  const mount = document.getElementById("sessions");
+  const placeholder = document.createElement("div");
+  placeholder.className = "session-loading";
+  placeholder.textContent = "Loading sessions...";
+  mount.appendChild(placeholder);
+
+  const { sidebar } = await makeSidebar({ rows: REGISTRY_ROWS, fetchRoutes: { instances: [] } });
+  await sidebar.loadSessions();
+  expect(sidebar.projects.length).toBeGreaterThan(0);
+  expect(document.querySelector(".session-loading")).toBeNull();
+  expect(mount.querySelector(".projects-group")).not.toBeNull();
+});
+
 test("a steady-state render reuses row nodes instead of rebuilding the tree", async () => {
   // The 100+-session expand stall was structural: every render ran
   // replaceChildren over the whole sidebar, dropping the WebView's layout
