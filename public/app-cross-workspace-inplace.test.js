@@ -471,3 +471,62 @@ test("expanding ANOTHER workspace right after a same-workspace spawn", async () 
   const item = document.querySelector(".session-item[data-file-path='/sessions/h2.jsonl']");
   expect(item).not.toBeNull();
 });
+
+test("a same-workspace spawn does not rebuild the history row nodes", async () => {
+  await import("./app.js?same-spawn-node-stability");
+  await settle();
+
+  // Load the history so its item nodes exist.
+  const expanded = await globalThis.__picotSidebar.expandWorkspace("w1-uuid");
+  expect(expanded).toBe(true);
+  await settle();
+  const historyBefore = document.querySelector(
+    ".session-item[data-file-path='/sessions/h1.jsonl']",
+  );
+  expect(historyBefore).not.toBeNull();
+
+  document.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "t", metaKey: true, bubbles: true, cancelable: true }),
+  );
+  await settle(200);
+
+  // The provisional row joins; the history item must keep its exact node.
+  const historyAfter = document.querySelector(".session-item[data-file-path='/sessions/h1.jsonl']");
+  expect(historyAfter).toBe(historyBefore);
+});
+
+test("a tile '+' on an expanded non-current workspace keeps its history", async () => {
+  // Dr. Lin's exact sequence: open a session in workspace A, expand B's
+  // list, then click B's tile "+" — B's list must not blank out.
+  await import("./app.js?tile-plus-cross-workspace");
+  await settle();
+
+  // A session is open in w1 (the boot route), and w2's history is loaded.
+  const expanded = await globalThis.__picotSidebar.expandWorkspace("w2-uuid");
+  expect(expanded).toBe(true);
+  await settle();
+  const historyBefore = document.querySelector(
+    ".session-item[data-file-path='/sessions/h2.jsonl']",
+  );
+  expect(historyBefore).not.toBeNull();
+
+  const control = (operation) =>
+    wsInstances
+      .at(-1)
+      .sent.filter(
+        (frame) =>
+          (frame.type === "host_request" || frame.type === "data_request") &&
+          frame.operation === operation,
+      );
+  const listCalls = control("workspace.list").length;
+
+  // The tile "+" on w2 (owner still bound to w1) answers "cross" from the
+  // host; the loaded history must survive the adoption anyway.
+  await globalThis.__picotSidebar.newProjectChat({ path: "/w2", source: "registry" });
+  await settle(200);
+
+  expect(document.querySelector(".session-item[data-file-path='/sessions/h2.jsonl']")).toBe(
+    historyBefore,
+  );
+  expect(control("workspace.list").length).toBe(listCalls);
+});

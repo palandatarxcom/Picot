@@ -214,7 +214,7 @@ import {
   createWorkspaceActionsController,
   populateAppLogo as sharedPopulateAppLogo,
 } from "./workspace-actions.js";
-import { registryPinsFromProjects } from "./workspace-projects.js";
+import { registryPinsFromProjects, workspacePathKey } from "./workspace-projects.js";
 
 // Initialize locale messages before constructing components that call t().
 const savedTheme = getCurrentTheme();
@@ -6359,12 +6359,17 @@ async function adoptSpawnedSessionInPlace(prepared, { targetCwd, workspaceGenera
     targetCwd,
     runtimeTarget: spawnTarget?.sessionId,
   });
-  if (prepared?.classification === "same") {
-    // A same-workspace spawn changed nothing about the workspace's history:
-    // the loaded list stays, and the provisional row simply joins it. A
-    // full refresh here used to blank the list (invalidate clears
-    // project.sessions), show only the "New chat" row, then stall on two
-    // serial RPCs before history returned (field defect).
+  // Refresh only when the target workspace's history is NOT already in
+  // memory. The Rust "same/cross" classification follows the OWNER binding,
+  // so a tile "+" on an expanded non-current workspace answers "cross" even
+  // though its history is loaded — refreshing there blanks the list (the
+  // three-stage flash: list vanishes, "New chat" alone, history returns
+  // after two serial RPCs).
+  const targetProject = sidebar.projects.find(
+    (item) => workspacePathKey(item.path) === workspacePathKey(targetCwd),
+  );
+  const historyLoaded = Array.isArray(targetProject?.sessions) && targetProject.sessions.length > 0;
+  if (historyLoaded) {
     sidebar.applyProvisionalSession();
     sidebar.render();
   } else if (targetCwd) {
@@ -6756,6 +6761,8 @@ globalThis.__picotSidebar = {
     sidebar.setWorkspaceExpanded(project, true);
     return sidebar.ensureWorkspaceSessions(project).then(() => true);
   },
+  // The sidebar tile "+" path for one project (cross to the current one).
+  newProjectChat: (project) => handleNewProjectChat(project),
   // Whether one workspace's loaded history survived in memory.
   hasLoadedSessions: (workspaceId) => {
     const project = sidebar.projects.find((item) => item.registryId === workspaceId);

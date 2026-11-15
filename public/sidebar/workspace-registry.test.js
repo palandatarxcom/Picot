@@ -382,11 +382,17 @@ describe("keyed row reuse", () => {
     );
     expect(refreshed.group).toBe(firstNode);
 
-    // Mutating visible data changes the signature and forces a rebuild.
+    // Mutating visible data keeps the group node (the skeleton signature is
+    // unchanged) and lands through the item-level diff: the new row appears
+    // inside the SAME group — history nodes are not rebuilt (two-level
+    // signature, the "+" flash fix).
     const beta = sidebar.projects.find((project) => project.workspaceId === "ws:uuid-2");
     beta.sessions.push({ filePath: "/sessions/new.jsonl", mtime: 12345 });
     const rebuilt = sidebar.projectRowNode(beta, null);
-    expect(rebuilt.group).not.toBe(firstNode);
+    expect(rebuilt.group).toBe(firstNode);
+    expect(
+      firstNode.querySelector(".session-item[data-file-path='/sessions/new.jsonl']"),
+    ).not.toBeNull();
   });
 });
 

@@ -2169,14 +2169,25 @@ export class SessionSidebar {
     // Pagination ("show more") mutates only the visible slice; include it in
     // the signature so those clicks still rebuild/reuse the correct DOM.
     const visibleCount = this.getProjectVisibleSessionCount(project, visibleRows.length);
-    const signature = JSON.stringify([
+    // Two-level signatures: the row SKELETON (header/count/expansion)
+    // gates the group-node reuse, and the session ENTRIES gate an item-level
+    // diff inside the reused group. A provisional row joining the list (or an
+    // unread/streaming dot flipping) used to rebuild the whole group — every
+    // history item node replaced — which read as the list blanking and
+    // repainting on "+" (field defect).
+    const searchMode = this.searchQuery ? "searching" : "browse";
+    const rowSignature = JSON.stringify([
       project.workspaceId,
       project.folderName || "",
       project.path || "",
       this.isWorkspaceExpanded(project),
-      visibleCount,
       project.sessionCount ?? null,
       project.hiddenSubagentCount ?? null,
+      searchMode,
+      project.workspaceId === "" ? String(Math.random()) : "stable", // live rows always rebuild
+    ]);
+    const sessionsSignature = JSON.stringify([
+      visibleCount,
       visibleRows.map((row) => [
         row.session.filePath,
         row.session.name ?? null,
@@ -2191,11 +2202,15 @@ export class SessionSidebar {
         row.session.filePath === this.activeSessionFile,
         this.isLiveSession(row.session.filePath), // delete gate reads the live snapshot
       ]),
-      this.searchQuery ? "searching" : "browse",
-      project.workspaceId === "" ? String(Math.random()) : "stable", // live rows always rebuild
     ]);
     const cached = this._projectRowCache.get(project.workspaceId);
-    if (cached && cached.signature === signature) return cached;
+    if (cached && cached.signature === rowSignature) {
+      if (cached.sessionsSignature !== sessionsSignature && cached.sessionsContainer) {
+        this._reconcileSessionItems(cached, project, visibleRows, visibleCount);
+        cached.sessionsSignature = sessionsSignature;
+      }
+      return cached;
+    }
 
     const sessionsToRender = this.searchQuery ? visibleRows : visibleRows.slice(0, visibleCount);
     const projectActive = Array.isArray(project.sessions)
@@ -2205,6 +2220,7 @@ export class SessionSidebar {
       project,
       projectActive || this.isCurrentWorkspace?.(project),
     );
+    let sessionsContainer = null;
     const { group } = buildSidebarWorkspaceGroup({
       workspaceId: project.workspaceId,
       folderName:
@@ -2228,30 +2244,90 @@ export class SessionSidebar {
       focusEnabled,
       onFocus: focusEnabled ? () => this.onWorkspaceFocus?.(project) : null,
       renderSessions: (sessionsDiv) => {
-        for (const row of sessionsToRender) {
-          sessionsDiv.appendChild(
-            this.buildSessionItem(row.session, project, {
-              showDeleteButton: true,
-              treeDepth: row.depth,
-              treeIsLast: row.isLast,
-              treeAncestorChain: row.ancestorChain,
-            }),
-          );
-        }
-        if (!this.searchQuery) {
-          const toggleRow = this.buildProjectSessionsToggleRow(
-            project,
-            sessionsToRender.length,
-            visibleRows.length,
-          );
-          if (toggleRow) sessionsDiv.appendChild(toggleRow);
-        }
+        sessionsContainer = sessionsDiv;
+        reconcileChildren(
+          sessionsDiv,
+          this._buildSessionItemNodes(project, sessionsToRender, visibleRows),
+        );
       },
     });
     group.dataset.projectSearchText = this.getProjectSearchText(project);
-    const entry = { signature, group };
+    const entry = {
+      signature: rowSignature,
+      sessionsSignature,
+      group,
+      sessionsContainer,
+    };
     this._projectRowCache.set(project.workspaceId, entry);
     return entry;
+  }
+
+  /** Desired session-item nodes for one workspace row (items + toggle row).
+   * Items are cached per (workspace, filePath) keyed by the same fields the
+   * row signature tracks: an unchanged entry returns its existing node, so
+   * the item-level diff keeps history nodes across a provisional row joining
+   * or a status dot flipping. Only the Projects region uses this cache — the
+   * pinned region rebuilds per render and must not fight over the nodes. */
+  _buildSessionItemNodes(project, sessionsToRender, visibleRows) {
+    const desired = [];
+    if (!this._sessionItemNodes) this._sessionItemNodes = new Map();
+    const cache = this._sessionItemNodes;
+    const liveKeys = new Set();
+    for (const row of sessionsToRender) {
+      const itemKey = `${project.workspaceId}::${row.session.filePath}`;
+      const signature = JSON.stringify([
+        row.session.filePath,
+        row.session.name ?? null,
+        row.session.parentSession ?? null,
+        Number(row.session.mtime) || 0,
+        row.depth,
+        row.ancestorKey,
+        Boolean(row.session.isRunning),
+        row.session.port ?? null,
+        this.unread.has(row.session.filePath),
+        this.streamingFiles?.has(row.session.filePath) || false,
+        row.session.filePath === this.activeSessionFile,
+        this.isLiveSession(row.session.filePath),
+      ]);
+      liveKeys.add(itemKey);
+      const cached = cache.get(itemKey);
+      if (cached && cached.signature === signature) {
+        desired.push(cached.node);
+        continue;
+      }
+      const node = this.buildSessionItem(row.session, project, {
+        showDeleteButton: true,
+        treeDepth: row.depth,
+        treeIsLast: row.isLast,
+        treeAncestorChain: row.ancestorChain,
+      });
+      cache.set(itemKey, { signature, node });
+      desired.push(node);
+    }
+    // Drop cache entries whose rows left this workspace's visible list.
+    for (const key of [...cache.keys()]) {
+      if (key.startsWith(`${project.workspaceId}::`) && !liveKeys.has(key)) {
+        cache.delete(key);
+      }
+    }
+    if (!this.searchQuery) {
+      const toggleRow = this.buildProjectSessionsToggleRow(
+        project,
+        sessionsToRender.length,
+        visibleRows.length,
+      );
+      if (toggleRow) desired.push(toggleRow);
+    }
+    return desired;
+  }
+
+  /** Item-level diff inside a reused group node: only changed entries swap. */
+  _reconcileSessionItems(cached, project, visibleRows, visibleCount) {
+    const sessionsToRender = this.searchQuery ? visibleRows : visibleRows.slice(0, visibleCount);
+    reconcileChildren(
+      cached.sessionsContainer,
+      this._buildSessionItemNodes(project, sessionsToRender, visibleRows),
+    );
   }
 
   /**
