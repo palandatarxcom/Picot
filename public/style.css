@@ -135,6 +135,12 @@ body {
   left: 0;
   right: 0;
   height: 40px;
+}
+/* In-page drag regions only exist for the macOS overlay title bar. Windows
+   builds keep the native title bar; a drag region there hands the area to
+   the OS non-client hit test, and WebView2 (v152+) swallows clicks on
+   interactive children as HTCAPTION window drags. */
+html.macos-overlay .landing-drag-strip {
   -webkit-app-region: drag;
 }
 body.landing-mode .workspace {
@@ -362,6 +368,8 @@ body.landing-mode #landing {
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-1-5) var(--space-3);
+}
+html.macos-overlay .sidebar-header {
   -webkit-app-region: drag;
 }
 
@@ -1827,11 +1835,13 @@ body.landing-mode #landing {
   -webkit-backdrop-filter: none;
   border-bottom: 1px solid var(--border);
   min-height: 36px;
-  -webkit-app-region: drag;
   position: relative;
   flex-shrink: 0;
   /* Keep header dropdowns above the file browser's stacking context. */
   z-index: 110;
+}
+html.macos-overlay .header {
+  -webkit-app-region: drag;
 }
 
 .header::before {
@@ -2572,6 +2582,8 @@ body.landing-mode #landing {
 .settings-drag-region {
   grid-column: 1 / -1;
   grid-row: 1;
+}
+html.macos-overlay .settings-drag-region {
   -webkit-app-region: drag;
 }
 
@@ -9599,6 +9611,8 @@ body.file-preview-resizing {
   padding: 0 var(--space-1);
   min-height: 36px;
   border-bottom: 1px solid var(--border);
+}
+html.macos-overlay .file-preview-tabs-bar {
   -webkit-app-region: drag;
 }
 

@@ -21,7 +21,7 @@
 
 import { createIcon } from "./icons.js";
 import { buildSessionTree } from "./session-tree.js";
-import { displayLocalPath } from "./workspace/path-utils.js";
+import { displayLocalPath, displayNativePath } from "./workspace/path-utils.js";
 
 // Live appends keep the panel's cache current turn to turn, but entries can
 // be persisted without a message_end enrichment (compaction summaries,
@@ -103,7 +103,7 @@ export class InfoPanel {
     this.pathEl.className = "file-sidebar-path info-panel-path";
     this.pathEl.id = "info-panel-session-file";
     this.pathEl.textContent = displayLocalPath(this.sessionFile) || "—";
-    this.pathEl.title = this.sessionFile;
+    this.pathEl.title = displayNativePath(this.sessionFile);
 
     const copy = document.createElement("button");
     copy.type = "button";
@@ -143,7 +143,7 @@ export class InfoPanel {
     this.sessionFile = path || "";
     if (!this.pathEl) return;
     this.pathEl.textContent = displayLocalPath(this.sessionFile) || "—";
-    this.pathEl.title = this.sessionFile;
+    this.pathEl.title = displayNativePath(this.sessionFile);
   }
 
   // ── Session history ─────────────────────────────────────────────────────

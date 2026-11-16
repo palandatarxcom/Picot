@@ -71,6 +71,7 @@ function localeStub() {
         removeFromList: "Remove from list",
         removedFromList: "Removed from the list; directory and session files were kept.",
         openInFinder: "Open in Finder",
+        openInFileManager: "Open in File Manager",
         deleteWorkspaceMainSessions: "Delete all main sessions",
         deleteWorkspaceMainSessionsConfirm:
           "Delete {count} main sessions permanently? Hidden subagent sessions will be kept. This cannot be undone.",
@@ -265,7 +266,8 @@ describe("SessionSidebar context menu", () => {
     const menu = document.querySelector(".sidebar-context-menu").textContent;
     // Fixture row is pinned; toggle renders its inverse action.
     expect(menu).toContain("Unpin workspace");
-    expect(menu).toContain("Open in Finder");
+    // Non-macOS test runtime renders the platform-neutral file-manager label.
+    expect(menu).toContain("Open in File Manager");
     expect(menu).toContain("Remove from list");
     expect(menu).toContain("Delete all main sessions");
 

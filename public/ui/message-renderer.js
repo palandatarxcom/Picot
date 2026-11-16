@@ -7,6 +7,7 @@
 import { onLocaleChange, t } from "../i18n.js";
 import { createIcon, setButtonIcon } from "../icons.js";
 import { createScrollOwner } from "../session/scroll-ownership.js";
+import { displayNativePath } from "../workspace/path-utils.js";
 import { renderMarkdown, renderStreamingMarkdown, renderUserMarkdown } from "./markdown.js";
 import { sanitizeMarkup } from "./sanitize-markup.js";
 
@@ -212,7 +213,7 @@ export class MessageRenderer {
       workspace.className = "hint welcome-workspace";
       workspace.appendChild(document.createTextNode(`${t("app.currentWorkspace")} `));
       const code = document.createElement("code");
-      code.textContent = workspacePath;
+      code.textContent = displayNativePath(workspacePath);
       workspace.appendChild(code);
       welcome.appendChild(workspace);
     }

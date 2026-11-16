@@ -209,7 +209,7 @@ import {
   consumeNavState,
   readCachedSidebarProjects,
 } from "./workspace/nav-state-cache.js";
-import { normalizeLocalPath } from "./workspace/path-utils.js";
+import { displayNativePath, normalizeLocalPath } from "./workspace/path-utils.js";
 import {
   createWorkspaceActionsController,
   populateAppLogo as sharedPopulateAppLogo,
@@ -1204,7 +1204,7 @@ function refreshGitBranch() {
 }
 
 function updateWorkspaceIndicator(path = "") {
-  const normalizedPath = typeof path === "string" ? normalizeLocalPath(path.trim()) : "";
+  const normalizedPath = typeof path === "string" ? displayNativePath(path.trim()) : "";
   if (!normalizedPath) {
     workspaceIndicatorEl.classList.add("hidden");
     workspaceIndicatorEl.textContent = "";
@@ -2426,7 +2426,10 @@ function refreshHeaderOpenAppButton() {
   }
   headerOpenApp.el.classList.remove("hidden");
   sharedPopulateAppLogo(headerOpenApp.logo, selected);
-  headerOpenApp.btn.title = t("nav.openWorkspaceInNamedApp", { path, app: selected.label });
+  headerOpenApp.btn.title = t("nav.openWorkspaceInNamedApp", {
+    path: displayNativePath(path),
+    app: selected.label,
+  });
   headerOpenApp.btn.setAttribute(
     "aria-label",
     t("nav.openWorkspaceInAppAria", { app: selected.label }),

@@ -2219,25 +2219,67 @@ fn open_in_app_core(
         }
     }
 
-    // Fallback: reveal in the OS file manager.
-    #[cfg(target_os = "macos")]
-    let mut child_command = Command::new("open");
+    // Fallback: reveal in the OS file manager. Windows runs a dedicated
+    // branch: Explorer parses `/`-prefixed argument segments as command
+    // switches (a canonical `E:/Code/Picot` lands in the default folder), and
+    // it exits 1 even on success, so the exit status carries no failure
+    // signal — only spawn failures are reported.
     #[cfg(target_os = "windows")]
-    let mut child_command = Command::new("explorer");
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let mut child_command = Command::new("xdg-open");
-    windows_child::hide_console(&mut child_command);
-    let status = child_command.arg(trimmed_path).status();
+    {
+        let mut child_command = Command::new("explorer");
+        windows_child::hide_console(&mut child_command);
+        return child_command
+            .arg(windows_native_path(trimmed_path))
+            .status()
+            .map(|_| ())
+            .map_err(|e| format!("Failed to reveal path: {e}"));
+    }
 
-    status
-        .map_err(|e| format!("Failed to reveal path: {e}"))
-        .and_then(|s| {
-            if s.success() {
-                Ok(())
-            } else {
-                Err(format!("File manager exited with status {s}"))
-            }
-        })
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut child_command = Command::new("open");
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        let mut child_command = Command::new("xdg-open");
+        windows_child::hide_console(&mut child_command);
+        let status = child_command.arg(trimmed_path).status();
+
+        status
+            .map_err(|e| format!("Failed to reveal path: {e}"))
+            .and_then(|s| {
+                if s.success() {
+                    Ok(())
+                } else {
+                    Err(format!("File manager exited with status {s}"))
+                }
+            })
+    }
+}
+
+/// Convert a canonical forward-slash path into the backslash form Explorer's
+/// command line requires (`//server/share` UNC roots keep their leading
+/// backslashes; verbatim `\\?\` prefixes are stripped first).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_native_path(path: &str) -> String {
+    pi_launch::strip_verbatim_prefix(path).replace('/', "\\")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_native_path_tests {
+    use super::windows_native_path;
+
+    #[test]
+    fn converts_canonical_forward_slashes_to_native_form() {
+        assert_eq!(windows_native_path("E:/Code/Picot"), r"E:\Code\Picot");
+        assert_eq!(
+            windows_native_path("//server/share/repo"),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            windows_native_path(r"\\?\C:\Users\Lin\repo"),
+            r"C:\Users\Lin\repo"
+        );
+    }
 }
 
 /// Open a URL in the user's default system browser. Uses the platform opener

@@ -51,6 +51,7 @@ beforeEach(async () => {
             pinWorkspace: "Pin workspace",
             unpinWorkspace: "Unpin workspace",
             openInFinder: "Open in Finder",
+            openInFileManager: "Open in File Manager",
             deleteWorkspaceMainSessions: "Delete all main sessions",
             deleteWorkspaceMainSessionsConfirm:
               "Delete {count} main sessions permanently? Hidden subagent sessions will be kept.",

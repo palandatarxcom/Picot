@@ -1,6 +1,8 @@
 // ABOUTME: Normalizes local filesystem paths for browser-side workspace features.
 // ABOUTME: Preserves POSIX, Windows drive, and UNC roots without using the host OS APIs.
 
+import { isWindowsRuntime } from "../platform.js";
+
 function parseRoot(value) {
   if (value.startsWith("//")) {
     const parts = value.slice(2).split("/").filter(Boolean);
@@ -51,13 +53,35 @@ function stripWindowsVerbatimPrefix(value) {
   return value;
 }
 
+function toNativeSeparators(posixPath, platform) {
+  return platform === "windows" ? posixPath.replaceAll("/", "\\") : posixPath;
+}
+
 /** Format a local path for sidebar display without changing its filesystem meaning. */
-export function displayLocalPath(value) {
+export function displayLocalPath(
+  value,
+  { platform = isWindowsRuntime() ? "windows" : undefined } = {},
+) {
   const normalized = normalizeLocalPath(value);
-  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
-    return normalized;
-  }
-  return `/${normalized}`;
+  if (!normalized) return "";
+  const posix =
+    normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) ? normalized : `/${normalized}`;
+  return toNativeSeparators(posix, platform);
+}
+
+/**
+ * Native-separator rendering of the canonical path for UI surfaces that must
+ * not grow the display-only leading slash (header pill, tooltips). On
+ * macOS/Linux the output equals normalizeLocalPath(); on Windows the
+ * canonical forward slashes render as backslashes.
+ */
+export function displayNativePath(
+  value,
+  { platform = isWindowsRuntime() ? "windows" : undefined } = {},
+) {
+  const normalized = normalizeLocalPath(value);
+  if (!normalized) return "";
+  return toNativeSeparators(normalized, platform);
 }
 
 /**

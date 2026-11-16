@@ -7,6 +7,7 @@
 
 import { onLocaleChange, t } from "../i18n.js";
 import { createIcon } from "../icons.js";
+import { isMacOSRuntime } from "../platform.js";
 import { buildSidebarSection, buildSidebarWorkspaceGroup } from "../sidebar-workspace-group.js";
 import { cacheSidebarProjects } from "../workspace/nav-state-cache.js";
 import { basenameLocalPath } from "../workspace/path-utils.js";
@@ -1169,7 +1170,9 @@ export class SessionSidebar {
         : []),
       {
         iconKind: "folder",
-        label: t("sidebar.openInFinder"),
+        // macOS calls the system file manager Finder; other platforms get the
+        // neutral name instead of leaking macOS wording.
+        label: t(isMacOSRuntime() ? "sidebar.openInFinder" : "sidebar.openInFileManager"),
         action: () => this.onOpenProject?.(workspace),
       },
       // Multi-window §5 entry 2 (landing project list): registry-backed rows

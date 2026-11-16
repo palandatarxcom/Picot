@@ -15,7 +15,7 @@ import {
   ROOT_PATH,
   trimExpandedForStorage,
 } from "./file-tree.js";
-import { displayLocalPath, normalizeLocalPath } from "./path-utils.js";
+import { displayLocalPath, displayNativePath, normalizeLocalPath } from "./path-utils.js";
 
 /** Movement that turns a mousedown into a drag rather than a click. */
 const DRAG_THRESHOLD_PX = 4;
@@ -126,7 +126,7 @@ export class FileBrowser {
     this.fileErrorText = null;
     if (changed) closeContextMenu();
     this.pathEl.textContent = displayLocalPath(normalized);
-    this.pathEl.title = normalized;
+    this.pathEl.title = displayNativePath(normalized);
     this.render();
     this.notifyMutability();
   }

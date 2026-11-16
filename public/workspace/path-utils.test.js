@@ -4,6 +4,7 @@ import { expect, test } from "vitest";
 import {
   basenameLocalPath,
   displayLocalPath,
+  displayNativePath,
   normalizeLocalPath,
   parentLocalPath,
   relativeLocalPath,
@@ -60,4 +61,25 @@ test("returns a relative path only when the file belongs to the canonical worksp
   );
   expect(relativeLocalPath("/work/other/app.js", "/work/picot")).toBeNull();
   expect(relativeLocalPath("D:/work/picot/app.ts", "C:/work/picot")).toBeNull();
+});
+
+test("renders native backslash separators when the display platform is Windows", () => {
+  expect(displayLocalPath("C:/Users/Lin/picot", { platform: "windows" })).toBe(
+    "C:\\Users\\Lin\\picot",
+  );
+  expect(displayLocalPath("/Users/Lin/project", { platform: "windows" })).toBe(
+    "\\Users\\Lin\\project",
+  );
+  expect(displayNativePath("E:/Code/Picot", { platform: "windows" })).toBe("E:\\Code\\Picot");
+  expect(displayNativePath("\\\\server/share/repo", { platform: "windows" })).toBe(
+    "\\\\server\\share\\repo",
+  );
+  expect(displayNativePath("E:\\Code\\Picot", { platform: "windows" })).toBe("E:\\Code\\Picot");
+});
+
+test("keeps canonical forward-slash output outside Windows display platforms", () => {
+  expect(displayLocalPath("C:/Users/Lin/picot", { platform: undefined })).toBe(
+    "C:/Users/Lin/picot",
+  );
+  expect(displayNativePath("E:/Code/Picot", { platform: "macos" })).toBe("E:/Code/Picot");
 });
