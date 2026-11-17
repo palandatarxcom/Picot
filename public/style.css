@@ -5366,9 +5366,10 @@ html.macos-overlay .settings-drag-region {
    ASCII, which then falls through to the system stack copied from body.
    Scoped to assistant replies, the user message bubble, and Markdown
    preview — body is untouched.
-   Code blocks (<pre>/<code>) keep the browser UA monospace because font-family
-   is not declared on them in author CSS; routing them to "Picot Mono Nerd" is
-   a known Phase 2 item. */
+   Code blocks (<pre>/<code>) and inline code read in the bundled "Picot Mono
+   Nerd" (Fira Code Nerd Mono) so chat code matches the terminal and editor.
+   "Picot CJK" stays in the stack: declaring font-family on code cuts the
+   container's CJK routing, so CJK codepoints inside code must resolve here. */
 .message.assistant .message-content,
 .message.user .message-content,
 .file-markdown-preview {
@@ -5619,6 +5620,17 @@ code {
 .message-content pre,
 .message-content pre code {
   font-size: var(--text-code);
+  font-family:
+    "Picot Mono Nerd", "Picot CJK", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Same monospace face for Markdown file previews — one code face across the
+   chat and preview surfaces, CJK still via Picot CJK. */
+.file-markdown-preview code,
+.file-markdown-preview pre,
+.file-markdown-preview pre code {
+  font-family:
+    "Picot Mono Nerd", "Picot CJK", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 /* Streaming cursor */
